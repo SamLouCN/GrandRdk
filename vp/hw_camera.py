@@ -30,12 +30,18 @@ _lib = None
 
 
 def _load():
+    """懒加载 libmjpg_hw.so 并声明 C 接口原型（mjcam_open/grab/close），首次调用时执行。"""
     global _lib
     if _lib is not None:
         return _lib
     if not os.path.exists(_SO):
         raise RuntimeError(f'libmjpg_hw.so 不存在: {_SO} (需要先编译)')
     lib = ctypes.CDLL(_SO)
+    # ---- C 接口 (libmjpg_hw.so) 约定 ----
+    #   mjcam_open(dev, w, h, fps) -> void*      打开相机句柄; 失败返回 NULL
+    #   mjcam_grab(h, buf, cap, &ow, &oh) -> int 抓一帧并 JPU 硬解为 NV12 写入 buf;
+    #                                          返回实际写入字节数 (= w*h*3//2), ow/oh 输出宽高
+    #   mjcam_close(h)                           释放相机与解码器资源
     lib.mjcam_open.restype = ctypes.c_void_p
     lib.mjcam_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.mjcam_grab.restype = ctypes.c_int
@@ -50,27 +56,29 @@ class HwMjpgCamera:
     """JPU 硬件解码的 USB MJPG 相机 (cv2.VideoCapture 兼容接口)."""
 
     def __init__(self, device, width=640, height=480, fps=200):
+        """按 device/宽高/帧率打开 JPU 硬解相机，预分配 NV12 帧缓冲；任何异常都不会抛出，而是打印警告并将 handle 置 None（调用方用 isOpened 判断）。"""
         self._dev = str(device)
         self._w = int(width)
         self._h = int(height)
         self._fps = int(fps)
         self._handle = None
         self._nv12 = None
-        self._cap = self._w * self._h * 3 // 2
+        self._cap = self._w * self._h * 3 // 2   # NV12 一帧字节数 = W*H + W*(H/2) = W*H*3/2
         try:
             lib = _load()
             h = lib.mjcam_open(self._dev.encode(), self._w, self._h, self._fps)
             if h:
                 self._lib = lib
                 self._handle = h
-                self._nv12 = ctypes.create_string_buffer(self._cap)
-                self._ow = ctypes.c_int(0)
+                self._nv12 = ctypes.create_string_buffer(self._cap)  # 内部 NV12 帧缓冲(复用, 避免每帧 malloc)
+                self._ow = ctypes.c_int(0)   # mjcam_grab 输出的实际宽/高 (可能小于请求值)
                 self._oh = ctypes.c_int(0)
         except Exception as exc:
             print(f'[警告] HwMjpgCamera 初始化失败: {exc!r}')
             self._handle = None
 
     def isOpened(self):
+        """返回相机是否成功打开（handle 非空）。"""
         return self._handle is not None
 
     def _grab(self):
@@ -112,6 +120,7 @@ class HwMjpgCamera:
         return True, bgr, nv.copy()
 
     def get(self, prop_id):
+        """读取属性（宽/高/帧率），未打开时返回 0.0；接口对齐 cv2.VideoCapture.get。"""
         if self._handle is None:
             return 0.0
         if prop_id == _CAP_W:
@@ -123,6 +132,7 @@ class HwMjpgCamera:
         return 0.0
 
     def release(self):
+        """关闭相机句柄并释放 JPU 解码资源（幂等，调用后 handle 置 None）。"""
         if self._handle is not None:
             try:
                 self._lib.mjcam_close(self._handle)

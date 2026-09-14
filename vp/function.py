@@ -1,10 +1,29 @@
 """
-HSV 巡线模块 (module_HSV.py)
+function.py — vp5.0 板端核心库（三大功能合一份）
 
-从 main.py 拆分出的 HSV 引导线巡线检测器:
-  - LineDetector: HSV 颜色分割 + 形态学 + 轮廓拟合 (重心/角度) + 角度消抖
+本文件把 3 个原本独立的子模块合并到同一个文件，便于 front.py / bottom.py 一次性 import。
+从顶到底的阅读顺序就是 3 个分节，建议按需跳读：
 
-依赖: cv2 / numpy / copy / main_config.DEFAULT_CONFIG / module_preprocess.preprocess
+    ① HSV 巡线检测器 (LineDetector)
+         - 适用于 bottom 相机走“引导线巡线”模式时的入口
+         - 本仓库保留实现，但当前 front.py / bottom.py 未实际接线（仅走 YOLO）
+         - 需要巡线时: detector = LineDetector(); detector.detect(frame)
+
+    ② YOLO 检测器 (YoloDetector + YoloDetect + 通用辅助)
+         - 当前 front.py / bottom.py 实际使用的检测入口
+         - 适配 hbm (RDK 板端 BPU) / ultralytics (开发机) 两种后端
+         - 上层调用: detector = YoloDetector(CFG['FRONT_YOLO']); detector.detect(frame, nv12=...)
+
+    ③ 水下图像预处理 (preprocess / _underwater_color_correct / _apply_clahe)
+         - 颜色校正 + 高斯去噪 + CLAHE 三个独立开关
+         - 被 front.py / bottom.py / LineDetector 三处复用
+
+外部依赖:
+    cv2 / numpy / copy
+    main_config.DEFAULT_CONFIG        (来自 main_config.py)
+    utils.py_utils.preprocess / postprocess  (YOLO 前后处理, 与本文件同级目录)
+
+阅读建议: 第一次接触先看 ②(YoloDetector.detect 是主入口)，再按需要跳读 ① 和 ③。
 """
 
 import copy
@@ -14,6 +33,10 @@ import numpy as np
 
 from main_config import DEFAULT_CONFIG
 
+
+# =====================================================================
+# ① HSV 巡线检测器 (LineDetector)
+# =====================================================================
 class LineDetector:
     """
     巡线检测器 (HSV 引导线识别)
@@ -443,6 +466,9 @@ class LineDetector:
 
 
 
+# =====================================================================
+# ② YOLO 检测器 (YoloDetector + YoloDetect + 通用辅助)
+# =====================================================================
 """
 YOLO 检测模块 (module_YOLO.py)
 
@@ -505,16 +531,20 @@ class NullTimer:
     """空计时器: 关闭阶段统计时使用 (接口与 StageTimer 一致, 近零开销)."""
 
     def measure(self, stage):
+        """返回一个空测量上下文管理器（不记录任何耗时）。"""
         return _NullMeasure()
 
 
 class _NullMeasure:
+    """空测量上下文管理器：与 NullTimer 配套，未启用阶段统计时 measure() 返回它，近零开销且接口兼容 StageTimer。"""
     __slots__ = ()
 
     def __enter__(self):
+        """进入上下文：返回自身。"""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文：不吞异常，原样返回 False。"""
         return False
 
 
@@ -809,6 +839,7 @@ class YoloDetector:
     """
 
     def __init__(self, cfg: dict, timer=None):
+        """初始化检测器：解析后端(hbm/ultralytics)、预处理模式、类别名与目标过滤，并按 backend 加载对应模型（hbm 走 BPU，ultralytics 走开发机 .pt）。"""
         self.cfg = cfg
         self.backend = cfg.get('backend', 'hbm')
         self.timer = timer or NULL_TIMER   # 阶段计时 (推理/后处理)
@@ -984,6 +1015,9 @@ class YoloDetector:
 
 
 
+# =====================================================================
+# ③ 水下图像预处理 (preprocess / _underwater_color_correct / _apply_clahe)
+# =====================================================================
 """
 预处理模块 (module_preprocess.py)
 
