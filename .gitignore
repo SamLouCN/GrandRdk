@@ -34,8 +34,3 @@ Thumbs.db
 *.swo
 *.log
 *.out
-
-main.py.bak_20260913_152832
-*.py.bak_v321
-*.hbm
-*.so
