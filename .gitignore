@@ -34,3 +34,6 @@ Thumbs.db
 *.swo
 *.log
 *.out
+
+
+runs/
