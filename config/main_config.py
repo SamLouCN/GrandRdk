@@ -122,8 +122,8 @@ DEFAULT_CONFIG = {  # 合成后的全局配置字典，供各业务进程直接�
     'FRONT_CAMERA': {  # 前视相机采集参数段
         'device': QC.FRONT_DEVICE,  # 设备节点，由 camera_ports.device_for('cam1') 解析
         'index':  0,  # 相机节点 index 兜底值，实际以 device_for 结果为准
-        'width':  640,  # 采集宽度，需相机 MJPG 支持该分辨率否则开流失败
-        'height': 480,  # 采集高度
+        'width':  1280,  # 采集宽度，需相机 MJPG 支持该分辨率否则开流失败
+        'height': 720,  # 采集高度
         'fps':    QC.FRONT_FPS,  # 请求帧率，受 USB 带宽与后端能力限制
         'format': 'MJPG',  # 像素格式，MJPG 才能走 JPU 硬件解码
         'backend': 'auto',  # OpenCV 采集后端，auto 优先选 V4L2
@@ -162,13 +162,13 @@ DEFAULT_CONFIG = {  # 合成后的全局配置字典，供各业务进程直接�
     'BOTTOM_CAMERA': {  # 下视相机采集参数段
         'device': QC.BOTTOM_DEVICE,  # 设备节点，由 camera_ports.device_for('cam2') 解析
         'index':  2,  # 相机节点 index 兜底值
-        'width':  640,  # 采集宽度
-        'height': 480,  # 采集高度
+        'width':  1280,  # 采集宽度
+        'height': 720,  # 采集高度
         'fps':    QC.BOTTOM_FPS,  # 请求帧率
         'format': 'MJPG',  # 像素格式
         'backend': 'auto',  # OpenCV 采集后端
         'hardware_decode': True,  # True 用 JPU 硬件解码
-        'mark_point': [320, 240],  # 画面中心十字标注点
+        'mark_point': [640, 360],  # 画面中心十字标注点
         'rotate_180': True,  # 下视相机物理装反，软件补偿 180° 旋转(转正画面与检测坐标)；硬件修好后置 False
     },
 

@@ -27,8 +27,8 @@ GATE_VISKF_PATH = '/dev/shm/momo_viskf.json'   # viskf 输出
 
 # ---- 视觉源 ----
 GATE_DET_PATH  = '/dev/shm/momo_det_front.json'
-GATE_IMG_W     = 640
-GATE_IMG_H     = 480
+GATE_IMG_W     = 1280
+GATE_IMG_H     = 720
 GATE_STALE_S   = 0.5     # 检测/滤波文件 mtime 超时 → 视同丢帧
 GATE_LABEL     = 'door'  # 参与的类别, 多个同标签取 score 最高
 GATE_W_PASS    = 0.85    # 门框宽占比 → 到位出口(留桩)
