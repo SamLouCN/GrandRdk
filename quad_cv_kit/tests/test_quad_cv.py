@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """red_pole_cv —— 离线自测（合成图，零板端依赖）
 
-跑法（本机工作区 venv **没有 cv2**，用 Anaconda 的）：
-    D:\\Anaconda\\python.exe test_quad_cv.py            # 全部断言
-    D:\\Anaconda\\python.exe test_quad_cv.py --probe    # 打印几何/阈值对照表，不断言
+跑法（需要 numpy + opencv-python）：
+    python tests/test_quad_cv.py            # 全部断言
+    python tests/test_quad_cv.py --probe    # 打印几何/阈值对照表，不断言
 
 ★ 本文件的价值：**几何与 lvl 逻辑不依赖板端数据** ⇒ 在 Stage 0 抓帧之前就能把算法钉死。
   只有"阈值/红度可分离度"必须等真实帧（见 `../开发计划.md` §5 Stage 0）。
@@ -14,11 +14,14 @@ import math
 import os
 import sys
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 try:
     import cv2
     import numpy as np
 except Exception as e:                                # pragma: no cover
-    print('需要 cv2 + numpy（用 D:\\Anaconda\\python.exe 跑）：%s' % e)
+    print('需要 cv2 + numpy（python -m pip install -r requirements.txt）：%s' % e)
     sys.exit(2)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))        # .../branches/red_pole_cv/tests
@@ -39,7 +42,7 @@ def _find(rel, start, up=6):
 
 
 # 本目录（kit 布局）+ 兼容原 branches/red_pole_cv/tests 布局
-sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.join(_BR, 'src'))
 sys.path.insert(0, os.path.join(_BR, 'board'))
 # 分支①的 quad_geom（psi/中心/面积都复用它）
 _GK = _find(('branches', 'gate_kpt', 'board'), os.path.dirname(_BR)) or \
@@ -328,7 +331,7 @@ def _t13():
 
 
 # ------------------------------------------------ 纵向残缺（2026-10-06 用户口径）
-@case('★ 下边切掉门、横杆仍大半可见 ⇒ **不降级**，ψ 方向正确（量级略衰减）')
+@case('★ 下边出画、横杆证据不足 ⇒ 降级，不外推完整门框')
 def _t14():
     img, ct, bb = make_door_img(yaw=+15.0, z=1.2, gy=+0.30)
     ymax = max(p[1] for p in ct)
@@ -336,29 +339,25 @@ def _t14():
     pt = psi_of(ct)
     r = D.detect(img, bb, img_wh=(img.shape[1], img.shape[0]))
     assert r['diag']['clip_v'] is True, r['diag']
-    assert r['lvl'] == 4, 'lvl=%d why=%s sup=%s' % (
+    assert r['lvl'] == 3, 'lvl=%d why=%s sup=%s' % (
         r['lvl'], r['why'], r['diag'].get('line_support'))
-    psi = r['fields'].get('psi')
-    assert psi is not None and psi > 0.0, 'psi 符号错：%s' % psi
-    # ★ 下边被切 ⇒ 左右两侧长度被同一条底边截断 ⇒ ψ **量级被压向 0**（本帧 ~40%）。
-    #   保守但方向对（宁可少转、绝不反着转）；不做固定增益补偿（截断比例在变）。
-    assert 0.30 * pt <= psi <= pt + 0.02, 'psi=%.4f 真=%.4f' % (psi, pt)
-    return 'lvl=%d src=%s psi=%.4f(真 %.4f)' % (r['lvl'], r.get('psi_src'), psi, pt)
+    assert r['corners'] is None, '证据不足时不能外推完整四边形'
+    assert r['fields'].get('psi') is None
+    return 'lvl=3 corners=None'
 
 
-@case('★ 上边切掉门、横杆仍大半可见 ⇒ **不降级**，ψ 方向正确')
+@case('★ 上边出画、横杆证据不足 ⇒ 降级，不外推完整门框')
 def _t15():
     img, ct, bb = make_door_img(yaw=-15.0, z=1.2, gy=-0.30)
     ymin = min(p[1] for p in ct)
     assert ymin < 4, '前提不成立：门没被上边切到 ymin=%.1f' % ymin
     pt = psi_of(ct)
     r = D.detect(img, bb, img_wh=(img.shape[1], img.shape[0]))
-    assert r['lvl'] == 4, 'lvl=%d why=%s sup=%s' % (
+    assert r['lvl'] == 3, 'lvl=%d why=%s sup=%s' % (
         r['lvl'], r['why'], r['diag'].get('line_support'))
-    psi = r['fields'].get('psi')
-    assert psi is not None and psi < 0.0, 'psi 符号错：%s' % psi
-    assert -(abs(pt) + 0.02) <= psi <= -0.4 * abs(pt), 'psi=%.4f 真=%.4f' % (psi, pt)
-    return 'lvl=%d src=%s psi=%.4f(真 %.4f)' % (r['lvl'], r.get('psi_src'), psi, pt)
+    assert r['corners'] is None, '证据不足时不能外推完整四边形'
+    assert r['fields'].get('psi') is None
+    return 'lvl=3 corners=None'
 
 
 @case('★★ 横杆整个出画 ⇒ 那条假线必须被丢，**宁可降级也不给错 ψ**')

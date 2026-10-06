@@ -42,6 +42,11 @@ from __future__ import annotations
 
 import math
 
+if __package__:
+    from .pole_lines import fit_pole, verify_quad
+else:
+    from pole_lines import fit_pole, verify_quad
+
 try:
     import numpy as np
 except Exception:                                    # pragma: no cover
@@ -53,7 +58,10 @@ except Exception:                                    # pragma: no cover
     cv2 = None
 
 try:
-    import quad_geom as _G                            # 分支①产物，优先复用
+    if __package__:
+        from . import quad_geom as _G
+    else:
+        import quad_geom as _G                        # 支持板端直接导入
 except Exception:
     _G = None
 
@@ -61,6 +69,8 @@ _EPS = 1e-9
 
 # ---------------------------------------------------------------- 默认参数
 DEFAULTS = dict(
+    robust_lines=True,      # 拟合独立杆中心线并验证整条边，避免杂点拉歪最小二乘线
+    pixel_scale=1.0,        # 像素阈值相对640宽参考帧的倍率
     # --- ROI ---
     roi_pad=0.15,          # door bbox 外扩比例（框紧贴红管，不外扩会把杆切掉）
     clip_margin_px=4.0,    # 贴边判据（与现役 AUV_CLIP_MARGIN_PX 同口径）
@@ -286,8 +296,8 @@ def _fit_line(pts):
     """pts: Nx2 float32 → (p0, p1) 两个远端点；点太少/退化返回 None"""
     if cv2 is None or pts is None or len(pts) < 2:
         return None
-    vx, vy, x0, y0 = cv2.fitLine(pts.reshape(-1, 1, 2), cv2.DIST_L2, 0, 0.01, 0.01)
-    vx, vy, x0, y0 = float(vx), float(vy), float(x0), float(y0)
+    fitted = cv2.fitLine(pts.reshape(-1, 1, 2), cv2.DIST_L2, 0, 0.01, 0.01)
+    vx, vy, x0, y0 = fitted.reshape(-1).tolist()
     n = math.hypot(vx, vy)
     if n < _EPS:
         return None
@@ -341,6 +351,12 @@ def fit_four_lines(mask, bbox, opts=None):
     minp = int(_o(opts, 'min_line_px'))
     out = {}
     for k in ('left', 'right', 'top', 'bottom'):
+        if _o(opts, 'robust_lines'):
+            ln = fit_pole(mask, bbox, k, band_rect(bbox, k, opts),
+                          float(_o(opts, 'pixel_scale')))
+            if ln:
+                out[k] = ln
+            continue
         pts = _band_pts(mask, *band_rect(bbox, k, opts))
         if pts is None or len(pts) < minp:
             continue
@@ -706,6 +722,8 @@ def quad_fields(corners, fx=0.0, bbox_cx=None):
                                     _dist(corners[0], corners[1]), _dist(corners[2], corners[3]))
     d = {'cx': center[0], 'cy': center[1], 'w': w, 'h': h, 'area': area,
          'psi': psi, 'lens': [left, right, top, bottom]}
+    if G:
+        d['edges'] = G.edge_metrics(corners)
     if psi is not None and fx and w > _EPS:
         d['psi_deg'] = math.degrees(math.atan(2.0 * float(fx) * psi / w))
     else:
@@ -783,6 +801,15 @@ def detect(frame_bgr, bbox, opts=None, ball_boxes=(), img_wh=None):
         out['why'] = 'no-input'
         return out
     H, W = (frame_bgr.shape[0], frame_bgr.shape[1])
+    # Fixed pixel thresholds must follow input resolution; colour thresholds do not.
+    scale = float((opts or {}).get('pixel_scale', max(W / 640, H / 480)))
+    opts = dict(opts or {})
+    for key in ('clip_margin_px', 'line_tol_px', 'pole_w_min', 'edge_trim_px'):
+        opts[key] = float(_o(opts, key)) * scale
+    opts['morph_px'] = max(1, int(_o(opts, 'morph_px') * scale) // 2 * 2 + 1)
+    opts['min_blob_px'] = float(_o(opts, 'min_blob_px')) * scale * scale
+    opts['min_area_px'] = float(_o(opts, 'min_area_px')) * scale * scale
+    opts['pixel_scale'] = scale
     if img_wh:
         W, H = int(img_wh[0]), int(img_wh[1])
 
@@ -835,19 +862,37 @@ def detect(frame_bgr, bbox, opts=None, ball_boxes=(), img_wh=None):
 
     # ---- 四边带拟合（★ mask 是 ROI 局部坐标，故带也用局部坐标）----
     roi_box = (0, 0, rx2 - rx1, ry2 - ry1)
-    raw_lines = fit_four_lines(mask, roi_box, opts)
+    # The ROI supplies surrounding pixels, but the YOLO bbox locates the target poles.
+    fit_box = (x1-rx1, y1-ry1, x2-rx1, y2-ry1)
+    if _o(opts, 'robust_lines'):
+        bw, bh = x2-x1, y2-y1
+        fit_box = (fit_box[0]-.04*bw, fit_box[1]-.04*bh,
+                   fit_box[2]+.04*bw, fit_box[3]+.04*bh)
+        fit_box = (max(0, fit_box[0]), max(0, fit_box[1]),
+                   min(mask.shape[1], fit_box[2]), min(mask.shape[0], fit_box[3]))
+    else:
+        fit_box = roi_box
+    raw_lines = fit_four_lines(mask, fit_box, opts)
     # ★★ 证据驱动：**不管 clip 与否**，一条线要同时过两道门才留
     #   ① `line_support` 沿线覆盖度 —— 砍"两根立柱截面连成的假横线"
     #   ② `band_fill`    带内密度   —— 砍"贴着画面边界的断续杂波"（★ 2026-10-06 板端真帧发现：
     #      门底边出画时 bottom 带被夹到图像下沿，里面只剩几段小白点，
     #      而这些杂波恰好散在"贴画面底边的那条线"上 ⇒ 支撑度也能算出 1.0，单靠①会被骗）
-    lines, sup, fil, run = filter_lines_by_support(mask, roi_box, raw_lines, opts, src=used)
+    lines, sup, fil, run = filter_lines_by_support(mask, fit_box, raw_lines, opts, src=used)
     out['diag']['lines_raw'] = sorted(raw_lines.keys())
     out['diag']['lines'] = sorted(lines.keys())
     out['diag']['line_support'] = sup
     out['diag']['band_fill'] = fil
     out['diag']['band_run'] = run
     corners = corners_from_lines(lines)
+    if corners is not None and _o(opts, 'robust_lines'):
+        valid, evidence = verify_quad(mask, corners, (x1-rx1, y1-ry1, x2-rx1, y2-ry1),
+                                      float(_o(opts, 'line_tol_px')))
+        out['diag'].update(evidence)
+        out['diag']['polygon_supported'] = valid
+        if not valid:
+            # No previous-frame substitution or smoothing can make these poles real.
+            corners = None
     if corners is not None:                              # 局部 → 全画幅
         corners = [(float(p[0]) + rx1, float(p[1]) + ry1) for p in corners]
 
@@ -935,6 +980,10 @@ def detect(frame_bgr, bbox, opts=None, ball_boxes=(), img_wh=None):
         out['why'] = struct_why or '结构不过'
         out['corners'] = _round_quad(corners)
         out['fields'] = quad_fields(corners, fx=fx, bbox_cx=bbox_cx)
+        # 结构未通过的四边形只用于诊断，不能输出可用的偏航量。
+        out['fields']['psi'] = None
+        out['fields']['psi_deg'] = None
+        out['fields']['psi_alt'] = None
         return out
 
     # ---- ⑥ 线凑不齐 ----

@@ -1,0 +1,26 @@
+{
+  "model": "air_intrinsics_flat_port",
+  "width": 640,
+  "height": 480,
+  "matrix": [
+    [
+      318.8,
+      0,
+      320.0
+    ],
+    [
+      0,
+      318.8,
+      240.0
+    ],
+    [
+      0,
+      0,
+      1
+    ]
+  ],
+  "distortion": null,
+  "n_water": 1.333,
+  "glass_distance_m": 0.013,
+  "note": "10-06 实跑按一格接头中心距 0.82 m 反算；畸变按零；玻璃距离为估计值"
+}

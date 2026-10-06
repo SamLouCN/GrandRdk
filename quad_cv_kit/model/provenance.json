@@ -1,0 +1,9 @@
+{
+  "active": "best.pt",
+  "source": "best.pt supplied in quad_cv_kit root",
+  "classes": [
+    "door"
+  ],
+  "sha256": "D56DDB6DE83C8673AFEE8C2D568A7D0540A64E31C5572BF3AC51F60FDEDB4754",
+  "backup": "best_corners.pt"
+}

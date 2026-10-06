@@ -51,14 +51,20 @@ from quad_vision import QuadVisionIF, VisionIF  # noqa: F401  (VisionIF 供 make
 
 # quad_cv_det / frame_io 是本分支**新增**文件 —— 缺文件/坏版本都不许拖死 AUV
 try:
-    import quad_cv_det as QD
-    import frame_io
+    if __package__:
+        from . import quad_cv_det as QD, frame_io
+    else:
+        import quad_cv_det as QD
+        import frame_io
 except Exception:                                      # pragma: no cover
     QD = None
     frame_io = None
 
 try:
-    import quad_geom as G
+    if __package__:
+        from . import quad_geom as G
+    else:
+        import quad_geom as G
 except Exception:                                      # pragma: no cover
     G = None
 

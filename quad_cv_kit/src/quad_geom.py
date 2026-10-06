@@ -527,6 +527,31 @@ def edge_lens(quad):
             math.hypot(tl[0] - bl[0], tl[1] - bl[1]))
 
 
+def edge_metrics(quad):
+    """四边像长(px)和相对图像水平线的倾角(deg)，顺序 top/right/bottom/left。
+
+    图像 x 向右、y 向下；倾角以数学坐标为准，逆时针为正。
+    无向直线角归一到 (-90, 90]：水平=0、竖直=90，端点交换不改变角度。
+    这是像面测量，不是物理长度或相对重力水平面的三维角度。
+    """
+    if quad is None or len(quad) != 4:
+        return {}
+    quad = [as_point(p) for p in quad]
+    if any(p is None or not all(math.isfinite(v) for v in p) for p in quad):
+        return {}
+    result = {}
+    for name, a, b in zip(('top', 'right', 'bottom', 'left'), quad, quad[1:] + quad[:1]):
+        dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
+        length = math.hypot(dx, dy)
+        if not math.isfinite(length) or length < 1e-9:
+            return {}
+        angle = math.degrees(math.atan2(-dy, dx)) % 180.0
+        if angle > 90.0:
+            angle -= 180.0
+        result[name] = {'length_px': length, 'angle_deg': angle}
+    return result
+
+
 def poly_area(pts):
     """任意点数的鞋带面积（点不足 3 个返回 None）"""
     p = [x for x in (pts or []) if x is not None]
