@@ -416,6 +416,7 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             self.log("[ERR] %s.build_telemetry 异常: %s" % (mode.name, e))  # 打印异常
         if not txt:  # 模式没提供或未实现
             txt = TB.build_tel(self.last_tel)  # 回落到统一映射组帧
+        txt = TB.append_fusion_fields(txt)  # v3.6: 帧尾追加融合深度/净空（无效/缺失原样返回）
         if txt and self.pc_link.send_telem(txt):  # 有内容且发送成功
             self.stats["tel_tx"] += 1  # 上行帧计数
 
