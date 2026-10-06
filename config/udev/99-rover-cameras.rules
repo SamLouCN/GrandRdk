@@ -1,0 +1,17 @@
+# RDK S100 / GrandRDK —— 物理 USB 端口 ↔ 摄像头固定绑定
+# 适用板：RDK S100；当前 USB 拓扑（按 udev KERNELS 物理口路径）：
+#   1-1 (Bus 001) = 内窥镜  Silicon Motion 090c:f37d  → cam3
+#   1-2 (Bus 001) = 前视     Realtek 0bda:5883          → cam1
+#   3-2 (Bus 003) = 下视     Realtek 0bda:5883          → cam2
+# 重要：cam1 与 cam2 型号/序列号相同（均为 20000001），只能按 USB 物理口区分；
+#       若物理接线变更，必须同步修改下方 KERNELS 值并重启 udev。
+# 规则只作用于 V4L2 capture 节点（ATTR{index}=="0"），不绑定 metadata 节点 index=1。
+
+# cam1 前视 —— USB 口 1-2 (Bus 001, Port 2)
+SUBSYSTEM=="video4linux", KERNELS=="1-2", ATTR{index}=="0", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="5883", SYMLINK+="cam1"
+
+# cam2 下视 —— USB 口 3-2 (Bus 003, Port 2)
+SUBSYSTEM=="video4linux", KERNELS=="3-2", ATTR{index}=="0", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="5883", SYMLINK+="cam2"
+
+# cam3 内窥镜 —— USB 口 1-1 (Bus 001, Port 1)
+SUBSYSTEM=="video4linux", KERNELS=="1-1", ATTR{index}=="0", ATTRS{idVendor}=="090c", ATTRS{idProduct}=="f37d", SYMLINK+="cam3"

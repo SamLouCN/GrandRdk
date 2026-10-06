@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>GrandRDK 实时监控</title>
+<style>
+  :root{
+    /* 品牌 */
+    --brand:#15024F;
+    --brand-2:#1e0a66;
+    /* 通道色（沿用原设计，保留辨识度） */
+    --ch-front:#15024F;
+    --ch-bottom:#68217a;
+    /* 状态色（全页唯一的语义色，其余一律中性） */
+    --s-target:#157347;
+    --s-idle:#3f4a5a;
+    --s-stale:#9a6207;
+    --s-dead:#a4272d;
+    --s-wait:#5b6472;
+    /* 中性 */
+    --ink:#16181d;
+    --ink2:#454b55;
+    --muted:#717884;
+    --line:#e3e5ea;
+    --line2:#cbd0d8;
+    --bg:#f1f2f5;
+    --card:#fff;
+    --mono:"Cascadia Mono",Consolas,"Courier New",ui-monospace,monospace;
+    --ui:"Segoe UI","Microsoft YaHei",-apple-system,BlinkMacSystemFont,Roboto,sans-serif;
+    --h-top:52px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg);color:var(--ink);font-family:var(--ui);font-size:14px;line-height:1.5;
+    min-height:100vh;-webkit-font-smoothing:antialiased;
+  }
+  button{font-family:inherit}
+
+  /* ================= 顶栏 ================= */
+  .top{
+    position:sticky;top:0;z-index:20;height:var(--h-top);
+    display:flex;align-items:center;gap:16px;padding:0 16px;
+    background:var(--brand);color:#fff;
+    box-shadow:0 1px 0 rgba(0,0,0,.15);
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:16px;letter-spacing:.01em;white-space:nowrap}
+  .brand .mark{width:9px;height:9px;background:#b6e04a;flex-shrink:0}
+  .brand .mark.off{background:#ff7b7b}
+  .brand small{font-weight:400;font-size:11.5px;color:rgba(255,255,255,.62);letter-spacing:.1em;text-transform:uppercase}
+
+  .top-spacer{flex:1}
+
+  /* 全局健康概览：一眼看两路是否在跑 */
+  .overview{display:flex;gap:6px}
+  .ov{
+    display:flex;align-items:center;gap:6px;padding:4px 10px;
+    border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.07);
+    font-size:12px;white-space:nowrap;
+  }
+  .ov i{width:7px;height:7px;border-radius:50%;background:#8d93a0;flex-shrink:0}
+  .ov[data-s="target"] i{background:#4ade80}
+  .ov[data-s="idle"]   i{background:#9aa3b2}
+  .ov[data-s="stale"]  i{background:#fbbf24}
+  .ov[data-s="dead"]   i{background:#f87171}
+  .ov b{font-weight:600;color:#fff}
+  .ov span{color:rgba(255,255,255,.7)}
+
+  .tools{display:flex;align-items:center;gap:6px}
+  .btn{
+    display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;
+    background:rgba(255,255,255,.09);color:#fff;border:1px solid rgba(255,255,255,.24);
+    font-size:12.5px;cursor:pointer;text-decoration:none;white-space:nowrap;
+    transition:background .12s,border-color .12s;
+  }
+  .btn:hover{background:rgba(255,255,255,.2);border-color:rgba(255,255,255,.45)}
+  .btn:focus-visible{outline:2px solid #b6e04a;outline-offset:1px}
+  .btn.primary{background:#fff;color:var(--brand);border-color:#fff;font-weight:600}
+  .btn.primary:hover{background:#e8e6f2}
+  .btn .kbd{
+    font-family:var(--mono);font-size:10px;padding:0 4px;border:1px solid rgba(255,255,255,.35);
+    color:rgba(255,255,255,.7);
+  }
+  .btn.primary .kbd{border-color:rgba(21,2,79,.3);color:rgba(21,2,79,.6)}
+
+  .clock{
+    font-family:var(--mono);font-size:13px;color:rgba(255,255,255,.86);
+    padding-left:14px;margin-left:4px;border-left:1px solid rgba(255,255,255,.22);
+    font-variant-numeric:tabular-nums;white-space:nowrap;
+  }
+
+  /* ================= 主区 ================= */
+  main{
+    display:grid;grid-template-columns:1fr 1fr;gap:14px;
+    padding:14px;max-width:1900px;margin:0 auto;align-items:start;
+  }
+  @media (max-width:1080px){ main{grid-template-columns:1fr} }
+  @media (max-width:640px){ main{padding:10px;gap:10px} }
+
+  /* ================= 相机卡片 ================= */
+  .cam{
+    background:var(--card);border:1px solid var(--line2);
+    border-left:4px solid var(--ch);
+    display:flex;flex-direction:column;overflow:hidden;
+    scroll-margin-top:calc(var(--h-top) + 10px);
+  }
+  #card-front{--ch:var(--ch-front)}
+  #card-bottom{--ch:var(--ch-bottom)}
+
+  /* --- 卡片头：状态优先 --- */
+  .cam-head{
+    padding:10px 14px 11px;color:#fff;background:var(--s-wait);
+    transition:background .18s;
+  }
+  .cam-head .row1{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+  .cam-head .name{font-size:17px;font-weight:600;letter-spacing:.01em}
+  .cam-head .ep{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.62)}
+  .cam-head .row2{display:flex;align-items:baseline;gap:10px;margin-top:5px;flex-wrap:wrap}
+  .cam-head .st{font-size:21px;font-weight:600;letter-spacing:.01em;line-height:1.15}
+  .cam-head .st-detail{font-family:var(--mono);font-size:12.5px;color:rgba(255,255,255,.88)}
+
+  /* 状态驱动头部底色 —— 全页唯一的语义色 */
+  .cam[data-s="target"] .cam-head{background:var(--s-target)}
+  .cam[data-s="idle"]   .cam-head{background:var(--s-idle)}
+  .cam[data-s="stale"]  .cam-head{background:var(--s-stale)}
+  .cam[data-s="dead"]   .cam-head{background:var(--s-dead)}
+
+  /* --- 画面 --- */
+  .cam-body{position:relative;background:#0b0b0e;aspect-ratio:4/3;overflow:hidden}
+  .cam-body img{width:100%;height:100%;object-fit:contain;display:block}
+  .ph{
+    position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:12px;color:rgba(255,255,255,.62);font-size:13.5px;pointer-events:none;text-align:center;padding:20px;
+  }
+  .ph .spin{width:22px;height:22px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .ph .sub{font-size:11.5px;color:rgba(255,255,255,.42);font-family:var(--mono)}
+
+  /* 画面悬浮操作 */
+  .cam-acts{
+    position:absolute;right:10px;bottom:10px;display:flex;gap:6px;
+    opacity:.55;transition:opacity .15s;
+  }
+  .cam-body:hover .cam-acts,.cam-acts:focus-within{opacity:1}
+  .icon-btn{
+    width:32px;height:32px;display:grid;place-items:center;cursor:pointer;
+    background:rgba(0,0,0,.58);color:#fff;border:1px solid rgba(255,255,255,.28);
+    transition:background .12s;
+  }
+  .icon-btn:hover{background:rgba(0,0,0,.85)}
+  .icon-btn:focus-visible{outline:2px solid #b6e04a;outline-offset:1px}
+  .icon-btn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+
+  /* --- 检测摘要：核心信息 --- */
+  .dets{border-top:1px solid var(--line);background:#fff}
+  .det{
+    display:grid;grid-template-columns:auto 1fr auto;gap:4px 12px;
+    padding:9px 14px;border-bottom:1px solid var(--line);align-items:baseline;
+  }
+  .det:last-child{border-bottom:none}
+  .det .tag{
+    font-family:var(--mono);font-size:11px;color:var(--muted);
+    grid-row:1/3;align-self:center;padding-top:1px;
+  }
+  .det .lab{font-weight:700;font-size:14.5px;color:var(--ink)}
+  .det .conf{
+    font-family:var(--mono);font-size:13px;font-weight:600;
+    color:var(--s-target);font-variant-numeric:tabular-nums;
+  }
+  .det .meta{font-family:var(--mono);font-size:11.5px;color:var(--ink2);grid-column:2/4}
+  .det .meta em{font-style:normal;color:var(--muted)}
+  .dets .none{padding:11px 14px;font-size:13px;color:var(--muted);display:flex;align-items:center;gap:8px}
+  .dets .none i{width:8px;height:8px;border:1.5px solid var(--line2);border-radius:50%;flex-shrink:0}
+
+  /* --- 健康数据：次要 --- */
+  .stats{
+    display:flex;flex-wrap:wrap;gap:4px 22px;padding:8px 14px;
+    border-top:1px solid var(--line);background:#fafbfc;
+    font-size:11.5px;color:var(--muted);letter-spacing:.02em;
+  }
+  .stats .it{display:flex;align-items:baseline;gap:5px}
+  .stats .it b{font-family:var(--mono);font-size:12.5px;font-weight:600;color:var(--ink2);font-variant-numeric:tabular-nums}
+  .stats .it.fresh b{color:var(--s-target)}
+  .stats .it.lag b{color:var(--s-stale)}
+  .stats .it.dead b{color:var(--s-dead)}
+
+  /* ================= 底部诊断 ================= */
+  footer{max-width:1900px;margin:0 auto;padding:0 14px 22px}
+  .debug{background:#fff;border:1px solid var(--line2)}
+  .debug>summary{
+    list-style:none;cursor:pointer;padding:11px 14px;
+    display:flex;align-items:center;gap:10px;
+    font-size:12.5px;color:var(--ink2);font-weight:600;letter-spacing:.02em;
+    user-select:none;
+  }
+  .debug>summary::-webkit-details-marker{display:none}
+  .debug>summary::before{
+    content:"▸";font-size:11px;color:var(--muted);transition:transform .15s;display:inline-block;
+  }
+  .debug[open]>summary::before{transform:rotate(90deg)}
+  .debug>summary:hover{color:var(--ink)}
+  .debug>summary .tail{margin-left:auto;font-weight:400;font-size:11.5px;color:var(--muted);font-family:var(--mono)}
+  .debug-body{padding:0 14px 14px}
+  .debug-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+  .chip{
+    font-family:var(--mono);font-size:11.5px;padding:4px 9px;text-decoration:none;
+    border:1px solid var(--line2);color:var(--ink2);background:#fff;
+  }
+  .chip:hover{border-color:var(--ink2);color:var(--ink)}
+  .keys{font-size:11.5px;color:var(--muted);margin-left:auto}
+  .keys kbd{
+    font-family:var(--mono);font-size:10.5px;border:1px solid var(--line2);
+    border-bottom-width:2px;padding:1px 5px;color:var(--ink2);background:#fafbfc;margin:0 2px;
+  }
+  .debug pre{
+    margin:0;padding:12px;background:#f6f7f9;border:1px solid var(--line);
+    max-height:320px;overflow:auto;font-family:var(--mono);font-size:11.5px;
+    line-height:1.6;color:var(--ink2);white-space:pre-wrap;word-break:break-all;
+  }
+
+  /* ================= 全屏 ================= */
+  .cam:fullscreen{
+    border:none;border-left-width:0;height:100vh;background:#000;
+  }
+  .cam:fullscreen .cam-head{padding:12px 18px}
+  .cam:fullscreen .cam-body{flex:1;aspect-ratio:auto;min-height:0}
+  .cam:fullscreen .cam-acts{opacity:1}
+  .cam:fullscreen .stats{background:#111;color:#9aa3b2;border-color:#222}
+  .cam:fullscreen .stats .it b{color:#e6e8ec}
+  .cam:fullscreen .dets{max-height:26vh;overflow:auto}
+
+  /* ================= 提示条 ================= */
+  #toast{
+    position:fixed;left:50%;bottom:26px;transform:translate(-50%,14px);
+    background:#16181d;color:#fff;font-size:13px;padding:9px 16px;
+    opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;z-index:60;
+    max-width:80vw;text-align:center;
+  }
+  #toast.on{opacity:1;transform:translate(-50%,0)}
+
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+</style>
+</head>
+<body>
+
+<h1 class="sr">GrandRDK 实时监控台：前视与下视双路检测画面、目标状态与运行指标</h1>
+
+<!-- ============ 顶栏：品牌 + 全局概览 + 快捷操作 ============ -->
+<header class="top">
+  <div class="brand">
+    <span class="mark" id="ws-mark" title="WebSocket 状态"></span>
+    GrandRDK 实时监控
+    <small>前视 / 下视</small>
+  </div>
+
+  <div class="overview" id="overview" role="status" aria-live="polite">
+    <div class="ov" data-s="wait" id="ov-front"><i></i><b>前视</b><span>等待…</span></div>
+    <div class="ov" data-s="wait" id="ov-bottom"><i></i><b>下视</b><span>等待…</span></div>
+  </div>
+
+  <div class="top-spacer"></div>
+
+  <div class="tools">
+    <a class="btn primary" id="lnk-cam3" href="#" target="_blank" rel="noopener" title="第三路相机取流（板端 :8084）">CAM3 取流</a>
+    <a class="btn" id="lnk-flow" href="#" target="_blank" rel="noopener" title="光流测速画面（板端 :8000）">光流测速</a>
+    <button class="btn" id="btn-debug" type="button" title="显示/隐藏原始数据">原始数据 <span class="kbd">D</span></button>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<!-- ============ 主区：两路相机 ============ -->
+<main>
+
+  <!-- 前视 -->
+  <section class="cam" id="card-front" data-s="wait">
+    <div class="cam-head">
+      <div class="row1">
+        <span class="name">前视</span>
+        <span class="ep">/cam1 · front · 红球</span>
+      </div>
+      <div class="row2">
+        <span class="st" id="front-st">等待数据…</span>
+        <span class="st-detail" id="front-std"></span>
+      </div>
+    </div>
+    <div class="cam-body">
+      <img id="front-img" src="/cam1" alt="前视相机实时画面">
+      <div class="ph" id="front-ph">
+        <div class="spin"></div>
+        <div>正在连接前视画面…</div>
+        <div class="sub">/cam1</div>
+      </div>
+      <div class="cam-acts">
+        <button class="icon-btn" data-fs="card-front" type="button" title="全屏（快捷键 1）" aria-label="前视全屏">
+          <svg viewBox="0 0 20 20"><path d="M3 7V3h4M17 7V3h-4M3 13v4h4M17 13v4h-4"/></svg>
+        </button>
+        <button class="icon-btn" data-snap="front" type="button" title="保存当前画面" aria-label="前视快照">
+          <svg viewBox="0 0 20 20"><path d="M3 6h3l1.2-2h5.6L14 6h3v10H3z"/><circle cx="10" cy="11" r="3"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="dets" id="front-dets"><div class="none"><i></i>等待数据…</div></div>
+    <div class="stats" id="front-stats"></div>
+  </section>
+
+  <!-- 下视 -->
+  <section class="cam" id="card-bottom" data-s="wait">
+    <div class="cam-head">
+      <div class="row1">
+        <span class="name">下视</span>
+        <span class="ep">/cam2 · bottom · 黄球</span>
+      </div>
+      <div class="row2">
+        <span class="st" id="bottom-st">等待数据…</span>
+        <span class="st-detail" id="bottom-std"></span>
+      </div>
+    </div>
+    <div class="cam-body">
+      <img id="bottom-img" src="/cam2" alt="下视相机实时画面">
+      <div class="ph" id="bottom-ph">
+        <div class="spin"></div>
+        <div>正在连接下视画面…</div>
+        <div class="sub">/cam2</div>
+      </div>
+      <div class="cam-acts">
+        <button class="icon-btn" data-fs="card-bottom" type="button" title="全屏（快捷键 2）" aria-label="下视全屏">
+          <svg viewBox="0 0 20 20"><path d="M3 7V3h4M17 7V3h-4M3 13v4h4M17 13v4h-4"/></svg>
+        </button>
+        <button class="icon-btn" data-snap="bottom" type="button" title="保存当前画面" aria-label="下视快照">
+          <svg viewBox="0 0 20 20"><path d="M3 6h3l1.2-2h5.6L14 6h3v10H3z"/><circle cx="10" cy="11" r="3"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="dets" id="bottom-dets"><div class="none"><i></i>等待数据…</div></div>
+    <div class="stats" id="bottom-stats"></div>
+  </section>
+
+</main>
+
+<!-- ============ 底部：诊断（默认收起） ============ -->
+<footer>
+  <details class="debug" id="debug">
+    <summary>
+      原始数据与诊断
+      <span class="tail" id="debug-tail"></span>
+    </summary>
+    <div class="debug-body">
+      <div class="debug-tools">
+        <a class="chip" href="/api/status" target="_blank" rel="noopener">/api/status</a>
+        <a class="chip" href="/api/detections" target="_blank" rel="noopener">/api/detections</a>
+        <a class="chip" href="/healthz" target="_blank" rel="noopener">/healthz</a>
+        <span class="keys">
+          <kbd>1</kbd><kbd>2</kbd> 全屏对应画面 · <kbd>D</kbd> 本面板 · <kbd>R</kbd> 重连
+        </span>
+      </div>
+      <pre id="debug-json">等待 WebSocket 数据…</pre>
+    </div>
+  </details>
+</footer>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+'use strict';
+
+/* ============================================================
+   常量
+   ============================================================ */
+const MARK = { x: 320, y: 240 };   // 与 main_config 的 mark_point 一致
+const FRESH_OK   = 2.0;            // 秒：此内视为实时
+const FRESH_WARN = 8.0;            // 秒：超过视为中断
+const SNAP_LABEL = { front: '前视', bottom: '下视' };
+
+const LABELS = {
+  wait:   '等待数据…',
+  target: '找到目标',
+  idle:   '未发现目标',
+  stale:  '数据滞后',
+  dead:   '数据中断'
+};
+
+const $ = id => document.getElementById(id);
+
+/* ============================================================
+   每路状态
+   ============================================================ */
+function blank() {
+  return {
+    det: null, stats: null,
+    detTs: null,            // 板端给的帧时间戳（用来判断是否还在更新）
+    changedAt: null,        // 本机单调时钟：detTs 最后一次变化的时刻
+    hasData: false
+  };
+}
+const st = { front: blank(), bottom: blank() };
+
+/* 相对标记点的偏移文本 */
+function relText(center) {
+  if (!Array.isArray(center) || center.length < 2) return '';
+  const [cx, cy] = center;
+  if (typeof cx !== 'number' || typeof cy !== 'number') return '';
+  const dx = cx - MARK.x, dy = cy - MARK.y;
+  return `相对标记点 (${dx >= 0 ? '+' : ''}${dx}, ${dy >= 0 ? '+' : ''}${dy})`;
+}
+
+/* 判定状态：用「板端时间戳是否还在变」而不是比对两端时钟，避免时钟不同步误判 */
+function stateOf(side) {
+  const s = st[side];
+  if (!s.hasData || s.changedAt === null) return 'wait';
+  const age = (performance.now() - s.changedAt) / 1000;
+  if (age > FRESH_WARN) return 'dead';
+  if (age > FRESH_OK) return 'stale';
+  const n = (s.det && Array.isArray(s.det.dets)) ? s.det.dets.length : 0;
+  return n > 0 ? 'target' : 'idle';
+}
+
+function ageText(side) {
+  const s = st[side];
+  if (!s.hasData || s.changedAt === null) return '—';
+  const age = (performance.now() - s.changedAt) / 1000;
+  if (age < 1) return '实时';
+  if (age < 60) return age.toFixed(1) + 's 前';
+  return Math.floor(age / 60) + 'm 前';
+}
+
+/* ============================================================
+   渲染
+   ============================================================ */
+const esc = s => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+const num = (v, d = 1) =>
+  (v === null || v === undefined || isNaN(Number(v))) ? '--' : Number(v).toFixed(d);
+
+/* 只在内容真变化时写 DOM，减少无谓重排 */
+function setText(el, v) { if (el.textContent !== v) el.textContent = v; }
+
+/* 头部：状态是主角 */
+function renderHead(side, state) {
+  const s = st[side];
+  const head = $(side + '-st');
+  const detail = $(side + '-std');
+  const dets = (s.det && Array.isArray(s.det.dets)) ? s.det.dets : [];
+
+  setText(head, LABELS[state]);
+
+  let d;
+  if (state === 'target') {
+    const names = [...new Set(dets.map(d => d.label))].join(' / ');
+    const best = dets.reduce((a, b) => (b.score > a.score ? b : a), dets[0]);
+    d = `${dets.length} 个 · ${names} · 最高 ${num(best.score, 2)}`;
+  } else if (state === 'stale' || state === 'dead') {
+    d = '最后更新 ' + ageText(side);
+  } else if (state === 'idle') {
+    d = '画面正常 · 无匹配目标';
+  } else {
+    d = '等待检测数据…';
+  }
+  setText(detail, d);
+}
+
+/* 检测明细 */
+function renderDets(side, state) {
+  const box = $(side + '-dets');
+  const s = st[side];
+  const dets = (s.det && Array.isArray(s.det.dets)) ? s.det.dets : [];
+
+  if (dets.length === 0) {
+    const txt = state === 'dead' ? '数据中断，显示的是最后一次结果'
+              : state === 'stale' ? '数据滞后，结果可能已过期'
+              : '当前画面中未发现目标';
+    box.innerHTML = `<div class="none"><i></i>${esc(txt)}</div>`;
+    return;
+  }
+
+  box.innerHTML = dets.map((d, i) => {
+    const [x1, y1, x2, y2] = d.bbox || [];
+    const meta = [
+      `中心 (${d.center ? d.center.join(', ') : '-'})`,
+      relText(d.center),
+      `bbox (${[x1, y1, x2, y2].join(', ')})`
+    ].filter(Boolean).join(' · ');
+    return `<div class="det">
+      <span class="tag">#${i + 1}</span>
+      <span class="lab">${esc(d.label)}</span>
+      <span class="conf">conf ${num(d.score, 2)}</span>
+      <span class="meta">${esc(meta)}</span>
+    </div>`;
+  }).join('');
+}
+
+/* 健康指标 */
+function renderStats(side, state) {
+  const box = $(side + '-stats');
+  const s = st[side];
+  const g = s.stats || {};
+  const cls = state === 'dead' ? 'dead' : state === 'stale' ? 'lag' : 'fresh';
+
+  box.innerHTML =
+    `<span class="it ${cls}">数据<b>${esc(ageText(side))}</b></span>` +
+    `<span class="it">FPS<b>${num(g.fps)}</b></span>` +
+    `<span class="it">采集<b>${num(g.capture_ms)} ms</b></span>` +
+    `<span class="it">检测<b>${num(g.detect_ms)} ms</b></span>` +
+    `<span class="it">累计帧<b>${g.frames != null ? esc(g.frames) : '--'}</b></span>`;
+}
+
+/* 顶栏概览 */
+function renderOverview(state) {
+  ['front', 'bottom'].forEach(side => {
+    const el = $('ov-' + side);
+    const s = st[side];
+    const dets = (s.det && Array.isArray(s.det.dets)) ? s.det.dets : [];
+    if (el.dataset.s !== state[side]) el.dataset.s = state[side];
+    const label = state[side] === 'target'
+      ? `找到 ${dets.length}`
+      : LABELS[state[side]].replace('数据', '').replace('目标', '');
+    const span = el.querySelector('span');
+    if (span.textContent !== label) span.textContent = label;   // 值没变就不动 DOM，避免读屏刷屏
+  });
+}
+
+function renderAll() {
+  const state = { front: stateOf('front'), bottom: stateOf('bottom') };
+  ['front', 'bottom'].forEach(side => {
+    const card = $('card-' + side);
+    card.dataset.s = state[side];
+    renderHead(side, state[side]);
+    renderDets(side, state[side]);
+    renderStats(side, state[side]);
+  });
+  renderOverview(state);
+}
+
+/* 数据摄取 */
+function ingest(side, det, stats, recvAt) {
+  const s = st[side];
+  if (stats && typeof stats === 'object' && !Array.isArray(stats)) s.stats = stats;
+  if (det && typeof det === 'object' && !Array.isArray(det)) {
+    s.det = det;
+    const ts = det.ts;
+    if (ts !== undefined && ts !== null) {
+      s.hasData = true;
+      if (ts !== s.detTs) { s.detTs = ts; s.changedAt = recvAt; }
+    }
+  }
+  if (stats && stats.ts !== undefined && stats.ts !== null) s.hasData = true;
+}
+
+/* ============================================================
+   画面：加载失败重试
+   ============================================================ */
+['front', 'bottom'].forEach(side => {
+  const img = $(side + '-img');
+  const ph = $(side + '-ph');
+  let tries = 0;
+
+  img.addEventListener('load', () => {
+    ph.style.display = 'none';
+    tries = 0;
+  });
+  img.addEventListener('error', () => {
+    tries++;
+    ph.style.display = 'flex';
+    ph.querySelector('div:nth-child(2)').textContent =
+      tries <= 1 ? '画面未就绪，2s 后重试…' : `画面连不上（已重试 ${tries} 次）`;
+    setTimeout(() => {
+      const base = img.src.split('?')[0];
+      img.src = `${base}?t=${Date.now()}`;
+    }, 2000);
+  });
+});
+
+/* ============================================================
+   全屏
+   ============================================================ */
+function toggleFullscreen(cardId) {
+  const card = $(cardId);
+  if (!card) return;
+  if (document.fullscreenElement === card) { document.exitFullscreen(); return; }
+  if (document.fullscreenElement) document.exitFullscreen();
+  const p = card.requestFullscreen ? card.requestFullscreen() : null;
+  if (p && p.catch) p.catch(() => toast('浏览器拒绝了全屏请求'));
+}
+
+document.querySelectorAll('[data-fs]').forEach(btn => {
+  btn.addEventListener('click', () => toggleFullscreen(btn.dataset.fs));
+});
+
+/* ============================================================
+   快照：从当前 MJPEG 帧抓一张
+   ============================================================ */
+function snapshot(side) {
+  const img = $(side + '-img');
+  if (!img.naturalWidth) { toast('画面还没就绪，无法快照'); return; }
+  try {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    c.getContext('2d').drawImage(img, 0, 0);
+    const url = c.toDataURL('image/png');
+    const a = document.createElement('a');
+    const t = new Date();
+    const p = n => String(n).padStart(2, '0');
+    a.href = url;
+    a.download = `grandrdk_${side}_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}_${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}.png`;
+    document.body.appendChild(a); a.click(); a.remove();
+    toast(`${SNAP_LABEL[side]}快照已保存`);
+  } catch (e) {
+    toast('快照失败：' + e.message);
+  }
+}
+document.querySelectorAll('[data-snap]').forEach(btn => {
+  btn.addEventListener('click', () => snapshot(btn.dataset.snap));
+});
+
+/* ============================================================
+   诊断面板
+   ============================================================ */
+const debugEl = $('debug');
+const debugJson = $('debug-json');
+let lastPayload = null;
+let lastRecvAt = null;
+
+function updateTail() {
+  const p2 = n => String(n).padStart(2, '0');
+  const t = lastRecvAt ? new Date(lastRecvAt) : null;
+  const hhmmss = t ? `${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}` : '--:--:--';
+  const mode = (ws && ws.readyState === 1) ? 'WS 推送' : 'HTTP 轮询';
+  setText($('debug-tail'), lastPayload ? `${mode} · 最后 ${hhmmss}` : '尚未收到数据');
+}
+
+function renderDebug() {
+  if (!lastPayload) return;
+  try { debugJson.textContent = JSON.stringify(lastPayload, null, 2); }
+  catch (e) { debugJson.textContent = String(lastPayload); }
+}
+$('btn-debug').addEventListener('click', () => { debugEl.open = !debugEl.open; });
+debugEl.addEventListener('toggle', () => { if (debugEl.open) renderDebug(); });
+
+/* ============================================================
+   顶栏外部入口（板端另两个服务的端口）
+   ============================================================ */
+(function initLinks() {
+  const host = location.hostname;
+  if (!host) {
+    ['lnk-cam3', 'lnk-flow'].forEach(id => {
+      const a = $(id);
+      a.removeAttribute('href');
+      a.style.opacity = '.45';
+      a.style.cursor = 'not-allowed';
+      a.title = '本地预览无法跳转，请从板端地址访问';
+    });
+    return;
+  }
+  $('lnk-cam3').href = `http://${host}:8084/`;
+  $('lnk-flow').href = `http://${host}:8000/`;
+})();
+
+/* ============================================================
+   时钟
+   ============================================================ */
+const pad = n => String(n).padStart(2, '0');
+setInterval(() => {
+  const d = new Date();
+  $('clock').textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}, 1000);
+$('clock').textContent = (() => {
+  const d = new Date();
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+})();
+
+/* ============================================================
+   WebSocket（主通道）+ REST（保底）
+   ============================================================ */
+let ws = null, retryTimer = null, backoff = 1000, restTimer = null;
+
+function setWs(on) {
+  $('ws-mark').className = 'mark' + (on ? '' : ' off');
+  $('ws-mark').title = on ? 'WebSocket 已连接' : 'WebSocket 未连接（改用轮询）';
+  updateTail();
+}
+
+function applyPayload(data) {
+  lastPayload = data;
+  lastRecvAt = Date.now();
+  const now = performance.now();
+  if (data.front)  ingest('front',  data.front.det,  data.front.stats,  now);
+  if (data.bottom) ingest('bottom', data.bottom.det, data.bottom.stats, now);
+  renderAll();
+  updateTail();
+  if (debugEl.open) renderDebug();
+}
+
+function connectWS() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  let sock;
+  try { sock = new WebSocket(`${proto}://${location.host}/ws/status`); }
+  catch (e) { scheduleReconnect(); return; }
+  ws = sock;
+
+  sock.onopen = () => { setWs(true); backoff = 1000; stopRest(); };
+  sock.onmessage = ev => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch (e) { return; }
+    applyPayload(data);
+  };
+  sock.onclose = () => {
+    if (ws !== sock) return;          // 已被主动替换（重连/切页），忽略这次回调
+    setWs(false); startRest(); scheduleReconnect();
+  };
+  sock.onerror = () => {};
+}
+
+function scheduleReconnect() {
+  if (retryTimer) return;
+  const delay = backoff;
+  backoff = Math.min(backoff * 2, 16000);
+  retryTimer = setTimeout(() => { retryTimer = null; connectWS(); }, delay);
+}
+
+function startRest() {
+  if (restTimer) return;
+  const tick = async () => {
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (r.ok) applyPayload(await r.json());
+    } catch (e) { /* 静默 */ }
+  };
+  tick();
+  restTimer = setInterval(tick, 2000);
+}
+function stopRest() { if (restTimer) { clearInterval(restTimer); restTimer = null; } }
+
+function reconnectNow() {
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  backoff = 1000;
+  if (ws) { try { ws.close(); } catch (e) {} }
+  ws = null;
+  connectWS();
+}
+
+/* ============================================================
+   页面可见性 / 键盘
+   ============================================================ */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  reconnectNow();
+  ['front', 'bottom'].forEach(side => {
+    const img = $(side + '-img');
+    img.src = img.src.split('?')[0] + '?t=' + Date.now();
+  });
+});
+
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+  switch (e.key) {
+    case '1': toggleFullscreen('card-front'); break;
+    case '2': toggleFullscreen('card-bottom'); break;
+    case 'd': case 'D':
+      debugEl.open = !debugEl.open;
+      if (debugEl.open) renderDebug();
+      break;
+    case 'r': case 'R':
+      toast('正在重连…'); reconnectNow();
+      break;
+  }
+});
+
+/* ============================================================
+   提示条
+   ============================================================ */
+let toastTimer = null;
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('on'), 1900);
+}
+
+/* ============================================================
+   心跳渲染：即使没有新数据，也要让「数据年龄」在走
+   ============================================================ */
+setInterval(renderAll, 1000);
+
+/* ============================================================
+   启动
+   ============================================================ */
+renderAll();
+connectWS();
+
+})();
+</script>
+</body>
+</html>
