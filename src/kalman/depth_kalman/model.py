@@ -19,7 +19,9 @@
 观测方程
 --------
 * O1 深度计：``z = D``
-* O2 高度计 i：``z = (H - dz_i) - D - PITCH_SIGN*x_i*θ + ROLL_SIGN*y_i*φ``
+* O2 高度计 i：``z = (H - dz_i) - D - PITCH_SIGN*y_i*θ + ROLL_SIGN*x_i*φ``
+  （2026-10-06 修正耦合配对：前向偏移 y 耦合**俯仰** θ，右向偏移 x 耦合**横滚** φ。
+  旧式 x↔θ、y↔φ 配对反了；x=y=0 时两者等价，填入真实安装偏移后必须用本式。）
 * O3 加速度：只进**预测**，不做观测
 """
 import math
@@ -220,17 +222,21 @@ class Model(object):
 
         被观测量（预测的净空）::
 
-            = H_eff_i - D - PITCH_SIGN*x_i*θ + ROLL_SIGN*y_i*φ
-            = (H + anchor_dz - dz_i) - D - PITCH_SIGN*x_i*θ + ROLL_SIGN*y_i*φ
+            = H_eff_i - D - PITCH_SIGN*y_i*θ + ROLL_SIGN*x_i*φ
+            = (H + anchor_dz - dz_i) - D - PITCH_SIGN*y_i*θ + ROLL_SIGN*x_i*φ
 
         （``H`` 是**锚路**的有效池底深度，见 ``set_anchor``）
+
+        耦合配对（2026-10-06 修正，推导见 config/depth_config.py 观测方程段）：
+        抬头 θ>0 时前向偏移 y 大的探头升高、净空变大 ⇒ y 耦合 θ；
+        横滚时右向偏移 x 改变探头高度 ⇒ x 耦合 φ。符号由 PITCH_SIGN/ROLL_SIGN 现场校核。
 
         返回 ``(h, offset, sigma)``；``sigma`` 已含传感器精度、姿态耦合残差与基础项。
         """
         cfg = self.cfg
         x, y, dz = self._mount(ch)
-        c_theta = float(cfg.PITCH_SIGN) * x
-        c_phi = float(cfg.ROLL_SIGN) * y
+        c_theta = float(cfg.PITCH_SIGN) * y   # ★ y（前向）耦合俯仰 θ —— 旧版错写成 x
+        c_phi = float(cfg.ROLL_SIGN) * x      # ★ x（右向）耦合横滚 φ —— 旧版错写成 y
         h = np.zeros(self.n)
         h[self.idx['D']] = -1.0
         h[self.idx['H']] = 1.0
@@ -288,9 +294,9 @@ class Model(object):
 
     # -------------------------------------------------------------- 输出换算
     def clearance_of(self, x, ch, theta=0.0, phi=0.0):
-        """由状态反算某路的离底净空（m）。"""
+        """由状态反算某路的离底净空（m）。耦合配对与 obs_alt 保持一致（2026-10-06 修正）。"""
         xr, yr, dz = self._mount(ch)
-        c_theta = float(self.cfg.PITCH_SIGN) * xr
-        c_phi = float(self.cfg.ROLL_SIGN) * yr
+        c_theta = float(self.cfg.PITCH_SIGN) * yr   # ★ y（前向）耦合俯仰 θ
+        c_phi = float(self.cfg.ROLL_SIGN) * xr      # ★ x（右向）耦合横滚 φ
         return ((x[self.idx['H']] + self.anchor_dz - dz)
                 - x[self.idx['D']] - c_theta * theta + c_phi * phi)

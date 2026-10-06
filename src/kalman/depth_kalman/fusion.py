@@ -34,7 +34,8 @@ class DepthFusion(object):
 
         self.cnt = {'pred': 0, 'depth': 0, 'alt': 0,
                     'rej_depth': 0, 'rej_alt': 0, 'sat': 0, 'reset': 0, 'inflate': 0,
-                    'accel_used': 0, 'alt_by_ch': {}, 'alt_rej_by_ch': {}}
+                    'accel_used': 0, 'alt_by_ch': {}, 'alt_rej_by_ch': {},
+                    'rej_range': 0, 'rej_tilt': 0}
         self.rej_streak = {}
         self.gate_var = {}          # 每路新息的 EWMA(ν²)，自适应门限的尺度来源
         self.last_tel = None
@@ -176,6 +177,24 @@ class DepthFusion(object):
         iD = self.model['D']
         theta = (tel.pitch_rad or 0.0) if (tel is not None and tel.has_att) else 0.0
         phi = (tel.roll_rad or 0.0) if (tel is not None and tel.has_att) else 0.0
+
+        # ---------- 失效硬拒（2026-10-06）：在自适应门限**之前**，且**不喂** P 放大看门狗。
+        # 传感器失效（读数变 -3 / 超程大数 / 波束入射角过大）不是「P 过度乐观」——
+        # 若让它累积 rej_streak 触发 _inflate_if_stuck，等于把垃圾观测放大 P 后放进来。
+        # 深度计的偶发跳变不在这里防：它由上面的自适应新息门限（EWMA 尺度）兜住。
+        c_m = float(sample.clearance_m)
+        if not (float(getattr(cfg, 'ALT_MIN_VALID_M', 0.02)) <= c_m
+                <= float(getattr(cfg, 'ALT_MAX_VALID_M', 2.5))):
+            self.cnt['rej_alt'] += 1
+            self.cnt['rej_range'] = self.cnt.get('rej_range', 0) + 1
+            return False
+        tilt_max = float(getattr(cfg, 'ALT_MAX_TILT_DEG', 30.0))
+        if tilt_max > 0.0 and tel is not None and tel.has_att \
+                and max(abs(theta), abs(phi)) > math.radians(tilt_max):
+            self.cnt['rej_alt'] += 1
+            self.cnt['rej_tilt'] = self.cnt.get('rej_tilt', 0) + 1
+            return False
+
         h, off, sigma = self.model.obs_alt(ch, theta, phi, sample.clearance_m)
         z = float(sample.clearance_m) - off
         r = sigma ** 2
@@ -297,6 +316,8 @@ class DepthFusion(object):
             'counters': {
                 'depth': self.cnt['depth'], 'alt': self.cnt['alt'],
                 'rej_depth': self.cnt['rej_depth'], 'rej_alt': self.cnt['rej_alt'],
+                'rej_range': self.cnt.get('rej_range', 0),
+                'rej_tilt': self.cnt.get('rej_tilt', 0),
                 'sat': self.cnt['sat'], 'reset': self.cnt['reset'],
                 'inflate': self.cnt.get('inflate', 0),
                 'alt_by_ch': dict(self.cnt['alt_by_ch']),
