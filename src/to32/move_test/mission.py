@@ -16,7 +16,8 @@ cmd 字段语义（mode_auv 据此组 0x09）：
 
 约束：
   - 阶段内绝不直接碰共享内存/链路 —— 观测一律走 obs.VisionIF / obs.DepthIF
-  - 阶段必须自带超时兜底：判据失效时走「定时 + 上浮」安全路径，不许死等
+  - 阶段完成判据由原语/阶段自定；t_function 的 Dive/Turn 已按用户口径移除超时
+    兜底（判据失效即持续执行），如需超时安全退出须在 Stage 层自行实现
 """
 import task_config as TC
 

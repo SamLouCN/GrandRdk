@@ -62,23 +62,22 @@ DIVE(60cm) → FWD(x1) → STRIKE_BALL → TURN(55cm,θ1) → FWD(x2) → GATE_1
 > 例：水深 130cm、撞球工作高度 60cm → depth_cm = 130 − 60 − 20 = **50**。
 > 实测水深进 task_config（池深实测后填写），机体高度 20cm 为固定常数。
 
-#### Dive（下潜定深）
-- **参数**：`target_depth`（cm）。
-- **行为**：heave 推进 + depth_cm 闭环，yaw 保持。
-- **完成**：深度连续若干拍稳定在目标带内。
-- **兜底**：深度源失效 → 定时下潜 + 固定推力，按时间视为完成。
+#### Dive（下潜定深）→ `t_function.dive_step`
+- **参数**：`target_height_cm`（距池底 cm，必填）、`tol_cm`（定深带半宽，默认 5）、`hold_n`（带内保持拍数，默认 15）。
+- **行为**：depth_cm 闭环（固件内），surge/sway=0，yaw 保持当前航向。
+- **完成**：kalman 融合深度连续 hold_n 拍落在目标带内（只看融合深度，不与固件深度计混判）。
+- **无兜底**（2026-10-06 用户口径）：融合源失效/未入带 → 永不完成，持续下发定深指令。
 
-#### Forward（定时直行）
-- **参数**：`duration`（s）、`surge`（速度档）、可选 `target_depth`（行进中保持定深）、`touch_wall`（bool，触壁模式）。
+#### Forward（定时直行）→ `t_function.forward_step`
+- **参数**：`duration_s`（秒，唯一完成判据）、可选 `target_height_cm`（行进定深，缺省沿用上一拍）、`surge`（[-1,1]，默认巡航档）、`touch_wall`（bool，触壁模式）。
 - **行为**：surge 恒定推力 + depth_cm 闭环定深，yaw 锁定当前航向。
-- **完成**：计时结束；触壁模式 = 速度遥测骤降/归零提前完成。
-- **兜底**：无 —— 定时就是它的完成方式（超时上限即 duration）。
+- **完成**：elapsed ≥ duration_s 即完成（纯定时；V2 无速度遥测，触壁模式暂等价纯定时）。
 
-#### Turn（定向旋转）
-- **参数**：`target_yaw`（绝对航向 °，相对当前 ±）、可选 `target_depth`（**Turn 兼职变深**：转向同时调深，一个阶段完成"定深 55cm 并转向"）。
-- **行为**：yaw_deg 闭环（固件内），surge/sway=0。
-- **完成**：航向误差连续若干拍 < 容差。
-- **兜底**：遥测无 yaw → 按角速度估算定时旋转，超时接受当前航向。
+#### Turn（定向旋转）→ `t_function.turn_step`
+- **参数**：`target_yaw_deg`（任务系绝对航向 °，必填）、可选 `target_height_cm`（**Turn 兼职变深**：转向同时调深）、`tol_deg`（到位容差，默认 3°）、`hold_n`（到位保持拍数，默认 10）。
+- **行为**：yaw_deg 闭环（固件内），surge/sway=0；下发值 = 任务系目标（固件系镜像由 mode_auv 统一处理）。
+- **完成**：|mirror(actual_yaw) − target| 连续 hold_n 拍 < tol_deg。
+- **无兜底**（2026-10-06 用户口径）：遥测无 yaw → 无法判到位，永不完成，持续下发转向指令。
 
 ### 4.2 任务阶段
 

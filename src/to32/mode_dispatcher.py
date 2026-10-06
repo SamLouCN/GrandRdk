@@ -166,11 +166,45 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
     # ------------------------------------------------------------------ #
     # 模式
     # ------------------------------------------------------------------ #
+    def _load_test_mode(self):  # [2026-10-06 测试模式] 探测 move_test/test_mode 开关
+        """TEST_MODE_ENABLED=True 时返回测试模式类（接管 AUV 位），否则返回 None。
+
+        开关文件：move_test/test_mode/test_config.py（会加载任务链；写错导致 import
+        失败时在下面捕获并回退标准壳，不影响中位机启动）。
+        文件缺失 / 开关关闭 / 加载失败一律返回 None —— 现有行为零变化。
+        ⚠ 本方法在 __init__._register_modes() 阶段调用，此时 self.log 尚未就绪，
+        失败提示用 print（进板端 journal）；接管成功的信息由 TestMode.on_enter
+        首次进入时打印。
+        """
+        import sys  # 局部导入：仅探测测试模式时需要
+        try:  # 任何异常都不能影响正常模式注册
+            mv = os.path.join(os.path.dirname(os.path.abspath(__file__)),  # move_test/test_mode 目录
+                              "move_test", "test_mode")
+            if not os.path.isfile(os.path.join(mv, "test_config.py")):  # 无开关文件
+                return None  # 按未启用处理
+            if mv not in sys.path:  # 把 test_mode 目录放进搜索路径
+                sys.path.insert(0, mv)  # （test_runner 内部会自行补 to32/move_test/task 路径）
+            import test_config as TCFG  # 会加载任务链（失败在 except 回退，见 docstring）
+            if not bool(getattr(TCFG, "TEST_MODE_ENABLED", False)):  # 开关关闭
+                return None  # 标准 AUV 壳照常
+            from test_runner import TestMode  # 延迟导入：只在开关开启时加载
+            return TestMode  # 交给 _register_modes 覆盖 id 后注册
+        except Exception as e:  # 加载失败不能拖垮中位机启动
+            print("[MODE] 测试模式加载失败 -> 回退标准 AUV 壳: %r" % (e,), flush=True)  # 进 journal 便于排查
+            return None  # 回退
+
     def _register_modes(self):  # 注册所有可用模式
         # [2026-10-04] 先注册 IDLE 待命模式：上电默认进入，等上位机 $CMD.mode 才切走。
-        auv = AuvModeStub(self)  # [2026-10-04 AUV 运动逻辑摘除] 用内联占位壳替代原 AuvMode
-        auv.id = getattr(self.cfg, "MODE_AUV", -1)  # 模式号从配置取（类体里读配置不便，故在此覆盖）
-        self.modes[auv.id] = auv  # 以模式 id 为键入表
+        auv_id = getattr(self.cfg, "MODE_AUV", -1)  # 模式号从配置取（类体里读配置不便，故在此覆盖）
+        test_cls = self._load_test_mode()  # [2026-10-06] 测试模式开关探测（默认关，行为不变）
+        if test_cls is not None:  # 开关开启：AUV 位由测试模式接管
+            tm = test_cls(self)  # 构造测试模式（ctx 传 self，同其他模式）
+            tm.id = auv_id  # 占用同一个 AUV 模式位：上位机切 mode=1 即进测试模式
+            self.modes[tm.id] = tm  # 以模式 id 为键入表
+        else:  # 开关关/文件缺失/加载失败：标准 AUV 占位壳（现状）
+            auv = AuvModeStub(self)  # [2026-10-04 AUV 运动逻辑摘除] 用内联占位壳替代原 AuvMode
+            auv.id = auv_id  # 模式号从配置取
+            self.modes[auv.id] = auv  # 以模式 id 为键入表
         for m in (IdleMode(self), RovMode(self)):  # 构造时把 self 作为 ctx 传入模式
             self.modes[m.id] = m  # 以模式 id 为键入表
 
