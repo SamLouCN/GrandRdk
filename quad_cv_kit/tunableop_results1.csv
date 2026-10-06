@@ -1,0 +1,7 @@
+Validator,PT_VERSION,2.12.0
+Validator,ROCBLAS_VERSION,5.5.0.cd957402
+Validator,HIP_VERSION,714
+Validator,GCN_ARCH_NAME,gfx1201
+Validator,HIPBLASLT_VERSION,100401-cd957402
+GemmStridedBatchedTunableOp_float_NT,nt_240_240_32_B_2_ld_240_240_240,Gemm_Hipblaslt_140711,0.0412867
+GemmStridedBatchedTunableOp_float_TN,tn_240_64_240_B_2_ld_240_240_240,Default,0.0462094
