@@ -7,9 +7,11 @@
                                 上位机切换成 AUV 模式（$CMD.mode=1）自动进入测试模式；
                                 测试模式运行中，上位机随时切回 ROV（$CMD.mode=0）即退出
                                 （发一帧停推 → ROV 接管）；再切 AUV 又从头进测试模式。
-      TEST_MODE_ENABLED=False → 完全不影响现有行为（AUV 位 = 标准 AuvModeStub 空壳）。
+      TEST_MODE_ENABLED=False → AUV 位 = 正式 AuvMode（2026-10-07 接回主链路，
+                                按 task_config.STAGE_TABLE 依次自动跑完全部阶段）。
     ⚠ 本文件会 import 任务链（task_config / task 脚本）：写错导致 import 失败时，
-      dispatcher 捕获异常自动回退标准 AUV 壳（journal 有 print 提示），不拖垮中位机。
+      dispatcher 捕获异常自动回退占位 AuvModeStub（宁停勿跑，journal 有 print 提示），
+      不拖垮中位机。
 
 ★★ 测试表 TEST_TABLE（本文件核心）：Stage 类的**列表表达式**，写法与
    task_config.STAGE_TABLE 完全一致 —— 既可以只测一个阶段，也可以任意拼多阶段：

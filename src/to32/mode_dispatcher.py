@@ -9,7 +9,8 @@
 
 本文件不含任何"模式自己的逻辑"; 模式的运行逻辑请写在 mode_rov.py / mode_auv.py。
 [2026-10-04 变更] AUV 的自主运动逻辑已整体移到 ./move_test/（主工程不再调用）；
-本文件注册的是内联的 AuvModeStub（只切模式、不发 0x09）。
+[2026-10-07 接回] AUV 位三态注册：test_mode 开=TestMode / 关=move_test 的 AuvMode
+（STAGE_TABLE 驱动）/ test_config 异常或 AuvMode 导入失败=AuvModeStub（宁停勿跑）。
 新增一个模式三步:
     1) 新建 mode_xxx.py 继承 mode_base.ModeBase, 实现 on_enter/on_exit/on_cmd/tick/on_downlink
     2) 在 config.py 登记 MODE_XXX（$CMD 的 mode 字段取值）
@@ -36,9 +37,15 @@ from mode_rov import RovMode  # ROV 遥控模式实现
 #   AUV 的一整套自主运动逻辑（mission.py 状态机 + vision_if/depth_if/viskf_if 观测接口
 #   + auv_report.py 状态回传 + kalman_launcher.py 卡尔曼托管 + mode_auv.py 模式壳）
 #   已整体搬到 ./move_test/ 目录，主工程**不再调用**。
-#   本文件改为注册下方内联的 AuvModeStub —— 壳还在（切 AUV 仍下发 0x04=0x05 让下位机进
-#   AUV 语义），但**没有任何自主运动（不发 0x09）**。
-#   要把自主逻辑接回来：见 src/to32/move_test/README_move_test.md。
+#   此后 AUV 位一度只注册下方内联的 AuvModeStub（壳还在：切 AUV 仍下发 0x04=0x05 让
+#   下位机进 AUV 语义，但没有任何自主运动、不发 0x09）。
+# [2026-10-07 AUV 接回主链路] AuvModeStub 降级为三种回退态之一，宁停勿跑：
+#   - test_mode 开关关（TEST_MODE_ENABLED=False）：AUV 位 = move_test/mode_auv.AuvMode，
+#     切 AUV 即由 Mission 按 task_config.STAGE_TABLE 依次自动跑完全部阶段；
+#   - test_mode 开关开：AUV 位 = TestMode（测试模式接管，行为不变）；
+#   - test_config.py 加载异常（开关状态未知）或 AuvMode 导入失败：回退 AuvModeStub
+#     （静止不发 0x09），失败原因打 journal —— 绝不静默跑任务。
+#   方案见 src/to32/move_test/接回AUV主链路方案_2026-10-07.md。
 
 
 class AuvModeStub(ModeBase):  # [2026-10-04] AUV 占位模式：只切模式，不跑自主运动
@@ -180,13 +187,16 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
         """TEST_MODE_ENABLED=True 时返回测试模式类（接管 AUV 位），否则返回 None。
 
         开关文件：move_test/test_mode/test_config.py（会加载任务链；写错导致 import
-        失败时在下面捕获并回退标准壳，不影响中位机启动）。
-        文件缺失 / 开关关闭 / 加载失败一律返回 None —— 现有行为零变化。
+        失败时在下面捕获，不影响中位机启动）。
+        返回 None 时须结合 self._test_cfg_broken 区分（[2026-10-07 接回] 三态依据）：
+          False = 文件缺失 / 开关关闭（开关状态明确）→ 正式 AuvMode 接回；
+          True  = 加载异常（开关状态未知，可能是"开着"）→ 宁停勿跑，回退占位壳。
         ⚠ 本方法在 __init__._register_modes() 阶段调用，此时 self.log 尚未就绪，
         失败提示用 print（进板端 journal）；接管成功的信息由 TestMode.on_enter
         首次进入时打印。
         """
         import sys  # 局部导入：仅探测测试模式时需要
+        self._test_cfg_broken = False  # [2026-10-07 接回] 默认视为开关状态明确；except 里置 True
         try:  # 任何异常都不能影响正常模式注册
             mv = os.path.join(os.path.dirname(os.path.abspath(__file__)),  # move_test/test_mode 目录
                               "move_test", "test_mode")
@@ -200,8 +210,28 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             from test_runner import TestMode  # 延迟导入：只在开关开启时加载
             return TestMode  # 交给 _register_modes 覆盖 id 后注册
         except Exception as e:  # 加载失败不能拖垮中位机启动
-            print("[MODE] 测试模式加载失败 -> 回退标准 AUV 壳: %r" % (e,), flush=True)  # 进 journal 便于排查
+            self._test_cfg_broken = True  # [2026-10-07 接回] 开关状态未知 → 宁停勿跑（占位壳）
+            print("[MODE] 测试模式加载失败 -> 回退占位 AUV 壳（宁停勿跑）: %r" % (e,), flush=True)  # 进 journal 便于排查
             return None  # 回退
+
+    def _load_auv_mode(self):  # [2026-10-07 接回主链路] 加载 move_test 的正式 AuvMode
+        """返回 move_test/mode_auv.AuvMode；任何失败返回 None（调用方回退占位壳）。
+
+        接回后行为：TEST_MODE_ENABLED=False 时切 AUV 模式 = 下发 0x04 后由 Mission
+        按 task_config.STAGE_TABLE 依次自动完成所有阶段。mode_auv 自带 sys.path 注入
+        （move_test 目录平级 import），此处只需把目录插进搜索路径。
+        失败提示用 print —— 本方法同样在 self.log 就绪前调用（进 journal 便于排查）。
+        """
+        import sys
+        try:
+            mv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "move_test")
+            if mv not in sys.path:  # 把 move_test 目录放进搜索路径
+                sys.path.insert(0, mv)
+            from mode_auv import AuvMode  # to32 顶层无同名文件，不会遮蔽（2026-10-07 已核）
+            return AuvMode
+        except Exception as e:  # 加载失败不能拖垮中位机启动
+            print("[MODE] 正式 AuvMode 加载失败 -> 回退占位 AUV 壳: %r" % (e,), flush=True)
+            return None
 
     def _register_modes(self):  # 注册所有可用模式
         # [2026-10-04] 先注册 IDLE 待命模式：上电默认进入，等上位机 $CMD.mode 才切走。
@@ -211,8 +241,12 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             tm = test_cls(self)  # 构造测试模式（ctx 传 self，同其他模式）
             tm.id = auv_id  # 占用同一个 AUV 模式位：上位机切 mode=1 即进测试模式
             self.modes[tm.id] = tm  # 以模式 id 为键入表
-        else:  # 开关关/文件缺失/加载失败：标准 AUV 占位壳（现状）
-            auv = AuvModeStub(self)  # [2026-10-04 AUV 运动逻辑摘除] 用内联占位壳替代原 AuvMode
+        else:  # 开关关 / 文件缺失 / 加载失败
+            if self._test_cfg_broken:  # [2026-10-07 接回] test_config 异常=开关状态未知，宁停勿跑
+                auv = AuvModeStub(self)  # 占位壳：静止不发 0x09，原因已打 journal
+            else:  # 开关明确关闭 / 文件缺失：接回正式 AuvMode（STAGE_TABLE 驱动）
+                cls = self._load_auv_mode() or AuvModeStub  # AuvMode 导入失败也回退占位壳
+                auv = cls(self)
             auv.id = auv_id  # 模式号从配置取
             self.modes[auv.id] = auv  # 以模式 id 为键入表
         for m in (IdleMode(self), RovMode(self)):  # 构造时把 self 作为 ctx 传入模式

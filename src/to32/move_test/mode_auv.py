@@ -5,6 +5,7 @@
   - 继承 mode_base.ModeBase，id=MODE_AUV；由 mode_dispatcher 注册
   - on_enter 下发 0x04 模式帧（值 0x05 = AUV 语义，与固件约定不变）
   - tick 每拍: pump_telemetry → 急停红线检查 → mission.step() → 组 0x09 下发
+  - on_exit 先发停推帧（stick_stop=1，急停闩锁时让路）再丢弃状态机，防推力悬挂
   - 安全红线：0x09 帧没有 STANDBY 守卫，急停闩锁期间一个字节都不能发
     （否则会静默退出急停）—— estop_latch 检查必须排在一切下发之前
 
@@ -65,6 +66,15 @@ class AuvMode(ModeBase):
             self.log("[AUV] 任务状态机已就绪（%d 个阶段）" % n)
 
     def on_exit(self, next_id):
+        # 切走前先停推：退出时上一拍可能仍挂着任务最后一段推力（对齐 TestMode.on_exit 做法）
+        if not self.ctx.estop_latch:   # 安全红线：急停闩锁期间一个字节都不能发（见文件头契约）
+            try:
+                self.send_downlink(
+                    S.frame_motion(pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0,
+                                   depth_cm=0.0, surge=0.0, sway=0.0, stick_stop=1),
+                    "0x09 AUV 退出停推")
+            except Exception as e:
+                self.log("[AUV] 退出停推帧下发异常: %r" % e)
         self.state = "idle"
         self.mission = None            # 丢弃状态机：阶段/计时器不残留到下次
         super().on_exit(next_id)

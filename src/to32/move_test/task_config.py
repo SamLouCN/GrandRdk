@@ -122,10 +122,18 @@ except ImportError:
 #   跑搜索球：       STAGE_TABLE = SEARCH_BALL_TABLE （转向 60° → 前进 2s → zigzag 扫描找球）
 #   跑 Task4：       STAGE_TABLE = TASK4_TABLE       （定深 65cm(离底) → 前进 2s → 悬停 3s）
 #   跑 Return：      STAGE_TABLE = RETURN_TABLE      （右转 90° → 前进 5s，触壁提前结束）
-#   撞球/穿门/捡球： 空骨架待实现（表为空，切换 = 开机即 DONE 安全停推）
-#   多任务串联：     STAGE_TABLE = TASK1_TABLE + SEARCH_BALL_TABLE（…任意拼）
-# 空表 = 开机即 DONE（安全停推）
-STAGE_TABLE = SEARCH_BALL_TABLE
+#   单独调试任意段： 把 STAGE_TABLE 换成对应单表即可（测试模式走 TEST_TABLE，互不影响）
+# 空表 = 开机即 DONE（安全停推）；任务脚本缺失时该表 try-import 置空，拼接时自动跳过。
+# [2026-10-07 接回主链路] 正式比赛全序列（Task.md §3 直译）：
+#   DIVE(60)+FWD(x1)=Task1   STRIKE_BALL=HitBall   TURN(θ1)+FWD(x2)=Task2
+#   GATE×N=PassGate   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
+#   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
+# 当前 t_hit_ball/t_pick_ball 未落地（try-import 置空自动跳过）；PassGateAll 已随
+# task_pass_door 接入（GATE 表非空，其导入链依赖 to32 根目录的 task_pid_controller）。
+# 实际序列（2026-10-07 板端等价路径实测导入）：
+#   Task1 → SearchBall → Task2 → PassGate → Return。
+STAGE_TABLE = (TASK1_TABLE + SEARCH_BALL_TABLE + HIT_BALL_TABLE + TASK2_TABLE
+               + PASS_GATE_TABLE + PICK_BALL_TABLE + RETURN_TABLE)
 
 # 注：测试模式（test_mode/）的测试表在 test_mode/test_config.py 的 TEST_TABLE 配置，
 #     写法与本文件 STAGE_TABLE 相同（Stage 类列表表达式，可单阶段/多阶段任意拼），
