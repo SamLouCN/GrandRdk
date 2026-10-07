@@ -1,0 +1,54 @@
+test_real_send_loop_uses_reversed_yaw_on_both_links_and_auv_zeros_motion (__main__.JoystickTests) ... ok
+test_both_views_center_current_position (__main__.PositionTests) ... ok
+test_gaps_and_missing_velocity_do_not_invent_travel (__main__.PositionTests) ... ok
+test_initial_heading_is_origin_and_body_velocity_rotates (__main__.PositionTests) ... ok
+test_invalid_and_legacy_velocity_are_ignored (__main__.PositionTests) ... ok
+test_nonfinite_required_fields_are_rejected (__main__.ProtocolTests) ... ok
+test_old_frame_has_no_valid_position_velocity_or_targets (__main__.ProtocolTests) ... ok
+test_truncated_target_fields_stay_absent (__main__.ProtocolTests) ... ok
+test_future_sender_failure_and_submission_are_distinct (__main__.WindowTests) ... ok
+test_local_depth_never_sends_and_telemetry_does_not_overwrite (__main__.WindowTests) ... ok
+test_mode_buttons_visible_and_switch_from_every_page (__main__.WindowTests) ... ok
+test_pid_controls_removed (__main__.WindowTests) ... ok
+test_position_overlay_survives_all_camera_layouts_and_exports (__main__.WindowTests) ... ok
+test_target_actual_and_local_depth_are_aligned_and_csv_preserves_sources (__main__.WindowTests) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 3.186s
+
+OK
+
+本轮定位外观修改验证：五种摄像头布局下均贴齐画面左上角，PASS。
+背景透明度 80%，轨迹不透明度 70%，方向箭头不透明度 80%；彩色模拟画面视觉检查通过。
+EXE 内嵌 navigation 核验：直角矩形与透明背景已包含，PASS。
+更新 EXE：99,251,512 字节。
+本轮未连接实机，未改动运动和通讯逻辑。
+
+============================================================
+合并版 v3.8 验证记录（2026-10-07，v3.8 合并 v3.6 板端融合值）
+============================================================
+1. py_compile: protocol.py / pc_main2.py 通过。
+2. tests/test_v39.py（协议级回归，替代缺失的 test_v36/test_v38）: 18/18 OK。
+   - 参考二进制 PID 帧：逐字节布局/×100舍入/范围校验，旧文本帧拒绝
+   - ReferenceTelemetryBuffer：拆包/粘包/调试文本容忍
+   - $TASKPID/$TASKPID_ACK 往返与 ERR 分支
+   - $TEL 帧尾 41/42：长帧含 fused_depth/clearance、短帧缺省、旧 7 字段兼容
+   - pc_main2 静态装配：板端融合两行/act_map/条目22 + PID 模块引用
+3. build_exe.ps1 重打 ROV_ControlStation_v3.8.exe：97,774,061 字节。
+4. build_v34/verify_exe_v38_merged.py 静态核验（CArchive 字节码）：
+   pc_main2/protocol/task_pid_wire 的合并标记全部存在
+   （板端融合、PID 调参、过门任务 PID、protocol.py v3.7、ROV控制站 v3.8 标题）。
+5. 未连接实机；PID 真实控制环、过门 S100 ACK、板端融合回传、EXE 双击启动待实机复核。
+
+============================================================
+方案A 验证记录（2026-10-07，急停后按模式按钮解除锁存）
+============================================================
+1. pc_main2.py::_set_mode 修改：急停待机态(_frozen)按模式按钮先发 $ESTOP,0# 解除 S100
+   锁存再切模式；更正 v3.4 过时注释。py_compile 通过。
+2. tests/test_v39.py 新增 test_mode_button_releases_estop_latch（静态装配断言），
+   19/19 OK。
+3. 实测 link_stm32.frame_mode(ESTOP)=CD 04 04 01 DC，与 STM32 固件一致，S100/固件零改动。
+4. build_exe.ps1 重打 ROV_ControlStation_v3.8.exe：97,774,987 字节。
+5. verify_exe_v38_merged.py 静态核验：方案A 标记（急停锁存中按模式按钮/已发 $ESTOP,0# 解除
+   锁存/send_estop_release）全部存在，全部核验通过。
+6. 未连接实机；"急停 → 按 ROV/AUV 恢复" 与 "温启动恢复 Last_Con_Mode" 待实机复核。

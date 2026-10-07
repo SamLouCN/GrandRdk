@@ -1,0 +1,6 @@
+# PC端依赖 (Windows)
+PyQt5>=5.15
+pygame>=2.0
+opencv-python>=4.5
+numpy
+pyserial>=3.5

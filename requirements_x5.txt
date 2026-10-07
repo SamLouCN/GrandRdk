@@ -1,0 +1,4 @@
+﻿# X5端依赖 (RDK X5 Ubuntu)
+flask>=2.0
+pyserial>=3.5
+opencv-python>=4.5
