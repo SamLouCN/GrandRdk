@@ -22,17 +22,19 @@
 
 一句话：**上面说文本（`$`帧），下面说二进制（V2 帧），中间负责翻译、编排和安全。**
 
+> **2026-10-07 v3.8**：PC 侧 PID 参数改走 **11B 二进制帧**（`CD 0A 01 CH KP_LE KI_LE KD_LE DC`，增益×100 / int16 小端 / ±327.68）——中位机先判二进制、严格校验后**原字节转发** STM32（默认仅放行 CH 0~3）；旧文本 `$PID` 仍丢弃；新增 `$TASKPID` 命名任务参数（仅 S100 处理，当前 gate，直接更新过门 GatePid 并 ACK 回 8081）。
+
 | 项 | 值 |
 |---|---|
 | 当前路径 | `/userdata/GrandRDK/src/to32/` |
 | 配置 | `/userdata/GrandRDK/config/to32_config.py` |
 | 模式记忆文件 | `/userdata/GrandRDK/logs/to32_mode_state.json` |
 | 日志 | `/userdata/GrandRDK/logs/to32_main.log` |
-| 上行端口 | UDP **8080**（收 `$CMD`/`$PID`/`$VID`） |
+| 上行端口 | UDP **8080**（收 `$CMD`/`$PID`/`$VID`/**11B 二进制 PID**/`$TASKPID`） |
 | 下行/遥测端口 | UDP **8081**（收 PING、发 `$TEL`/PONG） |
 | 下位机串口 | `/dev/ttyCH9344USB5`（CH348 F 口），921600 |
 | 进程识别串 | `src/to32/main.py`（`status.sh` / `stop.sh` 用它匹配） |
-| 规模 | 14 个 .py，约 2850 行 |
+| 规模 | 17 个 .py（**2026-10-07 新增 `task_pid_wire.py` / `task_pid_controller.py`**），另有 `move_test/` 任务包 21 个 .py（2686 行）；无硬件回归脚本位于补丁包 `源码\GrandRdk-2.5\tests\`（**未拷入本项目/未入 git**）；行数为本地工作副本实测 |
 
 ## 1. 文件功能速查
 
@@ -40,20 +42,20 @@
 
 | 文件 | 行数 | 职责 | 关键接口 |
 |---|---|---|---|
-| `main.py` | 288 | **入口**。解析命令行 → 构造配置视图 → 装配三件套 → 启动并阻塞等待；注册 SIGTERM 优雅退出 | `main()`、`build_runtime()`、`build_cfg()`、`list_stm32_ports()`、`preflight_ports()` |
-| `link_pc.py` | 113 | **上位机链路**（线程）。绑 8080/8081，收字节→解析归类→入队；PING→PONG；`$TEL` 出口 | `PcLink`（Thread）：`open/stop/run/_dispatch/send_telem/pc_ip` |
-| `link_stm32.py` | 295 | **下位机链路**。V2 组帧/收帧（`CD LEN FUNC DATA DC`）+ 0x0C 遥测轮询线程 | `build_frame`、`frame_mode`、`frame_motion`、`frame_set_pid`、`frame_target_depth`、`FrameParser`、`parse_telemetry`、`Stm32Link` |
+| `main.py` | 294 | **入口**。解析命令行 → 构造配置视图 → 装配三件套 → 启动并阻塞等待；注册 SIGTERM 优雅退出 | `main()`、`build_runtime()`、`build_cfg()`、`list_stm32_ports()`、`preflight_ports()` |
+| `link_pc.py` | 144 | **上位机链路**（线程）。绑 8080/8081，收字节→**先判 11B 二进制 PID（命中走独立中继）**再按文本解析归类入队；PING→PONG；`$TEL` 出口；`$TASKPID` ACK 出口 | `PcLink`（Thread）：`open/stop/run/_dispatch/send_telem/pc_ip/send_task_pid_ack` |
+| `link_stm32.py` | 348 | **下位机链路**。V2 组帧/收帧（`CD LEN FUNC DATA DC`）+ 0x0C 遥测轮询线程；**`send()` 整帧互斥写锁 + 短写检查**，兜底轮询走同一 `send`；新增 PID 帧常量 | `build_frame`、`frame_mode`、`frame_motion`、`frame_set_pid`、`frame_target_depth`、`FrameParser`、`parse_telemetry`、`Stm32Link.send` |
 
-> `link_pc.py` / `link_stm32.py` **只做传输**，不含任何模式逻辑。
+> `link_pc.py` / `link_stm32.py` **只做传输**，不含任何模式逻辑。（行数为本地工作副本 2026-10-07 补丁后口径）
 
 ### 模式层
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `mode_base.py` | 89 | **模式基类** `ModeBase`，定义 10 个回调；新增模式只需继承它 |
-| `mode_dispatcher.py` | 461 | **编排核心**：模式注册/切换、`$CMD` 事件派发、安全三件套、tick 调度、`$TEL` 上行、5s 状态汇报 |
-| `mode_rov.py` | 163 | **ROV 遥控**：`$CMD` 杆位 → `0x09` 推力槽；heave→深度积分、yaw→航向积分；急停锁存期间抑制 `0x09` |
-| `mode_auv.py` | 77 | **AUV 自主**（骨架）：进模式时下发 `0x02` 预编程，忽略手动杆位（只记录不动作），自主逻辑留 `tick()` |
+| `mode_base.py` | 92 | **模式基类** `ModeBase`，定义 10 个回调；新增模式只需继承它 |
+| `mode_dispatcher.py` | 641 | **编排核心**：模式注册/切换、`$CMD` 事件派发、安全三件套、tick 调度、`$TEL` 上行、5s 状态汇报；**2026-10-07 新增 PID 独立中继（`_on_pid_binary`/`_on_task_pid`，不切模式/不解急停/不保存）+ `task_pids` 注入** |
+| `mode_rov.py` | 198 | **ROV 遥控**：`$CMD` 杆位 → `0x09` 推力槽；heave→深度积分、yaw→航向积分；急停锁存期间抑制 `0x09` |
+| ~~`mode_auv.py`~~（已迁 `move_test/`） | — | **AUV 自主**：v2.5 重写起任务代码整体迁 `move_test/mode_auv.py`（123 行），**本目录不再有此文件**；`mode_dispatcher` 注册的是内联 `AuvModeStub` / 测试模式 `TestMode` |
 
 `ModeBase` 回调一览（`mode_base.py`）：
 
@@ -73,16 +75,25 @@
 
 | 文件 | 行数 | 职责 | 关键接口 |
 |---|---|---|---|
-| `protocol.py` | 84 | **上位机文本协议**解析与组帧 | `parse_cmd`、`parse_pid`、`parse_vid`、`is_ping`、`build_tel`、`TEL_FIELD_COUNT=41` |
-| `tel_builder.py` | 76 | **V2 遥测 → `$TEL` 41 字段**的**唯一**映射 | `tel_values(tel)`、`build_tel(tel)` |
+| `protocol.py` | 107 | **上位机协议**：文本解析与组帧 + **11B 二进制 PID 校验/解析**（v3.8） | `parse_cmd`、`parse_binary_pid`、`parse_pid`、`parse_vid`、`is_ping`、`build_tel`、`TEL_FIELD_COUNT=41` |
+| `tel_builder.py` | 167 | **V2 遥测 → `$TEL` 41 字段**的**唯一**映射 | `tel_values(tel)`、`build_tel(tel)` |
 
 > `$TEL` 的 41 个索引在上位机是**硬编码**的，缺失字段必须补 0 占位、不能省略，否则整帧错位。任何模式都不要再自己造一份映射，用 `tel_builder`。
+
+### S100 任务 PID（2026-10-07 v3.8 新增）
+
+| 文件 | 行数 | 职责 | 关键接口 |
+|---|---|---|---|
+| `task_pid_wire.py` | 81 | **`$TASKPID` 命名任务参数**编解码与 ACK 回帧（仅 S100 处理，不下发 STM32） | `build_task_pid`、`parse_task_pid`、`build_task_pid_ack`、`parse_task_pid_ack` |
+| `task_pid_controller.py` | 29 | **S100 真实任务 PID 对象**：`GatePid` 实例 + 过门任务工厂；`$TASKPID gate` 更新即时生效 | `TaskPidController.update(loop,p,i,d)`、`create_gate_mission(...)` |
+
+> `Dispatcher` 启动时构造 `TaskPidController` 并注入 `ctx.task_pids`；穿门阶段（`move_test/task/task_pass_door/t_pass_gate.py` 的 `PassGateAll`）经工厂共用同一被调参的 `GatePid`，参数更新**不启动任何任务**。
 
 ### 图像回传（默认关闭，见第 7 节 WARNING）
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `video.py` | 295 | USB 相机 → HTTP MJPEG（`:5000` `/cam1` `/cam2`）。懒加载开相机、`$VID,0#` 释放；HTTP 服务常驻；某路打不开则发占位帧不拖垮其它路。**2026-09-21 起 cam1/cam2 已停用**（默认不挂任何相机，见第 7 节） |
+| `video.py` | 303 | USB 相机 → HTTP MJPEG（`:5000` `/cam1` `/cam2`）。懒加载开相机、`$VID,0#` 释放；HTTP 服务常驻；某路打不开则发占位帧不拖垮其它路。**2026-09-21 起 cam1/cam2 已停用**（默认不挂任何相机，见第 7 节） |
 
 ### 调试 / 自测工具（不参与运行）
 
@@ -118,7 +129,9 @@ VideoService（若启用）        每路 Source 一个采集线程 + HTTP 服�
 | 帧 | 方向 | 说明 |
 |---|---|---|
 | `$CMD,surge,sway,heave,yaw,led1,led2,mode,grab,store#\r\n` | PC→中位机 | 20Hz（有线）/5Hz（无线）；`mode` 0=ROV、1=AUV |
-| `$PID,ch,p,i,d#\r\n` | PC→中位机 | 逐通道下发，默认 `PID_PASSTHRU=False` 丢弃计数 |
+| `$PID,ch,p,i,d#\r\n` | PC→中位机 | 逐通道文本下发，**v3.7 起仍丢弃计数**（`PID_PASSTHRU=False`）；v3.8 起请走下方二进制 PID |
+| **11B 二进制 PID** `CD 0A 01 CH KP_LE KI_LE KD_LE DC` | PC→中位机 | **v3.8**：增益×100 / int16 小端 / ±327.68；`protocol.parse_binary_pid` 严格校验（帧长/头/功能码/通道上限/帧尾）后**原字节转发** STM32；默认仅放行 **CH 0~3**（`PID_BINARY_MAX_CH=3`）；独立于模式切换、不解除急停、不保存 |
+| `$TASKPID,<req>,gate,P,I,D#` | PC→中位机 | **v3.8**：命名任务参数，**仅 S100 处理**、不下发 STM32；当前仅 `gate`（更新过门 GatePid 并 ACK 回 8081）；撞球/捡球未实现明确拒绝；**不启动任务、不切模式** |
 | `$VID,1#` / `$VID,0#` | PC→中位机 | 图像回传开关，**板端拦截、不下发下位机** |
 | `PING` | PC→8081 | 中位机回 `PONG` 到源端口 |
 | `$TEL,<41 字段>#\r\n` | 中位机→PC | 按 `TEL_HZ` 上行 |
@@ -130,7 +143,7 @@ VideoService（若启用）        每路 Source 一个采集线程 + HTTP 服�
 
 | FUNC | 含义 | 组帧函数 | 备注 |
 |---|---|---|---|
-| `0x01` | 设置 PID | `frame_set_pid` | 通道仅 0~3（Pitch/Yaw/Roll/Depth） |
+| `0x01` | 设置 PID | `frame_set_pid` | 通道仅 0~3（Pitch/Yaw/Roll/Depth）；v3.8 起由二进制中继转发，文本 `$PID` 不组此帧 |
 | `0x04` | 模式 | `frame_mode` | `00`启动 `01`急停 `02`预编程 `03`ROV `04`测试 |
 | `0x09` | 摇杆综合运动（15B） | `frame_motion` | 目标 Pitch/Yaw/Roll + 目标深度 + surge/sway + FLAG |
 | `0x0A` | 目标深度 | `frame_target_depth` | — |
@@ -173,7 +186,7 @@ VideoService（若启用）        每路 Source 一个采集线程 + HTTP 服�
 | 频率 | `POLL_HZ=10`、`TEL_HZ=10`、`TICK_HZ=20`、`REPORT_S=5` |
 | 模式 | `MODE_ROV/AUV`、`START_MODE`、`MODE_PERSIST`、`MODE_STATE_PATH`、`MODE_FORCE_START` |
 | ROV 映射量纲 | `SURGE_FULL_SCALE=127`、`YAW_RATE_DPS=60`、`DEPTH_RATE_CMS=20`、`HEAVE_SIGN=1`、`YAW_MIRROR=True`、`DEPTH_MAX_CM=200` |
-| PID | `PID_PASSTHRU=False`、`PID_MAX_CH=3`、`PID_VALUE_LIMIT=327.67` |
+| PID | `PID_PASSTHRU=False`（文本 `$PID` 仍丢弃）、`PID_MAX_CH=3`、`PID_VALUE_LIMIT=327.67`；**v3.8 新增 `PID_BINARY_PASSTHRU=True`（二进制中继总开关）、`PID_BINARY_MAX_CH=3`（放行通道上限，4~7 待实机核实后放宽）、`TASK_PID_ENABLED=True`（`$TASKPID` 开关）** |
 | 静默 | `MOTION_SILENT_WHEN_IDLE=True`、`POLL_IDLE_SILENT=False`、`IDLE_SILENT_AFTER_S=1.0`（**2026-09-21 修订**：静默判定是"surge/sway/heave/yaw **四轴全为 0**"，不是"载荷未变"；旧语义下持续推杆会只发 1 帧，已在 `selftest_modes.py` 加了回归用例） |
 | 安全 | `ESTOP_TIMEOUT=1.0`、`ESTOP_LATCH=True`（**可被 run.sh 命令行覆盖**） |
 | 图像 | `VIDEO_ENABLED_AT_START=True`、`VIDEO_HTTP_PORT=5000`、`VIDEO_WIDTH/HEIGHT/FPS/QUALITY`、`VIDEO_PATHS` |
@@ -256,6 +269,7 @@ python3 src/to32/main.py --no-video        # ★ 手动跑一定带上，理由�
 | 2026-09-21 | `mode_rov` 空闲静默语义修订：四轴全 0 才判回中，持续推杆每帧必发 `0x09`；`selftest_modes.py` 增加三组回归用例（持续推杆 / yaw / heave） |
 | 2026-10-01 | ★ **R8：测试代码迁出本目录** —— `selftest_modes.py` / `make_test_frame.py` / `test_v2_frames.py` → `hwless_tests/legacy_to32/`（补自足路径引导 + 源码守卫改绝对路径）；`port_probe.py` 作为运维排障工具**留原地**。本目录此后**不含任何测试脚本** |
 | 2026-10-01 | ⚠ **已知偏差**：`selftest_modes.py` 当前 66/68（"AUV 期间无 0x09" 2 例）。非 R8 引入，用迁移前原版在当前代码上复跑结果相同；根因是 AUV 模式已改为主动下发运动帧 |
+| 2026-10-07 | ★ **PID 中继 v3.8 落地**：`protocol.py` 新增 `parse_binary_pid`；`link_pc.py` 先判二进制再解码文本（并修复 `_stop` 覆盖）；`link_stm32.py` `send()` 整帧互斥写锁 + 短写检查、兜底轮询走同一 `send`；`mode_dispatcher.py` 独立 PID 中继（`_on_pid_binary`/`_on_task_pid`，不切模式/不解急停/不保存）+ `task_pids` 注入；新增 `task_pid_wire.py` / `task_pid_controller.py`；`config/to32_config.py` 新增 `PID_BINARY_PASSTHRU=True` / `PID_BINARY_MAX_CH=3` / `TASK_PID_ENABLED=True`；无硬件回归 30 项（16+14）**从补丁包 `源码\GrandRdk-2.5\tests\` 复跑全过**（脚本未拷入项目）。⚠ 未实机：STM32 通道接受/4~7 补偿环待联调；PC 侧需配套上位机 v3.8 |
 
 ---
 

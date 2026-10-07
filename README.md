@@ -4,9 +4,9 @@
 > 新增 `$TASKPID` 命名S100参数及确认，当前仅gate；直接更新实际GatePid，PASS_GATE_TABLE可选阶段共用同一对象。未实现的撞球/捡球明确拒绝。参数更新不会启动任务或切模式，默认任务排序保持原样。下方原说明为历史版本记录。
 
 > **2026-10-07 PID中继适配**：本工作副本已接通ROV控制站v3.7的UDP二进制PID。
-> `CD 0A 01 CH KP_LE KI_LE KD_LE DC`（11B，CH 0～7）先校验后原字节转发STM32；
+> `CD 0A 01 CH KP_LE KI_LE KD_LE DC`（11B，**默认放行 CH 0～3；4~7 为参考补偿环、待核实后另行启用**，与上行 v3.8 修正一致）先校验后原字节转发STM32；
 > 文本控制继续原路径，旧文本PID仍丢弃。`config/to32_config.py` 的
-> `PID_BINARY_PASSTHRU=True` / `PID_BINARY_MAX_CH=7` 控制新中继。
+> `PID_BINARY_PASSTHRU=True` / `PID_BINARY_MAX_CH=3` 控制新中继。
 > 串口采用整帧互斥，失败/短写/空跑分别记录；转发不切模式或解除急停。
 > 下文PID旧说明为原包历史记录；真实固件通道和参数生效尚需台架核对。
 
@@ -14,7 +14,8 @@ RDK S100 上跑的水下机器人（ROV/AUV）**板端软件总线**：两路相
 
 > 本机信息：hostname `neos100`，IP `192.168.127.10`（eth1；eth0=192.168.128.10），Ubuntu 22.04.5 LTS，内核 `6.1.158-rt58`（PREEMPT_RT 实时内核）
 > **文档更新：2026-10-06**（依 v2.5 镜像实测重整；同日晚间追加深度卡尔曼 2026-10-06 实测落档：B/C 安装参数 + 失效硬拒 + 耦合配对修正 + H_M 标定法）
-> 自写 Python 约 **11.2k 行** = 根级脚本 775 + `src/` 主工程约 9350（含 `src/to32/` 中位机 3640（内测试脚本 930）、`src/kalman/` 两路卡尔曼 2283、`src/to32/move_test/` v2.5 任务骨架 510）+ `config/` 约 1070；
+> **文档更新：2026-10-07**（PID 中继 v3.8 落地：新增《PID 调参链路》一节；`src/to32/`、`src/to32/move_test/`、`src/to32/move_test/task/task_pass_door/` 的 README 同步更新）
+> 自写 Python 约 **13.2k 行** = 根级脚本 775 + `src/` 主工程约 11394（含 `src/to32/` 中位机 3508（内测试脚本 931）、`src/kalman/` 两路卡尔曼 2283、`src/to32/move_test/` 任务代码 2686）+ `config/` 约 1070；**2026-10-07 更新**：to32/move_test 行数为补丁后本地实测（原 v2.5 镜像口径 3640/930/510 已替换）；
 > 另有 vendored 库 `src/utils/py_utils` 2299 行（第三方，**别改**）。
 > ★ v2.5 结构变化：① **`src/to32/move_test/` 全新重写**（v2.2 的 7 文件全删，换成 `task_config/obs/mission/mode_auv` 4 模块骨架 + `Task.md` 任务划分；阶段表为空 = AUV 依旧不动作）；② **`run.sh` 的 `read_cfg` stdout 污染已修复**（2026-10-04，旧 README 误记为未修）；③ **新增 `config/udev/99-rover-cameras.rules`**（⚠ 与 `camera_ports.py` 的 cam1/cam2 物理口记载相反，待现场核对）；④ 前视目标含 `red-ball`（撞球要靠前视找球，2026-09-26 改动，旧 README 漏记）。
 
@@ -33,8 +34,9 @@ RDK S100 上跑的水下机器人（ROV/AUV）**板端软件总线**：两路相
 | CAM3 内窥镜按需推流 :8084 | ✅ 运行中 | 取流才开相机、空闲 5s 释放 |
 | 高度计读取 `read_altimeter.py` | ⚠ 运行但无数据 | 五路持续 no-reply（自动降 2s 低频探测）；`$ALT` 照常推上位机 :8082。深度卡尔曼侧已加**失效硬拒**（净空出界 / 姿态超限直接拒，2026-10-06） |
 | 中位机（UDP 控制 / 遥测转发） | ✅ 运行中 | 上电停 **IDLE 待命**；行为见下节《模式与状态》 |
+| PID 参数下发（二进制中继 v3.8） | ✅ 软件链路已通（**未实机**） | 上位机 v3.8 发 11B 二进制 PID → S100 校验后**原字节转发** STM32（默认仅 CH 0~3）；`$TASKPID,gate,P,I,D#` 更新过门参数并 ACK；旧文本 `$PID` 仍丢弃。详见下节《PID 调参链路》 |
 | ROV 手动遥控 | ✅ 可用 | 摇杆 → `0x09` 四轴直通；需上位机显式发 `mode=0` 激活 |
-| AUV 自主任务（v2.5 阶段注册制状态机） | ⛔ **骨架就位，阶段表为空** | 2026-10-06 重写：`mission.py` Stage 基类 + `task_config.STAGE_TABLE=[]`，开机即 DONE、不发 0x09；任务阶段按 `move_test/Task.md`（2026 巡游规则）逐步填 |
+| AUV 自主任务（v2.5 阶段注册制状态机） | ⛔ **测试模式接管 AUV 位，正式任务未注册** | 2026-10-06 重写后 5 个任务脚本（Task1/Task2/SearchBall/Task4/Return）+ 穿门 `PassGateAll` 已就位；`test_mode/TEST_MODE_ENABLED=True` → 切 mode=1 进入**测试模式**跑 `TEST_TABLE`（5 任务整表串联）；正式 `AuvMode`（`move_test/`）未在 `mode_dispatcher` 注册；穿门可拼进测试表联调 |
 | 两路卡尔曼自动拉起 | ⛔ 不会发生 | v2.2 的托管方 `kalman_launcher.py` 已随重写**删除**（v2.5 不再提供自动托管）；代码仍在 `src/kalman/`，可手动 `./run.sh --daemon` 调试 |
 | `$AUV` 状态上报 :8085 | ⛔ 已删 | `auv_report.py` 已随 v2.2 重写删除（需要时按旧版思路重加） |
 | 光流测速 :8000 | ⛔ **已停用** | 计算+共享全停（`FLOW_DISABLED=1` + 两个配置开关 False）；代码与参数保留，一键可恢复 |
@@ -50,7 +52,7 @@ RDK S100 上跑的水下机器人（ROV/AUV）**板端软件总线**：两路相
 |---|---|---|---|---|---|---|---|
 | **IDLE 待命** | -1 | 上电默认；`--mode idle` | ❌ | ❌ | ❌ | 41 字段全 0 占位帧 | 静默待机：机器人不动，下位机收不到任何帧；上位机凭全 0 `$TEL` 知道板子在线 |
 | **ROV 手动** | 0 | `$CMD mode=0`；`--mode rov` | 进入时一次 | ✅ 每帧直通 | ✅ 周期轮询 | 真遥测 | 摇杆即推力（四轴直通，四轴全 0 才判回中）；图像/检测照常 |
-| **AUV 自主** | 1 | `$CMD mode=1`；`--mode 1` | 进入时一次（0x05） | ❌ **绝不发** | ✅ 周期轮询 | 真遥测 | **骨架空转**：`mode_dispatcher` 注册的仍是内联 `AuvModeStub`，只向下位机切一次模式；v2.5 状态机骨架已重写但 `STAGE_TABLE=[]`，**无任何自主运动**；卡尔曼不拉起、无 `$AUV` 上报 |
+| **AUV 自主** | 1 | `$CMD mode=1`；`--mode 1` | 进入时一次（0x05） | ⚠ **测试模式：发（跑 `TEST_TABLE`）；标准壳：绝不发** | ✅ 周期轮询 | 真遥测 | **2026-10-07 口径**：`test_mode/TEST_MODE_ENABLED=True`（当前默认）时 AUV 模式位被 `TestMode` 接管——切 mode=1 进入**测试模式**，驱动 `TEST_TABLE`（5 任务整表串联）下发 0x09；`False` 时仍是内联 `AuvModeStub`（只切模式、不运动）；正式 `AuvMode`（`move_test/`）未注册；卡尔曼不拉起、无 `$AUV` 上报 |
 
 切换语义（重要，逐条都是实测结论）：
 
@@ -63,6 +65,25 @@ RDK S100 上跑的水下机器人（ROV/AUV）**板端软件总线**：两路相
 想让 AUV 真正动起来（v2.5 两步）：
 1. **填阶段**：按 `src/to32/move_test/Task.md`（2026 巡游任务阶段划分）在 `mission.py` 写 Stage 子类，排进 `task_config.STAGE_TABLE`；
 2. **接回主链路**：按 `src/to32/move_test/README.md`——在 `mode_dispatcher.py` 顶部加 `from mode_auv import AuvMode`，把 `AuvModeStub` 的注册行换成 `register(AuvMode)`（`mode_auv.py` 自带 sys.path 注入，run.sh 不用改）。
+   ⚠ 2026-10-07 起：`test_mode/TEST_MODE_ENABLED=True`（当前默认）时 AUV 位已被 `TestMode` 接管；要跑正式 `STAGE_TABLE`，先把 `test_mode/test_config.py` 的开关置 `False`（或改注册逻辑），二选一，不要同时生效。
+
+---
+
+## ★ PID 调参链路（2026-10-07 v3.8 落地）
+
+上位机 v3.8 起，PID 增益不再走旧文本 `$PID`（仍丢弃），改走 **11B 二进制帧**：
+
+```
+CD 0A 01 CH KP_LE KI_LE KD_LE DC
+```
+
+（`CH`=通道号；增益 ×100、int16 小端、±327.68 边界）。中位机 `link_pc` 先判二进制 → `protocol.parse_binary_pid` 严格校验（帧长/头/功能码/编号上限/帧尾）→ `mode_dispatcher` **原字节转发** STM32（独立于模式切换、不解除急停、不保存）；文本 `$CMD/$VID/PING` 路径不变。
+
+- **通道口径**：默认只放行 **CH 0~3**（Pitch/Yaw/Roll/Depth）；4~7 是参考固件的补偿环，`PID_BINARY_MAX_CH=3` 写死，待台架核实后另行放宽。
+- **`$TASKPID,<req>,gate,P,I,D#`**（命名任务参数，仅 S100 处理）：直接更新过门 `GatePid` 实例并回 ACK（UDP 8081）；**不启动任务、不切模式**；撞球/捡球未实现，明确拒绝。
+- **配置开关**（`config/to32_config.py`）：`PID_BINARY_PASSTHRU=True` / `PID_BINARY_MAX_CH=3` / `TASK_PID_ENABLED=True`。
+- **已落地验证**：补丁包 `源码\GrandRdk-2.5\tests\test_pid_relay.py`（16 项）+ `test_task_pid.py`（14 项）无硬件回归全过（脚本**未拷入项目/未入 git**，从补丁包目录直接可跑）；**未实机**——STM32 对 0~3 的真实接受/保存、4~7 补偿环存在性，待实体联调核对。
+- **上位机配套**：PC 侧必须用 `ROV_ControlStation_v3.8`（二进制 PID 面板 + `$TASKPID` 确认）。
 
 ---
 
@@ -77,8 +98,8 @@ cd /userdata/GrandRDK
 
 # ★ 中位机模式（上电默认 IDLE 待命，需显式切换）
 ./run.sh --to32-args "--mode rov"   # 切到 ROV 手动模式
-./run.sh --to32-args "--mode 1"     # 切到 AUV（v2.5：只切模式不运动——阶段表为空；
-                                    #   填阶段与接回办法见 src/to32/move_test/README.md）
+./run.sh --to32-args "--mode 1"     # 切到 AUV（2026-10-07：测试模式接管 AUV 位，跑 TEST_TABLE 会发 0x09；
+                                    #   正式任务接回办法见 src/to32/move_test/README.md）
 ./run.sh --to32-args "--mode 1 --stm32 sim"   # 干跑（不下发真实指令）
 ```
 
@@ -140,8 +161,8 @@ cd /userdata/GrandRDK
 | `src/flow_speed.py` | ⛔ **光流测速，已停用（2026-10-04）**：`run.sh` 不再拉起，文件保留只加横幅；`:8000` 不再监听。恢复方法见《变更记录》 |
 | `src/show_cam.py` | 第三路相机 CAM3，**按需**采集推流 `:8084` |
 | `src/read_altimeter.py` | CH348 A–E 口读 DYP-L08 超声波高度计（Modbus-RTU）→ UDP `$ALT` 推上位机 `:8082` |
-| `src/to32/` | **中位机源码**：`main.py` 入口、`link_pc/link_stm32` 双链路、`mode_idle/mode_rov` 模式层、`mode_dispatcher`（内含 AuvModeStub）、`protocol`/`tel_builder`/`video`，+ 4 个测试脚本（详见 **`src/to32/README.md`**） |
-| `src/to32/move_test/` | ★（2026-10-06 v2.5 全新重写）**AUV 任务代码骨架**（4 模块：`task_config.py` 36 行=全部任务参数+`STAGE_TABLE`；`obs.py` 211 行=`VisionIF`+`DepthIF` 观测接口+`CANON` 标签归一化；`mission.py` 142 行=Stage 基类+Mission 编排器；`mode_auv.py` 121 行=AUV 模式壳，自带 sys.path 注入）+ `Task.md`（2026 巡游任务阶段划分与定深口径公式）+ `README.md`（重写规范与接回说明）+ 空目录 `task/`、`test_mode/`。**阶段表为空 = 状态机开机即 DONE；主链路零 import，当前不生效**。v2.2 旧 7 文件（mission/mode_auv/vision_if/depth_if/viskf_if/auv_report/kalman_launcher）已全部删除，旧版全套在 `D:\RC\S100\综合\GrandRDKv2.2` 可查 |
+| `src/to32/` | **中位机源码**：`main.py` 入口、`link_pc/link_stm32` 双链路、`mode_idle/mode_rov` 模式层、`mode_dispatcher`（内含 AuvModeStub）、`protocol`/`tel_builder`/`video`，+ 4 个测试脚本（详见 **`src/to32/README.md`**）。**2026-10-07 新增 `task_pid_wire.py`/`task_pid_controller.py`（PID 二进制中继 + `$TASKPID`）** |
+| `src/to32/move_test/` | ★（2026-10-06 v2.5 全新重写，2026-10-07 随 PID 补丁联动）**AUV 任务代码**（`task_config.py`=任务参数+`STAGE_TABLE` 当前=`SEARCH_BALL_TABLE`；`obs.py`=`VisionIF`+`DepthIF`；`mission.py`=Stage 基类+Mission 编排器，支持 `task_pids` 注入；`mode_auv.py`=AUV 模式壳）+ `Task.md`（2026 巡游任务阶段划分）+ `task/`（5 个任务脚本 + 穿门 `task_pass_door/` 含 `PassGateAll` + 撞球/捡球脚本未接线）+ `test_mode/`（**`TEST_MODE_ENABLED=True`，切 mode=1 即跑 `TEST_TABLE` 5 任务整表串联**）。⚠ 主链路仍注册内联 `AuvModeStub`/`TestMode`，正式 `AuvMode` 未注册；v2.2 旧 7 文件已删，旧版全套在 `D:\RC\S100\综合\GrandRDKv2.2` 可查 |
 | `src/to32/` | （2026-09-22 由 `docs/` 合并迁入）中位机文档：`README.md`、`README_中位机.md`、`ROV_指令与V2协议对应关系.md`、`上位机通讯协议.md` |
 | `logs/to32_mode_state.json` | 中位机模式记忆文件（原子写；当前 `MODE_PERSIST=False` 不写） |
 | `src/utils/flow_share.py` | 帧共享桥，flock 互斥避免读写撕裂（光流停用后暂无消费者，保留） |
@@ -236,17 +257,19 @@ cd /userdata/GrandRDK
 | 文件 | 行数 | 作用 |
 |---|---|---|
 | `main.py` | 294 | **入口**：argparse 参数 → 装配 link_pc / link_stm32 / mode_dispatcher / video 各线程并常驻；`--mode idle/-1/待命` 可直接进待命态 |
-| `link_pc.py` | 113 | 上位机链路：UDP :8080 收 `$CMD`/`$PID`/`$VID`/`PING`，:8081 发 `$TEL` |
-| `link_stm32.py` | 332 | 下位机链路：串口（CH348 F 口 `ttyCH9344USB5`）发 `0x09` 控制帧、收 `0x0C` 48 字节遥测帧并解析；**`poll_suspended=True` 时兜底 0x0C 轮询被抑制（IDLE 待命期）** |
-| `protocol.py` | 87 | V2 协议组帧 / 校验的纯函数；`parse_cmd` 输出 `mode_explicit` 标记"帧里有没有第 7 段" |
-| `tel_builder.py` | 76 | 把下位机遥测拼成上位机的 `$TEL` 帧 |
-| `mode_base.py` | 91 | `ModeBase` 抽象基类，定义 10 个回调（tick / 载荷处理 / 进入退出等） |
+| `link_pc.py` | 144※ | 上位机链路：UDP :8080 收 `$CMD`/`$PID`/`$VID`/`PING`，:8081 发 `$TEL`；**2026-10-07 收包先判 11B 二进制 PID（命中走独立中继），并新增 `$TASKPID` ACK 出口** |
+| `link_stm32.py` | 348※ | 下位机链路：串口（CH348 F 口 `ttyCH9344USB5`）发 `0x09` 控制帧、收 `0x0C` 48 字节遥测帧并解析；**`poll_suspended=True` 时兜底 0x0C 轮询被抑制（IDLE 待命期）；2026-10-07 `send()` 整帧互斥写锁 + 短写检查，兜底轮询走同一 `send`，新增 PID 帧常量** |
+| `protocol.py` | 107※ | V2 协议组帧 / 校验的纯函数；`parse_cmd` 输出 `mode_explicit` 标记"帧里有没有第 7 段"；**2026-10-07 新增 `parse_binary_pid`（11B 二进制 PID 严格校验）** |
+| `tel_builder.py` | 167※ | 把下位机遥测拼成上位机的 `$TEL` 帧 |
+| `mode_base.py` | 92※ | `ModeBase` 抽象基类，定义 10 个回调（tick / 载荷处理 / 进入退出等） |
 | `mode_idle.py` | 99 | ★（2026-10-04）**IDLE 待命模式**：上电默认进入，**不发 0x04/0x09/0x0C**，只回全 0 占位 `$TEL`；等上位机下发**带 mode 的** `$CMD` 才切到 ROV/AUV |
-| `mode_rov.py` | 197 | **ROV 手动模式**：四轴直通；空闲静默语义为四轴全 0 才判回中 |
-| `mode_dispatcher.py` | 537 | **调度核心**：模式切换与记忆、看门狗、急停锁存、抑制危险帧；**待命态只认显式带 `mode` 的 `$CMD`**（老格式 6 段帧不误激活），并在此进/出 IDLE 时置 `link_stm32.poll_suspended`。⚠（2026-10-04）AUV 槽位注册的是内联 **`AuvModeStub`**：`on_enter` 只发 `0x04=0x05`、`tick` 只泵 `0x0C`，**绝不发 0x09**（v2.5 任务骨架在 `move_test/`，接回方法见其 `README.md`） |
+| `mode_rov.py` | 198※ | **ROV 手动模式**：四轴直通；空闲静默语义为四轴全 0 才判回中 |
+| `mode_dispatcher.py` | 641※ | **调度核心**：模式切换与记忆、看门狗、急停锁存、抑制危险帧；**待命态只认显式带 `mode` 的 `$CMD`**（老格式 6 段帧不误激活），并在此进/出 IDLE 时置 `link_stm32.poll_suspended`。⚠（2026-10-04）AUV 槽位原为内联 **`AuvModeStub`**；**2026-10-07 起 `test_mode` 开关开启时被 `TestMode` 接管**（跑 `TEST_TABLE`），并新增 **PID 二进制中继（`_on_pid_binary`/`_on_task_pid`，不切模式/不解急停/不保存）** 与 `task_pids` 注入 |
+| `task_pid_wire.py` | 81※ | **2026-10-07 新增**：`$TASKPID` 命名任务参数编解码与 ACK 回帧（仅 S100 处理） |
+| `task_pid_controller.py` | 29※ | **2026-10-07 新增**：S100 真实 `GatePid` 对象 + 过门任务工厂；`$TASKPID gate` 更新即时生效 |
 | `verify_idle_mode.py` | **0（空文件）** | ⚠ 本 v2.5 镜像中为**空文件**（2026-10-04 版有 IDLE 专项自检 17/17，在 v2.2 工程/开发机里；要用从那边取） |
-| `move_test/`（4 模块 + 2 文档） | 510 | ★（2026-10-06 v2.5 全新重写）**AUV 任务代码骨架，主链路零 import、当前不生效**：`task_config.py`(36，全部任务参数 + `STAGE_TABLE=[]`) / `obs.py`(211，`VisionIF`+`DepthIF` 观测接口) / `mission.py`(142，Stage 基类 + Mission 编排器) / `mode_auv.py`(121，AUV 模式壳，自带 sys.path 注入) + `Task.md`(2026 巡游阶段划分) + `README.md`(重写规范与接回说明)。**空表 = 开机即 DONE，不发 0x09**。v2.2 旧 7 文件已删（mission 805/mode_auv 178/vision_if 181/depth_if 112/viskf_if 129/kalman_launcher 350/auv_report 271），全套在 `D:\RC\S100\综合\GrandRDKv2.2` 可查 |
-| `video.py` | 302 | ⚠ **个人测试代码，非交付链路** —— 中位机自带图像回传（自己开相机直编 MJPEG，**不经过 YOLO ⇒ 画面无检测框**）。**2026-09-21 已停用**（`VIDEO_PATHS={}`、`VIDEO_ENABLED_AT_START=False`），`run.sh` 固定 `--no-video --video-port 0`。**上位机看到的带框画面来自 `web_server.py`，与它无关。** 保留仅供个人调试 |
+| `move_test/`（任务包） | 4 模块 605※ + task/ 脚本 + test_mode/ 278※ | ★（2026-10-06 v2.5 重写，2026-10-07 随 PID 补丁联动）**AUV 任务代码**：`task_config.py`(127※，任务参数 + `STAGE_TABLE` 当前=`SEARCH_BALL_TABLE` + 各任务表 try-import 拼装) / `obs.py`(211，`VisionIF`+`DepthIF` 观测接口) / `mission.py`(144※，Stage 基类 + Mission 编排器，支持 `task_pids` 注入) / `mode_auv.py`(123※，AUV 模式壳，自带 sys.path 注入) + `Task.md`(2026 巡游阶段划分) + `task/`（5 个任务脚本 `t_task1/t_task2/t_search_ball/t_task4/t_return` + 穿门 `task_pass_door/`（`PassGateAll` 已就位）+ 撞球/捡球脚本**未接线**）+ `test_mode/`（`test_config.py` + `test_runner.py`，**`TEST_MODE_ENABLED=True` → 切 AUV 即跑 `TEST_TABLE`**）。⚠ **主链路未注册正式 `AuvMode`**。v2.2 旧 7 文件已删（mission 805/mode_auv 178/vision_if 181/depth_if 112/viskf_if 129/kalman_launcher 350/auv_report 271），全套在 `D:\RC\S100\综合\GrandRDKv2.2` 可查 |
+| `video.py` | 303※ | ⚠ **个人测试代码，非交付链路** —— 中位机自带图像回传（自己开相机直编 MJPEG，**不经过 YOLO ⇒ 画面无检测框**）。**2026-09-21 已停用**（`VIDEO_PATHS={}`、`VIDEO_ENABLED_AT_START=False`），`run.sh` 固定 `--no-video --video-port 0`。**上位机看到的带框画面来自 `web_server.py`，与它无关。** 保留仅供个人调试 |
 | `port_probe.py` | 74 | 串口探测（CH348 A~H 通道确认；`main.py --list` 是另一条独立实现，不依赖本文件） |
 | `selftest_modes.py` | 537 | 模式层离线自检（板端保留；开发机镜像归口 `hwless_tests/legacy_to32/`）。口径：**AUV 期间 0x09 必须不增加**（运动逻辑已摘除）。板端跑法：`PYTHONPATH=/userdata/GrandRDK/config:/userdata/GrandRDK/src:/userdata/GrandRDK/src/utils:/userdata/GrandRDK/src/to32 python3 src/to32/selftest_modes.py` |
 | `make_test_frame.py` / `test_v2_frames.py` | 197 / 196 | V2 测试帧构造 / 帧解析测试（板端保留；`test_v2_frames` 需先 `make_test_frame.py --bin /tmp/v2_telemetry_5frames.bin` 造数据，19/19 PASS） |
@@ -254,12 +277,14 @@ cd /userdata/GrandRDK
 > **测试脚本归属（2026-10-04 澄清）**：开发机镜像中，`selftest_modes` / `make_test_frame` /
 > `test_v2_frames` 已归口 `hwless_tests/legacy_to32/`；**板端（运行环境）没有 `hwless_tests/`，
 > 这几个脚本仍留在 `src/to32/`** 供板上自检。
+>
+> ※ 行数 = 2026-10-07 PID v3.8 补丁后**本地工作副本**实测；未标 ※ 的行仍为 2026-10-06 v2.5 镜像口径。板端部署后以实际为准。
 
 **文档**（2026-09-22 由 `docs/` 合并迁入）：
 
 | 文件 | 行数 | 作用 |
 |---|---|---|
-| `README.md` | 584 | **中位机目录导航**：文件速查、线程模型、协议速查、安全机制、排障表。⚠ **尚未同步 v2.5 move_test 重写**（`mode_auv.py` 描述仍是旧版口径），以 `move_test/README.md` 与代码注释为准 |
+| `README.md` | 584+ | **中位机目录导航**：文件速查、线程模型、协议速查、安全机制、排障表。**2026-10-07 已同步 PID v3.8 中继、`$TASKPID` 与 move_test 联动** |
 | `README_中位机.md` | 355 | 中位机完整设计说明（含完整协议字段表） |
 | `ROV_指令与V2协议对应关系.md` | 237 | 上位机指令 ↔ 下位机 V2 功能码对照 |
 | `上位机通讯协议.md` | 130 | 上位机侧 UDP 报文格式 |
@@ -294,7 +319,7 @@ cd /userdata/GrandRDK
 | ~~`flow_speed.py`~~ | — | ~~:8000~~ | ⛔ **已停用（2026-10-04），不启动** |
 | `show_cam.py` | nice 5 | :8084 | 空闲不占相机，上位机取流才开 |
 | `web_server.py` | nice 10 | :5000 | `/cam1` `/cam2` `/api/status` `/api/detections` `/ws/status` `/healthz`。★ **上位机图像回传的唯一来源（带检测框）**。⚠ 绑定具体网卡 IP（192.168.127.10），板端本地探测别用 127.0.0.1 |
-| `src/to32/main.py` | nice 5 | UDP 8080/8081 + 串口 F 口 | 中位机；**已停用自带图像回传**，不碰相机；上电停 IDLE，AUV=骨架空转（阶段表为空，见《模式与状态》） |
+| `src/to32/main.py` | nice 5 | UDP 8080/8081 + 串口 F 口 | 中位机；**已停用自带图像回传**，不碰相机；上电停 IDLE；**2026-10-07 起支持 11B 二进制 PID 中继与 `$TASKPID`**；AUV 位=测试模式接管（见《模式与状态》） |
 | Nginx | — | :80 | 静态页 + 反代到 :5000（供浏览器，非上位机） |
 
 > `legacy_bridge.py`（旧图像链路 `:9000/:9001`）**已于 2026-09-21 删除**，`--with-legacy` 不再存在，只剩 `logs/legacy_bridge.log` 的历史日志。
@@ -463,7 +488,7 @@ momo_det_front.json ──> src/kalman/camera_kalman/（图像卡尔曼 viskf �
 | `/cam1` `/cam2` 黑屏 | 写端没起来，`/dev/shm` 无数据 | `./status.sh` 看共享内存；先看 `front.log` / `bottom.log` |
 | 上位机连不上 :5000 | 监听地址或防火墙；或 run.sh 的 `read_cfg` 被 stdout 污染跳过了 web_server | 用 `ss -lntp \| grep 5000` 确认在听；板端本地探测**别用 127.0.0.1**（uvicorn 绑网卡 IP），refused 多为上游长连接占满 backlog，非故障 |
 | `stop.sh` 后进程还在 | 上位机占着 MJPEG 流，uvicorn 优雅关闭会挂住 | stop.sh 带宽限期后 SIGKILL 兜底，属已知行为 |
-| **上位机切 AUV 机器人不动** | **预期行为**：v2.5 骨架阶段表为空（`STAGE_TABLE=[]`），开机即 DONE 不发 0x09 | 填阶段 + 接回见 `src/to32/move_test/README.md`（与 `Task.md`） |
+| **上位机切 AUV 机器人不动** | 先看 `test_mode/test_config.py` 的 `TEST_MODE_ENABLED` 与 `TEST_TABLE`：`False` 时 AUV 位是内联 `AuvModeStub`（只切模式、不发 0x09，**预期行为**）；`True` 但测试表空 = 进入即 DONE | 要跑正式任务：`TEST_MODE_ENABLED=False` + 按 `src/to32/move_test/README.md` 接回 `AuvMode`（`STAGE_TABLE` 当前=`SEARCH_BALL_TABLE`） |
 | **日志疯狂刷"进入 AUV/退出 AUV/进入 ROV"** | 两个来源同时发带 mode 的 `$CMD`（如上位机 + 调试注入）互抢模式 | 只保留一个 `$CMD` 来源；`to32_main.log` 的"模式切换"计数可确认规模 |
 | 光流相关问题（:8000 无画面、`moving=0%`、m/s 不对） | **光流已整体停用（2026-10-04）** | 恢复：`run.sh` 的 `FLOW_DISABLED=0` + `main_config.py` 两个开关 True；启动顺序仍须**先 bottom 后 flow_speed** |
 | `[!!] [x] 读取失败(no-reply)` | 该串口没接高度计 | 自动降 2s 低频探测，接上自动恢复，无需处理 |
@@ -481,7 +506,7 @@ momo_det_front.json ──> src/kalman/camera_kalman/（图像卡尔曼 viskf �
 4. **高度计持续离线**：2026-10-01 复测 A–E 五路全部 no-reply（接线已确认），下一步查 Modbus 参数（`--addr 0x01`/`--reg 0x0101`/115200）与供电；与 STM32 共用同一颗 CH348。深度卡尔曼侧已按 2026-10-06 实机行为加**失效硬拒**（失效读数 -3/超程大数直接拒，见《数据流》），高度计来数即可安全接入。
 5. **`web/index_v2.html` 未接入**：Nginx `index index.html`，代码里也没有引用它。想启用需改 nginx 配置或自行接入。
 6. **遥测状态曾反复**：2026-09 期间 0x0C 恒 0 帧；**2026-10-04 实测已通**（150 帧、yaw 有真值），疑换过设备/固件。**上位机深度 0.0cm 仍降级**。改相关代码前先实测确认。
-7. **AUV 骨架待填（2026-10-06）**：v2.5 状态机骨架已重写（`move_test/` 的 `Stage` 注册制），但 `STAGE_TABLE=[]` 空表——阶段按 `move_test/Task.md` 逐步实现；两路卡尔曼不被自动拉起（托管方已删）；无 `$AUV` 上报（`auv_report.py` 已删）。任务侧待标定参数（`AUV_SPEED_MPS`、`AUV_YAW_RATE_DPS`、`AUV_POOL_DEPTH_CM`）在 `move_test/task_config.py`；旧 AUV 参数段在 `config/auv_config.py`；深度卡尔曼 `H_M=1.3` 仍须实测。
+7. **AUV 任务未接正式主链路（2026-10-07 口径）**：任务脚本已实现（5 任务 + 穿门 `PassGateAll`），但 `mode_dispatcher` 注册的是内联 `AuvModeStub` 或 `TestMode`——正式 `AuvMode` 未注册，`STAGE_TABLE` 不驱动主链路；要动起来按 `move_test/README.md` 接回（并先关 `test_mode/TEST_MODE_ENABLED`）。两路卡尔曼不被自动拉起（托管方已删）；无 `$AUV` 上报（`auv_report.py` 已删）。任务侧待标定参数（`AUV_SPEED_MPS`、`AUV_YAW_RATE_DPS`、`AUV_POOL_DEPTH_CM`）在 `move_test/task_config.py`；撞球/捡球脚本存在但**未接线**；旧 AUV 参数段在 `config/auv_config.py`；深度卡尔曼 `H_M=1.3` 仍须实测。
 8. **模式切换无来源锁定**：任意带 mode 的 `$CMD` 都即时生效、无防抖——双源并发会高频抖动（实测 12s 切 464 次）。运行期确保只有一个 `$CMD` 来源。
 9. **udev 规则与 `camera_ports.py` 的 cam1/cam2 物理口记载相反（2026-10-06 发现）**：`config/udev/99-rover-cameras.rules` 写 cam1=口1-2 / cam2=口3-2，`camera_ports.py` 写 cam1=3-2 / cam2=1-2——两颗 Realtek 型号/序列号相同，只能靠物理口区分，二者必有一个过时。**启用 udev 软链前必须现场实测核对**（`v4l2-ctl --list-devices` + 试开确认画面），并同步改另一个文件，否则前视/下视会错位。
 
@@ -529,3 +554,5 @@ momo_det_front.json ──> src/kalman/camera_kalman/（图像卡尔曼 viskf �
 | 2026-10-06 | ★ **`src/to32/move_test/` 全新重写为 v2.5 骨架**：v2.2 的 7 文件（mission/mode_auv/vision_if/depth_if/viskf_if/auv_report/kalman_launcher）全部删除，换成 4 模块 `task_config.py`(36)/`obs.py`(211)/`mission.py`(142)/`mode_auv.py`(121) + `Task.md`(2026 巡游阶段划分，含定深口径公式 `depth_cm=实测水深−目标高度−机体高度20cm`) + `README.md`。`STAGE_TABLE=[]` 空表 = 开机即 DONE；主链路仍注册 `AuvModeStub`，接回 = dispatcher 两行改动（见 `move_test/README.md`）。能力移除待需要时重加：卡尔曼自动托管、`$AUV` 5Hz 回传、viskf 过门滤波接口。新增空目录 `task/`、`test_mode/` |
 | 2026-10-06 | 新增 `config/udev/99-rover-cameras.rules`（udev 物理口绑定）；⚠ 其 cam1/cam2 物理口与 `camera_ports.py` 相反，列入已知问题待现场核对。`verify_idle_mode.py` 在本镜像为空文件。各文件行数按 v2.5 镜像实测校准（front 511 / bottom 543 / read_altimeter 347 / mode_dispatcher 537 / selftest 537 / kalman 2283 等）；本 README 依镜像实况全面更新 |
 | 2026-10-06（晚） | ★ **深度卡尔曼 2026-10-06 实测落档**：`config/depth_config.py`（210→231 行）——① B/C 安装参数落档（前后相距 ~15cm、B 比 C 高 20mm ⇒ `ALT_MOUNT['C'].dz=0.02`，修掉 C 恒带 2cm 系统偏差进融合的旧问题；y 全 0）；② 新增**失效硬拒**门限 `ALT_MIN/MAX_VALID_M=0.02/2.5`、`ALT_MAX_TILT_DEG=30`（实机高度计失效会读 -3/超程大数）；③ **观测方程耦合配对修正**（前向偏移 y 耦合俯仰 θ、右向偏移 x 耦合横滚 φ，旧式配反；pitch/roll 锁 0 期间无影响，姿态解锁前必须用新式）；④ `H_M` 水面标定法与公式口径 `H_M = 水深 − dz_锚路`（2026-10-06 实测水深约 1.2m，1.3 仍占位、重标预计 ≈1.2）；⑤ `R_ALT_BASE` 0.008→0.010（无遥测档放宽）。配套代码：`fusion.py`(342) 在自适应门限**之前**硬拒且不喂 P 放大看门狗、snapshot 新增 `rej_range`/`rej_tilt` 计数；`model.py`(302) `obs_alt`/`clearance_of` 同步修正耦合配对。⚠ 已知债务：深度计装机体**上部**，当前 D 语义 = B 探头深度（≈舱底上方 2cm），深度计回灌后 O1/O2 恒差 ~0.18m 由 b_d 吸收；完整迁移（dz_B=0.18 等）须连下游「池深当 D 目标」一起改 |
+| 2026-10-07 | ★ **PID 中继 v3.8 落地（本地工作副本，已提交）**：`protocol.py` 新增 `parse_binary_pid`；`link_pc.py` 先判二进制再解码文本（并修复 `_stop` 覆盖）；`link_stm32.py` `send()` 整帧互斥写锁 + 短写检查；`mode_dispatcher.py` 独立 PID 中继（不切模式/不解急停/不保存）+ `$TASKPID` 处理 + `task_pids` 注入；新增 `task_pid_wire.py`、`task_pid_controller.py`；`move_test` 联动（mission/mode_auv/test_runner/task_config/t_pass_gate/gate_pid/gate_mission）；`config/to32_config.py` 新增 `PID_BINARY_PASSTHRU=True` / `PID_BINARY_MAX_CH=3` / `TASK_PID_ENABLED=True`；无硬件回归 30 项（16+14）**从补丁包 `源码\GrandRdk-2.5\tests\` 复跑全过**（脚本未拷入项目/未入 git）。⚠ 未实机：STM32 通道接受/4~7 补偿环待联调；PC 侧需配套上位机 v3.8 |
+| 2026-10-07 | 本 README 更新：《PID 调参链路》新节；功能状态表 / 模式表 / 文件地图 / 进程表 / 排障 / 已知问题同步 2026-10-07 口径；`src/to32/`、`move_test/`、`task_pass_door/` 的 README 同步更新 |

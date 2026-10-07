@@ -3,7 +3,7 @@
 方案文档（本目录内）：
 - `过门任务方案_从零规划_2026-10-06.md`（定稿 v4：三态流程 / viskf 决策 / 陀螺仪增强）
 - `PID对门横向控制方案_2026-10-06.md`（早期方案存档，供追溯）
-- 任务骨架：`t_pass_gate.py`（GrandRDKv2.5 task 框架占位，PASS_GATE_TABLE 待实现）
+- 任务阶段：`t_pass_gate.py` → **`PassGateAll`（2026-10-07 已落地）**——`PASS_GATE_TABLE=[PassGateAll]`；等待有效遥测（actual_yaw/actual_depth_cm）→ `create_gate_mission` 构造 `GateMission` → tick；共用 `ctx.task_pids`
 
 ## 算法模块
 
@@ -24,6 +24,12 @@
 - 纯计算模块（gate_pid）仿真与实机共用同一份代码。
 - 符号：e 右为正（E_SIGN），ω 右转为正（GYRO_SIGN），都在入口处乘符号。
 
+## PID 调参（2026-10-07 v3.8 联动）
+
+- 中位机 `src/to32/task_pid_controller.py` 持有 S100 真实 `GatePid` 实例；`$TASKPID,gate,P,I,D#` 更新它并 ACK 回 8081（仅 S100 处理、不下发 STM32）。
+- `PassGateAll` 经 `create_gate_mission(...)` **共用同一 `GatePid`** → 过门 PID 调参即时生效；参数更新**不启动任务、不切模式**。
+- 验证：补丁包 `源码\GrandRdk-2.5\tests\test_task_pid.py`（14 项无硬件回归全过；脚本未拷入本项目）；**实机调参 / 门线符号标定（GATE_E_SIGN）待下水窗口**。
+
 ## 已做验证
 
 - 方案A回放（replay_out/）：2025 帧真机门视频检测数据开环跑通，
@@ -34,3 +40,5 @@
 
 随 GrandRDKv2.5 整体上传；实机接线：tel() 接 parse_telemetry 输出，
 send() 接 link_stm32 下行组帧，滤波用 `GATE_EF_TYPE='viskf'`。
+**2026-10-07**：`t_pass_gate.py` 已进 `PASS_GATE_TABLE`；AUV 模式位当前由 `test_mode` 接管，
+穿门可拼进 `TEST_TABLE` 做整表联调（见 `move_test/README.md`）。
