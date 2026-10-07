@@ -78,7 +78,7 @@ class TestMode(ModeBase):
         table = list(getattr(TCFG, 'TEST_TABLE', []) or [])
         cfg = types.SimpleNamespace(STAGE_TABLE=table)
         self.mission = Mission(cfg, vision=obs.VisionIF(log=self.log),
-                               depth=obs.DepthIF(log=self.log), log=self.log)
+                               depth=obs.DepthIF(log=self.log), log=self.log, task_pids=self.ctx.task_pids)
         self.log("[TEST] 测试模式接管 AUV 位：test_config.TEST_TABLE 共 %d 项；"
                  "上位机切 ROV(mode=0) 即退出停推" % len(table))
         if not table:
@@ -118,6 +118,8 @@ class TestMode(ModeBase):
         cmd = self.mission.step(now, dt, self.last_tel)
         if not cmd:                      # None = 测试表已跑完（收尾 stop 帧已发）
             self._maybe_loop(now)        # 按 TEST_LOOP 决定是否重跑
+            return
+        if cmd.get('paused'):
             return
         yaw = apply_yaw_mirror(cmd["yaw"], self.yaw_mirror)
         self.send_downlink(

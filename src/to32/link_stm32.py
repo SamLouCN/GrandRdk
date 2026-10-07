@@ -17,7 +17,8 @@
         0x05 AUV                0x06 有线ROV(ROV_TETHERED)
     ⚠ S100 侧**禁发** 0x02(预编程) 与 0x03(无线ROV) —— 见《多源控制协议设计.md》§5.3；
       发送守卫见 frame_mode()。0x02 测试油门(FUNC_TEST_THROTTLE) 亦禁止实现（§12.3）。
-  - 0x01 PID 通道只有 0~3 = Pitch/Yaw/Roll/Depth（与上位机 0~11 语义不同）
+  - 旧0x01组帧按0~3姿态/深度对接；v3.7新PID中继接受参考编号0~7并原字节转发，
+    4~7在参考固件为补偿回路，业务映射以现役固件为准。
   - **0x09 没有 STANDBY 守卫**：急停后再发 0x09 会静默退出急停 → 急停锁存必须由中位机负责
 """
 import threading  # 线程模块：轮询线程与停止事件
@@ -48,6 +49,10 @@ FUNC_MOTION         = 0x09  # 0x09 摇杆综合运动（15B，无 STANDBY 守卫
 FUNC_DEPTH          = 0x0A  # 0x0A 下发目标深度
 FUNC_READ_DEPTH     = 0x0B  # 0x0B 读取深度
 FUNC_TELEMETRY      = 0x0C  # 0x0C 遥测请求，唯一会触发下位机回帧的功能码
+
+# v3.7 PC PID 中继：参考协议编号0~7；业务名称由上位机/现役固件匹配。
+PID_FRAME_LEN = 11
+PID_REFERENCE_MAX_INDEX = 7
 
 # ---- 模式命令 ----
 MODE_START     = 0x00  # 启动/恢复运行
@@ -233,7 +238,8 @@ class Stm32Link:  # 下位机串口链路：负责开关串口、下发帧、轮
         self.ser = None  # 串口对象，打开成功后赋值
         self.enabled = (port_spec != "off")  # off 时整条链路禁用，不收不发
         self.sim = (port_spec == "sim")  # sim 时只打印不下串口
-        self.stats = {"tx_frames": 0, "rx_frames": 0, "bad_tail": 0, "bad_len": 0}  # 收发与错误计数器
+        self.stats = {"tx_frames": 0, "tx_errors": 0, "rx_frames": 0, "bad_tail": 0, "bad_len": 0}
+        self._write_lock = threading.RLock()  # PID、运动、模式和兜底轮询共用整帧写锁。
         self._stop = threading.Event()  # 轮询线程的停止信号
         self._thread = None  # 轮询线程句柄
         self.last_req_ts = 0.0      # 最近一次发出 0x0C 请求的时间（模式层/兜底轮询共享）
@@ -271,22 +277,34 @@ class Stm32Link:  # 下位机串口链路：负责开关串口、下发帧、轮
             pass  # 静默处理
 
     def send(self, frame, note=""):  # 下发一帧到下位机
-        """下发一帧（预留：由各模式决定帧内容）"""
+        """整帧互斥写入；完整写入/显式sim返回True，禁用/写失败返回False。"""
         if not self.enabled or not frame:  # 链路禁用或空帧则直接忽略
-            return  # 不发送
-        self.stats["tx_frames"] += 1  # 统计已下发帧数
-        if self.sim or self.ser is None:  # 空跑或串口未就绪
-            self.log("[STM32·sim] TX(%s) %s" % (note, hex_str(frame)))  # 只打印备注与十六进制帧
-            return  # 不写串口
-        try:  # 真实串口写可能失败（设备掉线）
-            self.ser.write(bytes(frame))  # 把整帧字节流写入串口
-        except Exception as e:  # 写失败不应让调用方崩溃
-            self.log("[STM32] 写失败: %s" % e)  # 记录写失败原因
+            return False
+        frame = bytes(frame)
+        with self._write_lock:
+            if self.sim:
+                self.log("[STM32·sim] TX(%s) %s" % (note, hex_str(frame)))
+                self.stats["tx_frames"] += 1
+                return True
+            try:
+                if self.ser is None:
+                    raise IOError("串口尚未打开")
+                written = self.ser.write(frame)
+                if written != len(frame):
+                    raise IOError("整帧写入不完整：%s/%d字节" % (written, len(frame)))
+                self.stats["tx_frames"] += 1
+                return True
+            except Exception as e:
+                self.stats["tx_errors"] += 1
+                self.log("[STM32] 写失败(%s): %s" % (note, e))
+                return False
 
     def send_telemetry_request(self, note="0x0C 遥测请求"):  # 发 0x0C 请求并记录时间戳
         """发一帧 0x0C 遥测请求（按协议，下位机收到即回一帧）。同时记时间戳供兜底轮询去重。"""
-        self.last_req_ts = time.time()  # 记录请求时刻，供兜底轮询判断是否已请求过
-        self.send(frame_telemetry_request(), note)  # 组帧并下发
+        sent = self.send(frame_telemetry_request(), note)
+        if sent:
+            self.last_req_ts = time.time()
+        return sent
     def _poll_loop(self):  # 轮询线程主体：补发遥测请求并收帧分发
         """链路层兜底轮询：只在"最近没有模式层按节拍请求过"时才补发 0x0C。
 
@@ -302,9 +320,7 @@ class Stm32Link:  # 下位机串口链路：负责开关串口、下发帧、轮
                 #   （GrandRDK/src/to32 那份仍保持暂停）
                 # [2026-10-04 IDLE] 待命期 poll_suspended=True：不补发 0x0C，下位机保持安静。
                 if not self.poll_suspended and (time.time() - self.last_req_ts) >= period:  # 未暂停且已过周期
-                    self.ser.write(frame_telemetry_request())  # 补发一帧 0x0C 兜底
-                    self.stats["tx_frames"] += 1  # 统计下行帧数
-                    self.last_req_ts = time.time()  # 刷新时间戳，防止模式层与本循环重复请求
+                    self.send_telemetry_request("0x0C 遥测请求(兜底)")
                 chunk = self.ser.read(512)  # 读最多 512B（timeout=0.05 会阻塞到超时）
                 if chunk:  # 读到数据才解析
                     for func, data in self.parser.feed(chunk):  # 交给状态机切帧

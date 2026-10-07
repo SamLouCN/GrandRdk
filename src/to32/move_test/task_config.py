@@ -100,7 +100,7 @@ except ImportError:
     HIT_BALL_TABLE = []
 
 try:
-    from task import t_pass_gate
+    from task.task_pass_door import t_pass_gate
     PASS_GATE_TABLE = t_pass_gate.PASS_GATE_TABLE
 except ImportError:
     PASS_GATE_TABLE = []

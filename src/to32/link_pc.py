@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""上位机链路：UDP 8080 收指令 / UDP 8081 收 PING + 发 $TEL
+"""上位机链路：UDP 8080 收文本控制/二进制 PID；8081 收 PING + 发 $TEL。
 
 只做"收字节、解析归类、入队"；业务派发交给主循环与 ModeManager。
 """
@@ -21,8 +21,9 @@ class PcLink(threading.Thread):
         self.pc_addr = None          # 从下行帧源地址学习（上位机从不自报 IP）
         self.first_cmd_logged = False  # 首个下行帧只打一次源地址（对端身份可追溯，U2）
         self.last_cmd_ts = 0.0
-        self.stats = {"cmd": 0, "pid": 0, "vid": 0, "ping": 0, "unknown": 0}
-        self._stop = threading.Event()
+        self.stats = {"cmd": 0, "pid": 0, "pid_binary": 0, "pid_invalid": 0,
+                      "vid": 0, "ping": 0, "unknown": 0}
+        self._stop_event = threading.Event()
         self._sock_cmd = None
         self._sock_tel = None
 
@@ -36,7 +37,7 @@ class PcLink(threading.Thread):
         self._sock_tel.bind((self.cfg.PC_BIND_IP, self.cfg.TELEM_PORT))
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         for s in (self._sock_cmd, self._sock_tel):
             try:
                 if s is not None:
@@ -52,7 +53,7 @@ class PcLink(threading.Thread):
             return
         self.log("[PC] 监听 UDP :%d（指令） / :%d（PING→PONG + $TEL 上行）"
                  % (self.cfg.CMD_PORT, self.cfg.TELEM_PORT))
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 r, _, _ = select.select([self._sock_cmd, self._sock_tel], [], [], 0.2)
             except (OSError, ValueError):
@@ -62,7 +63,6 @@ class PcLink(threading.Thread):
                     data, addr = s.recvfrom(2048)
                 except OSError:
                     continue
-                text = data.decode("utf-8", errors="replace")
                 if s is self._sock_cmd:
                     self.pc_addr = addr
                     self.last_cmd_ts = time.time()
@@ -70,8 +70,8 @@ class PcLink(threading.Thread):
                         self.first_cmd_logged = True
                         self.log("[PC] 首个下行帧来自 %s:%d（对端身份已记录）"
                                  % (addr[0], addr[1]))
-                    self._dispatch(text)
-                elif P.is_ping(text):
+                    self._dispatch(data, addr)
+                elif P.is_ping(data.decode("utf-8", errors="replace")):
                     self.stats["ping"] += 1
                     try:
                         self._sock_tel.sendto(b"PONG", addr)   # 必须回 PING 的源端口
@@ -79,7 +79,28 @@ class PcLink(threading.Thread):
                         pass
 
     # ---------- 解析归类 ----------
-    def _dispatch(self, text):
+    def _dispatch(self, data, addr=None):
+        # PID 必须在 UTF-8 解码前识别。每个数据报只允许一条完整11B PID。
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            data = bytes(data)
+            if data[:1] == bytes((P.HEAD,)):
+                if P.parse_binary_pid(data) is None:
+                    self.stats["pid_invalid"] += 1
+                    self.log("[PC] 拒绝二进制PID：长度/功能码/编号/帧尾不合法 %s"
+                             % data[:32].hex(" ").upper())
+                    return
+                self.stats["pid"] += 1
+                self.stats["pid_binary"] += 1
+                self.q.put(("pid_binary", data))
+                return
+            text = data.decode("utf-8", errors="replace")
+        else:
+            text = data  # 保留旧代码/本地自测直接传文本的入口。
+        task = P.parse_task_pid(text)
+        if task is not None:
+            task['reply_ip'] = addr[0] if addr else (self.pc_addr[0] if self.pc_addr else None)
+            self.q.put(('task_pid', task))
+            return
         cmd = P.parse_cmd(text)
         if cmd is not None:
             self.stats["cmd"] += 1
@@ -112,3 +133,12 @@ class PcLink(threading.Thread):
 
     def pc_ip(self):
         return self.pc_addr[0] if self.pc_addr else "-"
+
+    def send_task_pid_ack(self, text, ip):
+        if not ip or self._sock_tel is None:
+            return False
+        try:
+            self._sock_tel.sendto(text.encode('ascii'), (ip, self.cfg.TELEM_PORT))
+            return True
+        except OSError:
+            return False

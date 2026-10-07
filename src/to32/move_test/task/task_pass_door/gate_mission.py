@@ -49,6 +49,7 @@ class GateMission(object):
         self._blind_t0 = None         # 盲跑起始时刻
         self._wait_warned = False     # 等门超时只告警一次
         self._t_prev = None           # 上一拍时刻(算 dt)
+        self._last_sway = 0.0          # 初次进ALIGN后即丢帧，也能保持零横移。
 
     # ------------------------------------------------------------ 内部
     def _log(self, msg):

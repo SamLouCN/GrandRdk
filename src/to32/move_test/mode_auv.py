@@ -57,7 +57,7 @@ class AuvMode(ModeBase):
         self.state = "idle"
         # 每次进入都重建状态机：保证每次切进 AUV 都从头跑
         self.mission = Mission(TC, vision=obs.VisionIF(log=self.log),
-                               depth=obs.DepthIF(log=self.log), log=self.log)
+                               depth=obs.DepthIF(log=self.log), log=self.log, task_pids=self.ctx.task_pids)
         n = len(getattr(TC, 'STAGE_TABLE', []) or [])
         if n == 0:
             self.log("[AUV] 阶段表为空（v2.5 骨架）—— 状态机开机即 DONE，不会下发运动指令")
@@ -86,6 +86,8 @@ class AuvMode(ModeBase):
             return
         cmd = self.mission.step(now, dt, self.last_tel)
         if not cmd:                       # None = 任务已结束，不再下发
+            return
+        if cmd.get('paused'):
             return
         self.state = "run" if cmd["stage"] not in ("DONE", "ABORT") else "idle"
         yaw = apply_yaw_mirror(cmd["yaw"], self.yaw_mirror)

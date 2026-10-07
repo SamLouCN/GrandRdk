@@ -73,10 +73,15 @@ DEPTH_MAX_CM = 200.0       # 固件钳位上限（2.00 m）；frame_motion 读�
 # ==================== $PID（上位机 PID 调试面板） ====================      # 注释: 分组标题
 # 2026-09-15 决策 D：**暂不打通**。上位机 UI 是 12 通道（文案"每台推进器一路 PID 速度环"），  # 注释: 暂不接通 PID
 # 而固件 0x01 只认 ch 0~3 = Pitch/Yaw/Roll/Depth → 语义不对齐，先保持"丢弃 + 计数"。  # 注释: 语义不对齐
-# 将来打通：PID_PASSTHRU 置 True，并实现 mode_rov.on_pid（frame_set_pid 已就绪）。  # 注释: 将来打通方法
-PID_PASSTHRU = False                                                     # 注释: 是否下发 PID 帧
+# 旧文本PID保持原来的丢弃行为；新PC二进制PID走Dispatcher独立中继，见下方。
+PID_PASSTHRU = False                                                     # 旧文本开关，未实现转发
 PID_MAX_CH = 3             # 固件 0x01 接受的通道上限（超出整帧丢弃）     # 注释: 通道上限
 PID_VALUE_LIMIT = 327.67   # int16×100 的表示上限；超范围由 frame_set_pid 钳位  # 注释: 数值钳位
+
+# v3.7：11B CD 0A 01 CH KP KI KD DC，经校验后原字节转发，不重新量化。
+PID_BINARY_PASSTHRU = True
+PID_BINARY_MAX_CH = 3      # 默认姿态/深度；参考补偿环4~7需核实固件后显式启用。
+TASK_PID_ENABLED = True    # S100命名任务参数；当前仅gate，绝不转发STM32。
 
 # ==================== 空闲静默策略（2026-09-15 需求） ====================  # 注释: 分组标题
 # 需求：摇杆在中间（未动）时，中位机不要给下位机发送任何信号。            # 注释: 需求说明

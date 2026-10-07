@@ -24,6 +24,17 @@ if os.path.isabs(QC.YOLO_MODEL):  # 判断模型名是绝对路径还是仅文�
 else:  # 只有文件名的情况
     YOLO_MODEL = os.path.join(PATH_MODELS, QC.YOLO_MODEL)  # 拼到 models/ 下形成完整路径
 
+# [2026-10-07 双模型] 前视 door_3 / 下视 bottom 各自独立模型路径(解析规则同 YOLO_MODEL)
+if os.path.isabs(QC.YOLO_MODEL_FRONT):
+    YOLO_MODEL_FRONT = QC.YOLO_MODEL_FRONT
+else:
+    YOLO_MODEL_FRONT = os.path.join(PATH_MODELS, QC.YOLO_MODEL_FRONT)
+
+if os.path.isabs(QC.YOLO_MODEL_BOTTOM):
+    YOLO_MODEL_BOTTOM = QC.YOLO_MODEL_BOTTOM
+else:
+    YOLO_MODEL_BOTTOM = os.path.join(PATH_MODELS, QC.YOLO_MODEL_BOTTOM)
+
 JPU_LIB = os.path.join(PATH_LIBS, 'libmjpg_hw.so')  # JPU 硬件解码库绝对路径，MJPG 解码依赖它
 
 # ======================                                                          # 注释: 分组标题 - 共享内存
@@ -141,16 +152,16 @@ DEFAULT_CONFIG = {  # 合成后的全局配置字典，供各业务进程直接�
         'clahe_tile': (8, 8),  # CLAHE 分块网格，块越小局部增强越强
     },
 
-    'FRONT_YOLO': {  # 前视推理参数段
+    'FRONT_YOLO': {  # 前视推理参数段（door_3 模型, 只识别 door）
         'backend': 'hbm',  # BPU 推理后端，hbm 表示走 hbm_runtime
         'preprocess_mode': 'auto',  # 预处理模式，auto 按模型输入自动选择
-        'model_path': YOLO_MODEL,  # .hbm 模型文件路径
+        'model_path': YOLO_MODEL_FRONT,  # 前视专用 .hbm 模型(door_3_640x640.hbm)
         'score_thres': QC.SCORE_THRES,  # 置信度阈值，低于此值的检测框被丢弃
         'nms_thres':   QC.NMS_THRES,  # NMS 的 IoU 阈值，越大保留的框越多
         'strides': [8, 16, 32],  # YOLO 三个输出尺度，需与模型结构一致
         'priority': 0,  # 进程优先级，0 为默认
         'bpu_cores': QC.FRONT_BPU_CORES,  # 允许使用的 BPU 核列表，限定前视可用算力
-        'class_names': QC.CLASS_NAMES,  # 模型类别名列表，顺序必须与训练一致
+        'class_names': QC.FRONT_CLASS_NAMES,  # door_3 模型类别名列表，顺序必须与训练一致
         'label_file': None,  # 可选的 labels.txt 覆盖类别名(预留)
         'target_class_names': QC.FRONT_TARGETS,  # 前视真正要筛出的类别名
         'target_class_ids': [],  # 目标类别 id，留空由 function.py 运行时换算
@@ -182,16 +193,16 @@ DEFAULT_CONFIG = {  # 合成后的全局配置字典，供各业务进程直接�
         'clahe_tile': (8, 8),  # CLAHE 分块网格
     },
 
-    'BOTTOM_YOLO': {  # 下视推理参数段
+    'BOTTOM_YOLO': {  # 下视推理参数段（bottom 模型: ring/red-ball/yellow-ball, 只筛 red-ball）
         'backend': 'hbm',  # BPU 推理后端
         'preprocess_mode': 'auto',  # 预处理模式
-        'model_path': YOLO_MODEL,  # 模型文件路径，两路共用同一个模型
+        'model_path': YOLO_MODEL_BOTTOM,  # 下视专用模型 bottom.hbm
         'score_thres': QC.SCORE_THRES,  # 置信度阈值
         'nms_thres':   QC.NMS_THRES,  # NMS 的 IoU 阈值
         'strides': [8, 16, 32],  # 输出三个尺度
         'priority': 0,  # 进程优先级
         'bpu_cores': QC.BOTTOM_BPU_CORES,  # 允许使用的 BPU 核列表
-        'class_names': QC.CLASS_NAMES,  # 模型类别名列表
+        'class_names': QC.BOTTOM_CLASS_NAMES,  # bottom 模型类别名列表(顺序=输出 id)
         'label_file': None,  # 可选 labels.txt 覆盖类别名
         'target_class_names': QC.BOTTOM_TARGETS,  # 下视真正要筛出的类别名
         'target_class_ids': [],  # 目标类别 id，留空运行时算

@@ -8,8 +8,10 @@
 惯例: 与设备/相机相关的真值不在 quick_config 写死; 通过 camera_ports.py 按 USB 物理口解析。  # 注释: 配置按惯例说明
 """                                                                          # 注释: 文档字符串结束
 
-# YOLO模型(单一 BPU 模型文件)                                                # 注释: 分组标题
-YOLO_MODEL      = 'test_nashe_640x640_nv12.hbm'  # 模型文件名, 实际路径在 main_config.PATH_MODELS 下拼出  # 注释: 注释内容
+# YOLO模型(2026-10-07 双模型: 前视/下视各用独立 .hbm, 各带独立类别集)
+YOLO_MODEL_FRONT  = 'door_3_640x640.hbm'  # 前视模型: door_3, 只识别 door
+YOLO_MODEL_BOTTOM = 'bottom.hbm'          # 下视模型: 识别 ring/red-ball/yellow-ball
+YOLO_MODEL        = 'test_nashe_640x640_nv12.hbm'  # 旧单模型, 两路不再引用(兼容/回退参考)
 
 # === 相机(按 USB 物理口绑定, 见 camera_ports.py) ===                          # 注释: 分组标题
 # 2026-09-23: 改为按 USB 物理口固定(见 camera_ports.py), 设备节点号不再写死。  # 注释: 改动日期与原因
@@ -25,13 +27,14 @@ BOTTOM_DEVICE   = device_for('cam2')  # 下视节点 = 按 USB 物理口 1-2 实
 FRONT_FPS       = 250  # 前视相机请求帧率(实测低于此值, 受 USB 带宽与解码限制)  # 注释: 帧率上限
 BOTTOM_FPS      = 250  # 下视相机请求帧率(同上)  # 注释: 帧率上限
 
-# === 识别目标(模型类别顺序在 CLASS_NAMES, 这里只列出"实际想筛出谁") ===         # 注释: 分组标题
-# [AUV-MISSION 2026-09-26 改动 ①] 前视加球类别: 撞球阶段要靠前视找球（原来只筛 door，前视看不见球）
-# 🔴 新模型的球类别名出来后必须同步改这里（现按沿用 'red-ball' 占位）：
-#    若新模型里叫 'ball'/'sphere' 等，这里写那个名字，并同步 vision_if.CANON 表。
-FRONT_TARGETS   = ['door', 'red-ball']  # 前视目标类别: door(过门) + red-ball(撞球)  # 注释: 前视目标说明
-BOTTOM_TARGETS  = ['red-ball']  # 下视要的目标类别: red-ball(下视主要光流 + 红球定位)  # 注释: 下视目标说明
-CLASS_NAMES     = ['door', 'red-ball', 'yellow-ball']  # 模型类别顺序(索引=输出 id), 换模型必须同步改  # 注释: 模型输出索引对齐
+# === 识别目标(模型类别顺序在各路 CLASS_NAMES, 这里只列出"实际想筛出谁") ===         # 注释: 分组标题
+# [2026-10-07 双模型拆分] 前视 door_3 只识别 door, 撞球不再走前视(撞球用下视 red-ball);
+#   下视 bottom 可识别 ring/red-ball/yellow-ball, 当前只筛 red-ball。
+FRONT_TARGETS   = ['door']                 # 前视目标类别: 只 door(过门)
+BOTTOM_TARGETS  = ['red-ball']             # 下视目标类别: 只 red-ball(撞球/捡球定位)
+FRONT_CLASS_NAMES  = ['door']              # door_3 模型类别(索引0=door)
+BOTTOM_CLASS_NAMES = ['ring', 'red-ball', 'yellow-ball']  # bottom 模型类别(索引0=ring,1=red-ball,2=yellow-ball)
+CLASS_NAMES     = ['door', 'red-ball', 'yellow-ball']     # 旧单模型类别(兼容/回退参考)
 
 # === 检测阈值 ===                                                              # 注释: 分组标题
 SCORE_THRES     = 0.6  # 置信度阈值: 低于此分数的检测结果直接丢弃(过滤噪声)  # 注释: 阈值作用

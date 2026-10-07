@@ -13,6 +13,7 @@
   - 纯计算模块, 不碰文件与串口, 仿真与实机共用同一份代码。
 """
 import math
+import threading
 
 
 def wrap180(a):
@@ -32,13 +33,31 @@ class GatePid(object):
         self.ki = float(ki)
         self.i_max = float(i_max)
         self.psi_max = float(psi_max)   # 0 = 不限幅
+        self._lock = threading.RLock()
         self.reset()
+
+    def set_gains(self, p, i, d):
+        values = tuple(float(v) for v in (p, i, d))
+        if not all(math.isfinite(v) and -327.68 <= v <= 327.67 for v in values):
+            raise ValueError('INVALID_GAINS')
+        with self._lock:
+            self.kp_yaw, self.ki, self.kd_yaw = values
+            self._integ = 0.0
+
+    def gains(self):
+        with self._lock:
+            return self.kp_yaw, self.ki, self.kd_yaw
 
     def reset(self):
         """清积分。换阶段/重进对准时调用。"""
-        self._integ = 0.0
+        with self._lock:
+            self._integ = 0.0
 
     def step(self, e, omega, dt):
+        with self._lock:
+            return self._step(e, omega, dt)
+
+    def _step(self, e, omega, dt):
         """e: 滤波后横向误差; omega: 陀螺仪 z 轴角速度(°/s); dt: 拍间隔 s。
 
         返回 (dpsi, sway)。dt<=0 时本拍不推进积分。

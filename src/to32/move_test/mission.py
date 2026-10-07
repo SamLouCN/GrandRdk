@@ -25,12 +25,13 @@ import task_config as TC
 class Ctx(object):
     """传给每个阶段的上下文：配置 + 观测接口 + 遥测 + 日志"""
 
-    def __init__(self, cfg, vision, depth, log=None):
+    def __init__(self, cfg, vision, depth, log=None, task_pids=None):
         self.cfg = cfg          # task_config
         self.vision = vision    # obs.VisionIF
         self.depth = depth      # obs.DepthIF
         self.log = log          # 日志函数，可为 None
         self.tel = None         # 最近一帧下位机遥测（每拍由 Mission 注入）
+        self.task_pids = task_pids
 
     def say(self, msg):
         if self.log:
@@ -80,9 +81,9 @@ class Mission(object):
       3. mode_auv.on_enter 会重建 Mission，每次切进 AUV 都从头跑
     """
 
-    def __init__(self, cfg=None, vision=None, depth=None, log=None):
+    def __init__(self, cfg=None, vision=None, depth=None, log=None, task_pids=None):
         self.cfg = cfg or TC
-        self.ctx = Ctx(self.cfg, vision, depth, log=log)
+        self.ctx = Ctx(self.cfg, vision, depth, log=log, task_pids=task_pids)
         self.table = list(getattr(self.cfg, 'STAGE_TABLE', []) or [])
         self.idx = -1                  # -1 = 尚未开始
         self.current = None            # 当前 Stage 实例

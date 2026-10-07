@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
-"""t_pass_gate.py —— 穿门任务脚本（空骨架，待实现）
-
-定位：穿门任务（通过门洞 / 过门）。
-    ⚠ 空内容占位：本文件只导出空表 PASS_GATE_TABLE = []（空表 = 开机即 DONE 安全停推），
-    实现时按 t_task1.py / t_search_ball.py 同构补充 Stage 类并替换表内容。
-"""
+"""穿门阶段：复用GateMission和S100可调GatePid，等待有效遥测后计算。"""
+import math
 import os
 import sys
 
@@ -15,5 +11,66 @@ for _p in (_HERE, _PARENT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# 空骨架：实现后替换为 [PassGateAll]（整体为一个阶段，参照 t_task1.py 同构写法）
-PASS_GATE_TABLE = []
+from mission import Stage
+from task_pid_controller import TaskPidController
+from gate_filter import EFilter
+import gate_config as GC
+from gate_mission import ST_DONE
+
+
+class _VisionAdapter:
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def poll(self, now):
+        obs = self.ctx.vision.poll('front', 'gate', now)
+        if not obs:
+            return None
+        width = float(getattr(self.ctx.vision, 'w', GC.GATE_IMG_W))
+        error = float(obs['ex']) * GC.GATE_E_SIGN
+        if width <= 0 or not math.isfinite(error):
+            return None
+        return dict(e_raw=error, w_ratio=float(obs['w']) / width,
+                    score=obs.get('score', 0), frame=obs.get('frame'))
+
+
+class PassGateAll(Stage):
+    """把已有GateMission接到阶段框架，共用S100正在被调参的GatePid。"""
+    NAME = 'PassGate'
+
+    def enter(self, now):
+        self.controller = self.ctx.task_pids or TaskPidController()
+        self.gate = None
+        self.command = None
+        self.hold_depth = None
+
+    def _tel(self):
+        tel = self.ctx.tel or {}
+        return {'yaw': tel.get('actual_yaw'), 'omega': tel.get('gyro_yaw', 0.0)}
+
+    def _send(self, yaw, surge, sway):
+        self.command = dict(stage=self.NAME, note=self.gate.state, yaw=yaw,
+                            depth=self.hold_depth, surge=surge, sway=sway, stop=0)
+
+    def step(self, now, dt):
+        tel = self.ctx.tel or {}
+        try:
+            yaw = float(tel['actual_yaw'])
+            depth = float(tel['actual_depth_cm'])
+            if not all(math.isfinite(v) for v in (yaw, depth)):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            return dict(stage=self.NAME, note='等待有效遥测', paused=True)
+        if self.gate is None:
+            self.hold_depth = max(0.0, min(200.0, depth))
+            filt = EFilter(GC.GATE_EF_TYPE, GC.GATE_VISKF_PATH, GC.GATE_STALE_S, GC.GATE_EF_ALPHA)
+            self.gate = self.controller.create_gate_mission(_VisionAdapter(self.ctx), filt,
+                                                           self._tel, self._send, self.ctx.log)
+        self.gate.tick(now)
+        if self.gate.state == ST_DONE:
+            return None
+        return self.command
+
+
+# 仅提供可选任务表，不修改正式/测试任务的默认排序。
+PASS_GATE_TABLE = [PassGateAll]

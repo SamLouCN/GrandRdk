@@ -2,7 +2,7 @@
 """中位机编排核心 —— 模式注册/切换 + 安全 + 周期调度 + 遥测上行。
 
 三机分层（命名见《上位机通讯协议.md》）:
-    上位机(PC UI)  ──UDP 8080/8081──▶  link_pc.py      只收发文本帧(自带 PING->PONG / $TEL 出口)
+    上位机(PC UI)  ──UDP 8080/8081──▶  link_pc.py      文本控制/二进制PID(自带 PING->PONG / $TEL 出口)
     模式逻辑       ──mode_rov / mode_auv──▶  各模式的运行逻辑写在这里
     下位机(STM32)  ──V2 串口帧──────▶  link_stm32.py   只收发 V2 帧
     本文件         把三者接起来: 事件派发 / $CMD.mode 切模式 / 安全三件套 / tick / $TEL
@@ -24,6 +24,9 @@ import threading  # 后台线程与停止事件
 import time  # 时间戳、节拍与睡眠
 
 import link_stm32 as S  # 下位机 V2 帧收发，S 作帧构造命名空间
+import protocol as P  # 新上位机二进制PID校验；只中继0x01，不放行其他二进制功能码。
+from collections import OrderedDict
+from task_pid_controller import TaskPidController
 import tel_builder as TB  # $TEL 统一映射组帧（回落用）
 from mode_base import ModeBase  # 模式基类（AUV 占位壳继承它）
 from mode_idle import IdleMode  # [2026-10-04] IDLE 待命模式（上电默认，等上位机 $CMD.mode）
@@ -77,6 +80,8 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
         self.video = video          # 图像回传服务（可选；None = 本进程不做图像）
         self.rx_queue = rx_queue if rx_queue is not None else queue.Queue()  # 外部没传队列就自建一个
         self._log_fn = log  # 日志输出函数（通常由 main 注入）
+        self.task_pids = TaskPidController()
+        self._task_pid_cache = OrderedDict()
 
         self.modes = {}  # 模式表：模式 id -> 模式实例
         self._register_modes()  # 注册全部可用模式
@@ -97,6 +102,9 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
 
         self.stats = {  # 运行统计计数器
             "cmd": 0, "pid": 0, "vid": 0, "unknown": 0, "bad_mode": 0,  # 上位机各类帧与非法模式计数
+            "pid_binary": 0, "pid_forwarded": 0, "pid_rejected": 0,
+            "pid_failed": 0, "pid_simulated": 0,
+            "task_pid_updated": 0, "task_pid_rejected": 0,
             "tel": 0, "tel_tx": 0, "switch": 0,  # 遥测接收/上行与模式切换次数
             "tx_total": 0, "tx_mode": 0, "tx_motion": 0, "tx_poll": 0, "tx_other": 0,  # 下行帧按功能码分类计数
         }
@@ -134,8 +142,10 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
         self._orig_send = self.link_stm32.send  # 先保存原始发送函数
 
         def _send(frame, note=""):  # 替代原 send 的包装函数
-            self._count_tx(frame)  # 先统计功能码再转发
-            return self._orig_send(frame, note)  # 调用原始发送
+            sent = self._orig_send(frame, note)
+            if sent:
+                self._count_tx(frame)
+            return sent
 
         self.link_stm32.send = _send  # 用包装函数接管实例属性
         self.link_stm32._rdk_counted = True  # 打标记，避免二次包装
@@ -324,6 +334,12 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
         elif kind == "pid":  # $PID 调参帧
             self.stats["pid"] += 1  # PID 帧计数
             self.mode().on_pid(payload)  # 交给当前模式处理
+        elif kind == "pid_binary":
+            self.stats["pid"] += 1
+            self.stats["pid_binary"] += 1
+            self._on_pid_binary(payload)
+        elif kind == 'task_pid':
+            self._on_task_pid(payload)
         elif kind == "vid":  # $VID 图像开关帧
             self.stats["vid"] += 1  # 图像帧计数
             on = bool(payload)  # 统一成布尔开关量
@@ -338,6 +354,57 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             self._on_raw(payload)  # 兜底解析 $ESTOP 之类
         else:  # 未知事件类型
             self.stats["unknown"] += 1  # 未识别计数
+
+    def _on_task_pid(self, payload):
+        request, loop = payload['request'], payload['loop']
+        signature = (loop, payload['p'], payload['i'], payload['d'])
+        identity = (payload.get('reply_ip'), request)
+        cached = self._task_pid_cache.get(identity)
+        if cached is not None:
+            old_signature, ack = cached
+            if signature != old_signature:
+                ack = P.build_task_pid_ack(request, loop, error='REQUEST_CONFLICT')
+        else:
+            try:
+                if not bool(getattr(self.cfg, 'TASK_PID_ENABLED', True)):
+                    raise ValueError('DISABLED')
+                gains = self.task_pids.update(loop, *signature[1:])
+                ack = P.build_task_pid_ack(request, loop, gains=gains)
+                self.stats['task_pid_updated'] += 1
+                self.log('[TASKPID] S100 %s 参数已更新 P=%.2f I=%.2f D=%.2f；未启动任务' % (loop, *gains))
+            except ValueError as e:
+                code = str(e) if str(e) in ('UNSUPPORTED', 'DISABLED', 'INVALID_GAINS') else 'INVALID_GAINS'
+                ack = P.build_task_pid_ack(request, loop, error=code)
+                self.stats['task_pid_rejected'] += 1
+            self._task_pid_cache[identity] = (signature, ack)
+            if len(self._task_pid_cache) > 128:
+                self._task_pid_cache.popitem(last=False)
+        self.pc_link.send_task_pid_ack(ack, payload.get('reply_ip'))
+
+    def _on_pid_binary(self, frame):
+        """参数帧独立中继：不切模式、不解除急停、不产生运动或保存指令。"""
+        pid = P.parse_binary_pid(frame)
+        if pid is None:
+            self.stats["pid_rejected"] += 1
+            self.log("[PID] 拒绝：二进制帧不合法")
+            return
+        max_ch = min(S.PID_REFERENCE_MAX_INDEX, int(getattr(self.cfg, "PID_BINARY_MAX_CH", 3)))
+        if not bool(getattr(self.cfg, "PID_BINARY_PASSTHRU", True)) or pid["ch"] > max_ch:
+            self.stats["pid_rejected"] += 1
+            self.log("[PID] 拒绝 ch=%d：中继关闭或超过配置通道上限%d" % (pid["ch"], max_ch))
+            return
+        # 保留原始11字节，尤其是-327.68边界；禁止解码为float后再次量化。
+        if not self.link_stm32.send(bytes(frame), "0x01 PID ch=%d" % pid["ch"]):
+            self.stats["pid_failed"] += 1
+            self.log("[PID] 未写入 ch=%d：下位机链路禁用或写入失败" % pid["ch"])
+            return
+        if getattr(self.link_stm32, "sim", False):
+            self.stats["pid_simulated"] += 1
+            self.log("[PID] 空跑 ch=%d：已校验，未写入真实串口" % pid["ch"])
+        else:
+            self.stats["pid_forwarded"] += 1
+            self.log("[PID] 已写入STM32串口 ch=%d P=%.2f I=%.2f D=%.2f（未回读）"
+                     % (pid["ch"], pid["p"], pid["i"], pid["d"]))
 
     def _on_cmd(self, cmd):  # 处理上位机 $CMD
         self.stats["cmd"] += 1  # 指令帧计数
@@ -508,8 +575,10 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             m.name, "已锚定" if self.anchored else "未锚定",  # 模式名与锚定标记
             "锁存" if self.estop_latch else "正常",  # 急停状态文字
             (" (%s)" % self.estop_reason) if self.estop_latch else ""))  # 锁存时附上原因
-        self.log("  上位机 %s | $CMD %d / $PID %d / $VID %d / 未识别 %d | 模式切换 %d" % (  # 上位机各类帧统计
+        self.log("  上位机 %s | $CMD %d / PID %d / $VID %d / 未识别 %d | 模式切换 %d" % (  # 上位机各类帧统计
             self.pc_link.pc_ip(), s["cmd"], s["pid"], s["vid"], s["unknown"], s["switch"]))  # 上位机 IP 与计数
+        self.log("  二进制PID %d / 写入 %d / 拒绝 %d / 失败 %d / 空跑 %d" % (
+            s["pid_binary"], s["pid_forwarded"], s["pid_rejected"], s["pid_failed"], s["pid_simulated"]))
         self.log("  下位机 TX %d 帧 [0x04 %d / 0x09 %d / 0x0C %d / 其他 %d] | 遥测 %d 帧 | $TEL 上行 %d 帧" % (  # 下行与遥测统计
             s["tx_total"], s["tx_mode"], s["tx_motion"], s["tx_poll"], s["tx_other"],  # 下行帧各功能码计数
             s["tel"], s["tel_tx"]))  # 遥测接收与上行计数
@@ -554,8 +623,7 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             th = threading.Thread(target=target, daemon=True)  # 守护线程，随主进程退出
             th.start()  # 启动线程
             self._threads.append(th)  # 记录以便 stop 时 join
-        # 注意: 不在这里调 pc_link.is_alive() —— link_pc.PcLink 的 self._stop 覆盖了
-        # Thread._stop，调用会在后期抛 TypeError。端口占用改由 main.preflight_ports() 启动前探测。
+        # 端口占用由main.preflight_ports()启动前探测。
         time.sleep(0.1)  # 给后台线程一点启动时间
 
     def stop(self):  # 停止全部链路与线程
