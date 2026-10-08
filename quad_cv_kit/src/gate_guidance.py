@@ -10,21 +10,50 @@ from .detect_red_gate import project_gate_geometry
 AXES = 'camera: X right, Y down, Z forward; right-hand rotations Rz*Ry*Rx'
 
 
-def enhance_cv_contrast(frame, gain=1.12, valid_mask=None):
-    """Mild HSV-value contrast; preserve hue/saturation, input pixels and black margins."""
+def enhance_cv_contrast(frame, gain=1.2, valid_mask=None, clahe_clip=2.0, clahe_blend=.6,
+                        sharpen_amount=.6, saturation_gain=1.25):
+    """CLAHE, global contrast, value-channel unsharp mask and HSV saturation.
+
+    CLAHE limits local noise amplification. Invalid correction borders are filled
+    with the valid median for histogram calculation, then restored unchanged.
+    Sharpen only luminance (sigma=1.2px, 3-level noise threshold), preserving hue.
+    Set sharpen_amount=0 and saturation_gain=1 for the previous contrast stages.
+    """
     if not math.isfinite(gain) or not 1 <= gain <= 1.5:
         raise ValueError('CV contrast gain must be finite and in [1, 1.5]')
-    if gain == 1:
+    if (not math.isfinite(clahe_clip) or not 0 <= clahe_clip <= 8
+            or not math.isfinite(clahe_blend) or not 0 <= clahe_blend <= 1):
+        raise ValueError('CLAHE clip must be in [0, 8], blend in [0, 1]')
+    if (not math.isfinite(sharpen_amount) or not 0 <= sharpen_amount <= 2
+            or not math.isfinite(saturation_gain) or not 1 <= saturation_gain <= 2):
+        raise ValueError('Sharpen amount must be in [0, 2], saturation gain in [1, 2]')
+    if (gain == 1 and (clahe_clip == 0 or clahe_blend == 0)
+            and sharpen_amount == 0 and saturation_gain == 1):
         return frame.copy()
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     active = hsv[:, :, 2] > 0
     if valid_mask is not None:
-        active &= valid_mask
+        active &= np.asarray(valid_mask, bool)
     if not active.any():
         return frame.copy()
     value = hsv[:, :, 2].astype(float)
     pivot = float(np.median(value[active]))
-    hsv[:, :, 2] = np.rint(np.clip((value-pivot)*gain+pivot, 0, 255)).astype(np.uint8)
+    if clahe_clip > 0 and clahe_blend > 0:
+        histogram_input = hsv[:, :, 2].copy()
+        histogram_input[~active] = round(pivot)
+        local = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8)).apply(histogram_input)
+        value = (1-clahe_blend)*value + clahe_blend*local
+        pivot = float(np.median(value[active]))
+    value = np.clip((value-pivot)*gain+pivot, 0, 255)
+    if sharpen_amount > 0:
+        # Replace invalid borders during blur to avoid bright halos against black.
+        blur_input = value.astype(np.float32)
+        blur_input[~active] = float(np.median(value[active]))
+        detail = value-cv2.GaussianBlur(blur_input, (0, 0), 1.2)
+        detail[np.abs(detail) < 3] = 0
+        value = np.clip(value+sharpen_amount*detail, 0, 255)
+    hsv[:, :, 2] = np.rint(value).astype(np.uint8)
+    hsv[:, :, 1] = np.rint(np.clip(hsv[:, :, 1].astype(float)*saturation_gain, 0, 255)).astype(np.uint8)
     enhanced = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     enhanced[~active] = frame[~active]
     return enhanced
@@ -115,7 +144,7 @@ def _euler_xyz(rotation):
     return np.degrees([x, y, z])
 
 
-def estimate_alignment(corners, camera_matrix, gate_size=(.7, .5)):
+def estimate_alignment(corners, camera_matrix, gate_size=(.7, .5), pixel_scale=1.0):
     """Planar PnP; translate onto the gate-normal axis, then rotate camera by R.
 
     Pixel equivalents are K focal lengths times camera translation / center depth.
@@ -128,7 +157,8 @@ def estimate_alignment(corners, camera_matrix, gate_size=(.7, .5)):
     image_points = np.asarray(corners, float)
     if (image_points.shape != (4, 2) or not np.isfinite(image_points).all()
             or matrix.shape != (3, 3) or not np.isfinite(matrix).all()
-            or min(width, height, matrix[0, 0], matrix[1, 1]) <= 0):
+            or min(width, height, matrix[0, 0], matrix[1, 1]) <= 0
+            or not math.isfinite(pixel_scale) or pixel_scale <= 0):
         return None, 'invalid-pose-input'
     try:
         result = cv2.solvePnPGeneric(object_points, image_points, matrix, np.zeros(5),
@@ -180,16 +210,21 @@ def estimate_alignment(corners, camera_matrix, gate_size=(.7, .5)):
     center = matrix@translation
     center = center[:2]/center[2]
     return dict(rotation_xyz_deg=_euler_xyz(rotation).tolist(),
-                rotation_matrix=rotation.tolist(), gate_center_camera_m=translation.tolist(),
-                gate_normal_camera=normal.tolist(), alignment_translation_camera_m=movement.tolist(),
+                rotation_matrix=rotation.tolist(), gate_center_model_units=translation.tolist(),
+                gate_normal_camera=normal.tolist(), alignment_translation_model_units=movement.tolist(),
                 translation_pixel_equivalent_xyz=pixel_equivalent.tolist(),
+                translation_scaled_xyz=(pixel_equivalent*pixel_scale).tolist(),
+                translation_scale=pixel_scale, translation_unit='scaled pixel equivalent',
+                translation_formula='scale * (fx*dx, fy*dy, mean(fx,fy)*dz) / center_depth',
                 translation_z_unit='virtual pixel equivalent: mean(fx,fy)*dz/center_depth',
                 gate_center_px=center.tolist(), center_offset_xy_px=(center-matrix[:2, 2]).tolist(),
-                normal_distance_m=normal_distance, reprojection_rms_px=error,
-                gate_size_m=list(gate_size), axes=AXES, estimated=True), 'pose-estimated'
+                normal_distance_model_units=normal_distance, reprojection_rms_px=error,
+                gate_size_reference=list(gate_size), axes=AXES, estimated=True,
+                metric_distance_available=False), 'pose-estimated'
 
 
-def build_gate_guidance(status, geometry, camera_matrix, size, valid_mask=None, gate_size=(.7, .5)):
+def build_gate_guidance(status, geometry, camera_matrix, size, valid_mask=None, gate_size=(.7, .5),
+                        pixel_scale=1.0):
     result = dict(mode='no-target', reason='no-current-yolo-target', ui_only=True,
                   coordinate_space='corrected', missing_sides=[], direction_xy=None,
                   completion=None, alignment=None, axes=AXES)
@@ -210,7 +245,7 @@ def build_gate_guidance(status, geometry, camera_matrix, size, valid_mask=None, 
     if completion is None:
         result.update(mode='waiting-geometry', reason=reason)
         return result
-    alignment, reason = estimate_alignment(completion['corners'], camera_matrix, gate_size)
+    alignment, reason = estimate_alignment(completion['corners'], camera_matrix, gate_size, pixel_scale)
     result.update(mode='align' if alignment else 'pose-unavailable', completion=completion,
                   alignment=alignment, reason=reason,
                   geometry_observation=geometry['observation'])
@@ -253,8 +288,8 @@ def draw_gate_guidance(frame, guidance, camera_matrix, point_mapper=None):
         arrow(pose['translation_pixel_equivalent_xyz'][:2], (255, 255, 0))
         text_lines += [f'NORMAL ALIGN | ESTIMATE | {guidance["geometry_observation"]}',
                        'Rotate deg: X {:+.1f}   Y {:+.1f}   Z {:+.1f}'.format(*pose['rotation_xyz_deg']),
-                       'Shift px-equiv: X {:+.1f}   Y {:+.1f}   Z {:+.1f} (virtual)'.format(
-                           *pose['translation_pixel_equivalent_xyz'])]
+                       'Shift px-equiv x{:g}: X {:+.1f}   Y {:+.1f}   Z {:+.1f} (Z virtual)'.format(
+                           pose['translation_scale'], *pose['translation_scaled_xyz'])]
     else:
         text_lines += [mode.upper()+': '+guidance['reason'], 'Rotation / shift: unavailable']
     band_height = 26*len(text_lines)+10

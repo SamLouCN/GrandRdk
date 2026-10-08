@@ -4,7 +4,7 @@
 
 ## YOLO 与改进 CV 联动的最近门视频实验
 
-`src/detect_red_gate.py` 提取红管中心线、连接白色弯头和可见管端，支持只有部分边可见的门框。`demo/demo_video_cv_improved.py` 默认批量处理 `E:/TEST` 中的视频，使用 `model/best.pt` 和 CPU 推理。`src/yolo_red_gate.py` 负责 YOLO 目标选择、搜索区域和短时跟踪的联动。
+`src/detect_red_gate.py` 提取红管中心线，并使用 `src/gate_models.py` 的四线交点模型容忍白色弯头缺口，支持只有部分边可见的门框。`demo/demo_video_cv_improved.py` 默认批量处理 `E:/TEST` 中的视频，使用 `model/best.pt` 和 CPU 推理。`src/yolo_red_gate.py` 负责 YOLO 目标选择、搜索区域和短时跟踪的联动。
 
 ```powershell
 # 在 GrandRdk 项目根目录运行；也可以传入单个视频或其他目录
@@ -24,13 +24,38 @@ CV 在所选搜索区域内按可见管子的像素粗细选择，粗细相近�
 
 ## CV 预处理与 UI 回正提示
 
-改进 demo 默认在 CV 输入上以 HSV 的亮度通道做 1.12 倍温和对比度增强（`--cv-contrast 1` 关闭，允许 1..1.5）。YOLO 输入和输出视频的底图保持原校正图，CV 光流和新检测都使用相同预处理。校正黑边保持不变。预处理参数写入 `camera_used.json`、逐帧记录和汇总。
+从 `D:/Projects/red_gate_improved` v3 选择迁移的部分：LAB 红色通道与多尺度局部色差证据、颜色通道 LSD 候选线、沿杆搜索和短断口连接、独立四线组合、逐边颜色覆盖验证。实现位于 `src/gate_models.py`，不依赖外部目录。新完整框不要求白角先被分割出来：两横两竖四条实测红杆求交，每条边剔除不超过 10% 的端部检查区，分八段检查颜色覆盖，限制红杆向交点的延伸。端部延伸上限为检测画布中的 `max(22px, 2.2*杆宽)`，并检查相对方向、管径、凸性、面积、搜索区域和校正有效像素。没有第四根杆时不生成完整框；残缺前景门继续使用已有端点链逻辑和管径选择。
+
+增强帧用于提线和光流；干净校正帧用于颜色证据和白角判断。增强出的红色只允许补充原色掩膜附近的支持，减少饱和度增强造成的误检。弱 LAB 证据只用于四边联合验证；残缺门再用原有严格红色掩膜裁短杆线，防止偏色白支撑腿被延长成红杆。裁短后仍要求长度至少为检测画布中的 35px、长宽比至少为 5，避免白腿上的短红斑加入近门并导致整组候选被拒绝；残缺门原有的显著红色检查使用增强帧，白角分割单独使用干净帧。已验证的完整四线模型跳过旧端点连通筛选；跟踪时重新验证当前帧各边，失去支持则降级。`nearest_gate.model/side_support` 分别记录模型来源和本帧逐边颜色支持，`observed_segments` 保留测得的红杆范围，白角补线仍单独绘制。四线联合验证可以减少跨门混边，仍不能保证高度重叠门的实例归属。
+
+运行迁移版并对照此前锐化、饱和度版本：
+
+```powershell
+python demo/demo_video_cv_improved.py E:/TEST --out runs/cv_gate_models --device cpu --export-cv-input
+python demo/validate_cv_retest.py --input runs/cv_gate_models --out runs/cv_gate_models/comparison --baseline runs/cv_sharp_saturation
+# 同一源帧和保存的 YOLO 框诊断；不重新推理 YOLO
+python demo/diagnose_gate_models.py runs/cv_gate_models/DOOR_TEST_3 399 --out runs/gate_diagnostic
+```
+
+三段视频共5145帧的迁移对比已完成：新检测完整框从173帧增至478帧，新检测姿态可用帧从149帧增至315帧；YOLO逐帧检测列表完全一致，九份视频通过全量解码核验，80项回归测试通过。完整框数是可用性指标，尚无逐帧人工真值来计算准确率；部分完整框仍因姿态残差过大而拒绝输出角度和位移。本轮含推理与三视图导出的CPU吞吐量约8.25帧/秒，基线约10.26帧/秒。详情、抽帧与九份视频链接见 [迁移报告](runs/cv_gate_models/migration_report.md)。
+
+改进 demo 默认仅增强 CV 输入：HSV 亮度通道 CLAHE（8×8 网格、限幅 2.0、混合比例 0.6）→ 1.20 倍对比度 → 亮度通道反遮罩锐化（强度 0.6、高斯 sigma=1.2px、低于 3 级的亮度细节不增强）→ HSV 饱和度提高至 1.25 倍并限幅。色相保持，避免分别均衡 B/G/R 引起色偏；无效校正边界最终原样恢复。YOLO 输入为干净校正图，CV 光流与新检测使用同一增强帧。`--cv-clahe-clip`（0..8）、`--cv-clahe-blend`（0..1）、`--cv-contrast`（1..1.5）、`--cv-sharpen`（0..2，0 关闭锐化）及 `--cv-saturation`（1..2，1 关闭饱和度提高）可调。`--cv-sharpen 0 --cv-saturation 1` 恢复上一轮仅对比度增强；再加 `--cv-contrast 1 --cv-clahe-clip 0` 完全关闭预处理。参数写入 `camera_used.json`、逐帧记录和汇总。
+
+`--export-cv-input` 额外导出 `nearest_gate_cv_input.mp4`：底图为实际送入 CV 的锐化、饱和度增强帧，并绘制共享的 YOLO/CV 标注。原有 `nearest_gate_before.mp4/nearest_gate_after.mp4` 分别保留原始/校正底图，三个视频共用一次识别；增加后的图像效果可直接在 `cv_input` 视频查看。
+
+```powershell
+python demo/demo_video_cv_improved.py E:/TEST --out runs/cv_sharp_saturation --export-cv-input
+python demo/compare_cv_contrast.py --enhancement --out runs/cv_sharp_saturation/comparison
+python demo/validate_cv_retest.py --input runs/cv_sharp_saturation --out runs/cv_sharp_saturation/comparison
+```
 
 UI 后处理：当前所选 YOLO 框触及图像外边界或校正有效区边界时，显示朝相应缺失侧的橙色箭头；两侧同时缺失导致方向冲突时显示 `DIRECTION UNCERTAIN`。这是由边界接触推断出画方向，不能判断遮挡造成的框内残缺。YOLO 漏检时暂停方向和姿态提示。仅当目标不贴边且 CV 提供两横两竖四条有效观测线时，以直线交点得到按 TL/TR/BR/BL 排列的四点，浅绿色只绘制观测管端到交点之间的补线。超过外推上限、交点越界、非凸或越出目标范围时拒绝补线。实际观测管端单独保存在 `nearest_gate.observed_segments`，补线在 `guidance.completion`，不写回检测或跟踪状态。
 
-四点以校正输出内参、零残余畸变和门管中心距 0.70×0.50m 做平面 PnP；`--gate-width-m/--gate-height-m` 可指定实测值。UI 用相机右手坐标系 X 向右、Y 向下、Z 向前，角度是相机需要旋转的局部欧拉角，`R=Rz*Ry*Rx`，并非重力系航向角。先沿 `d=t-(t·n)n` 移到穿过门中心的法线，再按估计旋转使前进轴与法线同向；完成后门中心处于前进轴上。显示 `Shift px-equiv` 的 X/Y/Z 为 `(fx*dx,fy*dy,mean(fx,fy)*dz)/t_z`，X/Y 表示当前深度下的像素等效位移，Z 是虚拟像素等效量，不是可直接测得的像素深度。`center_offset_xy_px` 另存中心偏移。未设定穿门前后距离，因此 Z 不表示前进至门的距离命令。
+四点以校正输出的估计内参、零残余畸变和门框宽高比例 0.70:0.50 做平面 PnP；兼容参数 `--gate-width-m/--gate-height-m` 只用于定义同单位参考宽高，不据此声明实际米制距离。等比例改变宽高不会改变角度和像素等效位移。透视图恢复三个空间角仍依赖相机模型与门框宽高比，不能仅靠四边倾角得到精确三维角。UI 用相机右手坐标系 X 向右、Y 向下、Z 向前，角度是相机需要旋转的局部欧拉角估计，`R=Rz*Ry*Rx`，并非重力系航向角；相机与船体有安装偏角时还需坐标变换。先沿 `d=t-(t·n)n` 移到穿过门中心的法线，再按估计旋转使前进轴与法线同向。显示 `Shift px-equiv x比例` 的 X/Y/Z 为 `比例*(fx*dx,fy*dy,mean(fx,fy)*dz)/t_z`；`--pixel-shift-scale` 指定三个轴的统一比例，默认 1。X/Y 表示当前深度下的像素等效位移，Z 是虚拟像素等效量。`center_offset_xy_px` 另存中心偏移。它们表示回正所需调整的估计量，不表示船只已经移动的距离，也不表示前进至门的距离。
 
-姿态结果在 `guidance.alignment` 内，保存角度、相机坐标平移、法线、像素等效量、重投影误差及尺寸假设；平面姿态有明显双解、拟合残差过大或数据不足时显示 unavailable。跟踪四边的结果标为 tracked；推算与跟踪都不冒充实测。现有校正参数和门尺寸未经本次实测，这些量用于 UI 示意，不输出运动控制。`guidance_*_before/after.jpg` 保存首次方向、补线和姿态提示样例；`summary.json.guidance_frames` 统计状态。
+姿态结果在 `guidance.alignment` 内，`rotation_xyz_deg` 保存角度，`translation_pixel_equivalent_xyz` 保存未缩放像素等效量，`translation_scaled_xyz` 保存乘比例后的显示值；`translation_scale`、`translation_formula` 说明换算。参考模型平移字段采用 `_model_units`，`metric_distance_available=false`，不标为米。平面姿态有明显双解、拟合残差过大或数据不足时显示 unavailable。跟踪四边的结果标为 tracked。`guidance_*_before/after.jpg` 保存首次方向、补线和姿态提示样例；`summary.json.guidance_frames` 统计状态，`fresh_complete_frames/fresh_pose_frames` 分别统计真实新检测的完整框和姿态可用帧，避免把保持显示当作新增检出。
+
+增强效果对照：`python demo/compare_cv_contrast.py` 读取三段原视频及 `rows.jsonl`，默认每 15 帧抽样，用相同校正帧、相同 YOLO 搜索区域独立比较原增强、较强全局增强和两档 CLAHE，不使用跟踪保持。加 `--sequence` 则复用逐帧 YOLO 检测结果，完整运行各档 CV 检测与跟踪；`--video-stem DOOR_TEST_2` 可选单段。报告与差异抽帧写入 `runs/contrast_comparison/`。无人工真值时，完整框数和姿态可用数是检出可用性指标，不能作为正确识别率。`python demo/validate_cv_retest.py` 核验六份输出的全部解码帧数、尺寸、帧率、姿态记录和固定随机种子的抽帧；可用 `--input` 指定其他输出目录。
 
 ## 模型与目录
 
@@ -42,6 +67,10 @@ src/yolo_quad.py        YOLO → 最大框 → OpenCV、绘制
 src/quad_cv_det.py      红杆提取、直线拟合和结构检查
 src/pole_lines.py       独立杆线候选、稳健中心线拟合、完整边段验证
 src/temporal_overlay.py 短时光流跟踪、显示平滑和当前红杆证据检查
+src/detect_red_gate.py  红杆检测、残缺门选择和短时跟踪（改进视频入口）
+src/gate_models.py     颜色证据、红杆短断口恢复和完整四线组合验证
+src/gate_line_geometry.py 共享直线交点、端点和截面采样
+src/yolo_red_gate.py   整门 YOLO 与改进红杆检测的联动
 src/quad_geom.py        四边形几何、边长和倾角
 src/camera_correction.py 平面窗折射、镜头畸变校正、坐标映射和弯曲诊断
 src/media_demo.py       图片/视频输入、标注和 JSONL 输出
@@ -187,6 +216,7 @@ python tests/test_temporal_overlay.py
 python tests/test_red_gate_improved.py
 python tests/test_yolo_red_gate.py
 python tests/test_gate_guidance.py
+python -m unittest discover -s tests -v
 ```
 
 23 项原有合成场景回归；流程测试覆盖首帧立即执行、最大面积优先、目标切换立即执行、丢失后不复用旧结果、重新出现立即执行、长度倾角和四角模型误用。
@@ -194,6 +224,8 @@ python tests/test_gate_guidance.py
 13项流程测试验证最大门框立即处理及独立 YOLO 框接口不启动旧 CV；13项校正测试验证默认参数加载、映射一致性、无畸变恒等变换、镜头系数生效、弯曲诊断、16:9居中裁切的内参换算、原分辨率处理及缓存和双视频每帧只在校正图上推理一次；3项杆线测试验证重叠背景杆干扰、定位框轻微抖动和整边证据拒绝。旧出画场景中强制给完整四角的两项断言已改为验证证据不足时降级。
 
 改进检测的9项测试验证管径选择、原分辨率坐标、真实观测超时、非线性边段回映射和无效区间断开；8项联动测试验证普通 ROI 隔离、贴边允许溢出、残缺前景连续性、YOLO 缺失禁止新 CV、漏检时限、目标切换清除旧跟踪、校正黑边和固定尺度管径。
+
+`tests/test_gate_models.py` 的14项迁移回归验证白角无需分割也能构框、白色及偏色支撑腿不延长完整/残缺门框、白腿短红斑不使近门丢失、缺边及过长端缺口拒绝、背景短杆与远门不补第四边、ROI/校正有效区限制、增强不能凭空制造颜色支持、当前帧失去支持后的跟踪降级、短断口恢复、褪色顶杆和偏移重叠门归属。
 
 6项时序测试使用真实光流，验证首帧立即显示、漏检时随当前帧移动、0.2秒时限到期、CV丢失时的独立时限、画面切换/目标变化清除旧框、显示平滑及边长倾角一致性；原始检测数据始终保留。
 

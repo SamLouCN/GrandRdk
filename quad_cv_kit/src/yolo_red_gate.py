@@ -74,12 +74,19 @@ class YoloRedGateTracker:
     """
 
     def __init__(self, detector, fps=30, detect_every=3, hold_seconds=.2,
-                 valid_mask=None, roi_padding=.08, cv_contrast=1.12):
+                 valid_mask=None, roi_padding=.08, cv_contrast=1.2,
+                 cv_clahe_clip=2.0, cv_clahe_blend=.6,
+                 cv_sharpen=.6, cv_saturation=1.25):
         self.detector = detector
         self.cv = RedGateTracker(fps, detect_every, hold_seconds)
         self.valid_mask = valid_mask
         self.roi_padding = roi_padding
         self.cv_contrast = cv_contrast
+        self.cv_clahe_clip = cv_clahe_clip
+        self.cv_clahe_blend = cv_clahe_blend
+        self.cv_sharpen = cv_sharpen
+        self.cv_saturation = cv_saturation
+        self.last_cv_frame = None
         self.hold_frames = self.cv.hold_frames
         self.target = None
         self.last_yolo = None
@@ -137,11 +144,15 @@ class YoloRedGateTracker:
         if self.target is not None:
             region = search_region(self.target['bbox'], (frame.shape[1], frame.shape[0]),
                                    self.target['clipped'], self.roi_padding)
-        cv_frame = enhance_cv_contrast(frame, self.cv_contrast, self.valid_mask)
+        cv_frame = enhance_cv_contrast(frame, self.cv_contrast, self.valid_mask,
+                                       self.cv_clahe_clip, self.cv_clahe_blend,
+                                       self.cv_sharpen, self.cv_saturation)
+        self.last_cv_frame = cv_frame
         selected, lines = self.cv.update(cv_frame, region,
                                          self.target['bbox'] if self.target else None,
                                          allow_detect=allow_detect,
-                                         prefer_previous_width=reason=='clipped-target-continuity')
+                                         prefer_previous_width=reason=='clipped-target-continuity',
+                                         reference_frame=frame, valid_mask=self.valid_mask)
         self.last_status = dict(self.cv.last_status, yolo_count=len(boxes),
                                 yolo_detections=boxes,
                                 target_bbox=self.target['bbox'] if self.target else None,

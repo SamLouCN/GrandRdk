@@ -5,6 +5,14 @@ import json
 import subprocess
 import cv2
 import numpy as np
+if __package__:
+    from .gate_line_geometry import endpoints, intersection, samples
+    from . import gate_models
+else:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from src.gate_line_geometry import endpoints, intersection, samples
+    from src import gate_models
 
 
 def red_mask(frame):
@@ -35,20 +43,7 @@ def prepare_detection_frame(frame):
     return canvas,ratio,offset
 
 
-def samples(mask, a, b, radius=5):
-    length = np.linalg.norm(b-a)
-    count = max(10, int(length))
-    p = np.linspace(a, b, count)
-    normal = np.array([-(b-a)[1], (b-a)[0]]) / max(length, 1)
-    q = p[:, None, :] + np.arange(-radius, radius+1)[None, :, None]*normal
-    x, y = np.rint(q[..., 0]).astype(int), np.rint(q[..., 1]).astype(int)
-    valid = (x >= 0) & (x < mask.shape[1]) & (y >= 0) & (y < mask.shape[0])
-    z = mask[np.clip(y, 0, mask.shape[0]-1), np.clip(x, 0, mask.shape[1]-1)] > 0
-    z &= valid
-    return p, z, normal
-
-
-def line_from_segment(mask, ends):
+def line_from_segment(mask, ends, min_support=.6):
     a, b = ends.reshape(2, 2).astype(float)
     d = b-a
     length = np.linalg.norm(d)
@@ -62,7 +57,7 @@ def line_from_segment(mask, ends):
         a, b = b, a
     p, z, normal = samples(mask, a, b, 10)
     good = z.any(axis=1)
-    if good.mean() < .6:
+    if good.mean() < min_support:
         return None
     # 每个截面选离种子最近的红色连通段，避免拉向另一根管。
     ids=np.flatnonzero(good)[::2]
@@ -91,10 +86,6 @@ def line_from_segment(mask, ends):
                 width=float(np.median(widths)), support=float(good.mean()), vertical=vertical)
 
 
-def endpoints(line):
-    return np.array([line['n']*line['b']+line['d']*line[k] for k in ('lo', 'hi')])
-
-
 def elbow_mask(frame):
     h,s,v=cv2.split(cv2.cvtColor(frame,cv2.COLOR_BGR2HSV))
     white=np.uint8((((h>18)&(h<102)&(s<110)&(v>70))|((s<18)&(v>130))))*255
@@ -121,17 +112,19 @@ def tube_contrast(frame,line):
     return float(np.median(delta)),float(np.mean(delta>.035))
 
 
-def get_lines(frame, mask):
+def get_lines(frame, mask, reference_frame=None):
     lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
     segments = []
-    for img in (mask, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)):
+    reference_frame = frame if reference_frame is None else reference_frame
+    chroma = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2LAB)[:, :, 1]
+    for img in (mask, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.createCLAHE(2., (8, 8)).apply(chroma)):
         found = lsd.detect(img)[0]
         if found is not None:
             segments.extend(found.reshape(-1, 4))
     hough=cv2.HoughLinesP(mask,1,np.pi/720,35,minLineLength=55,maxLineGap=10)
     if hough is not None:
         segments.extend(hough.reshape(-1,4))
-    lines = [q for s in segments if (q := line_from_segment(mask, s)) is not None]
+    lines = [q for s in segments if (q := line_from_segment(mask, s, .48)) is not None]
     lines.sort(key=lambda q: (q['hi']-q['lo'])*q['support'], reverse=True)
     merged = []
     for line in lines:
@@ -141,7 +134,10 @@ def get_lines(frame, mask):
                 continue
             mid = endpoints(line).mean(axis=0)
             distance = abs(mid@old['n']-old['b'])
-            if distance < max(5, .7*max(old['width'], line['width'])):
+            projected = endpoints(line)@old['d']
+            gap = max(old['lo']-projected.max(), projected.min()-old['hi'], 0)
+            if (distance < max(2.5, .45*min(old['width'], line['width']))
+                    and gap < min(34, max(12, 2.5*old['width']))):
                 group = old
                 break
         if group is None:
@@ -164,8 +160,9 @@ def get_lines(frame, mask):
             lo,hi=p[run[[0,-1]]]@line['d']
             if (hi-lo)/max(line['width'],1)<5:continue
             item=dict(line,lo=float(lo),hi=float(hi),support=float(occupancy[run].mean()))
-            contrast,fraction=tube_contrast(frame,item)
-            if contrast>.24 and fraction>.7:
+            contrast, fraction = max((tube_contrast(source, item) for source in (reference_frame, frame)),
+                                     key=lambda measurement: measurement[0])
+            if contrast>.035 and fraction>.48:
                 item['contrast']=contrast
                 split.append(item)
     merged=sorted(split,key=lambda q:(q['hi']-q['lo'])*q['support'],reverse=True)
@@ -175,12 +172,12 @@ def get_lines(frame, mask):
     return vertical, horizontal
 
 
-def pipe_groups(vertical,horizontal,frame):
+def pipe_groups(vertical,horizontal,frame,reference_frame=None):
     """管子端部组成连通图，缺边的近框和完整框使用同一个选择规则。"""
     lines=vertical+horizontal
     parent=list(range(len(lines)))
     links=[]
-    white=elbow_mask(frame)
+    white=elbow_mask(frame if reference_frame is None else reference_frame)
     def root(i):
         while parent[i]!=i:
             parent[i]=parent[parent[i]];i=parent[i]
@@ -292,17 +289,21 @@ def pipe_groups(vertical,horizontal,frame):
     return groups
 
 
-def intersection(a, b):
-    m = np.stack([a['n'], b['n']])
-    if abs(np.linalg.det(m)) < .3:
-        return None
-    return np.linalg.solve(m, [a['b'], b['b']])
-
-
-def detect(frame, search_bbox=None, anchor_bbox=None):
+def detect(frame, search_bbox=None, anchor_bbox=None, reference_frame=None, valid_mask=None):
     """Detect in a masked ROI, retaining the full-frame processing scale."""
     small,ratio,offset=prepare_detection_frame(frame)
-    mask=red_mask(small)
+    if reference_frame is not None and reference_frame.shape != frame.shape:
+        raise ValueError('Reference and enhanced frames must have identical dimensions')
+    reference = small if reference_frame is None else prepare_detection_frame(reference_frame)[0]
+    mask, color_score = gate_models.combined_evidence(small, reference)
+    width, height = round(frame.shape[1]*ratio), round(frame.shape[0]*ratio)
+    bounds = (int(offset[0]), int(offset[1]), int(offset[0])+width, int(offset[1])+height)
+    small_valid = None
+    if valid_mask is not None:
+        small_valid = np.zeros_like(mask, bool)
+        small_valid[bounds[1]:bounds[3], bounds[0]:bounds[2]] = cv2.resize(
+            np.uint8(valid_mask), (width, height), interpolation=cv2.INTER_NEAREST) > 0
+        mask[~small_valid] = 0
     if search_bbox is not None:
         points=np.asarray(search_bbox,float).reshape(2,2)*ratio+offset
         low=np.floor(points[0]).astype(int);high=np.ceil(points[1]).astype(int)
@@ -311,8 +312,31 @@ def detect(frame, search_bbox=None, anchor_bbox=None):
         roi_mask[low[1]:high[1],low[0]:high[0]]=255
         mask=cv2.bitwise_and(mask,roi_mask)
         small=small.copy();small[roi_mask==0]=0
-    vertical,horizontal=get_lines(small,mask)
-    candidates=pipe_groups(vertical,horizontal,small)
+        reference=reference.copy();reference[roi_mask==0]=0
+        bounds = (max(bounds[0], low[0]), max(bounds[1], low[1]),
+                  min(bounds[2], high[0]), min(bounds[3], high[1]))
+    vertical,horizontal=get_lines(small,mask,reference)
+    recovered = gate_models.trim_lines(vertical+horizontal, mask, color_score, bounds)
+    vertical = [line for line in recovered if line['vertical']][:10]
+    horizontal = [line for line in recovered if not line['vertical']][:10]
+    complete = gate_models.complete_models(vertical, horizontal, mask, bounds, small_valid)
+    # The weak LAB evidence is safe only with four-side geometric validation.
+    # Partial chains have no enclosing model to stop a warm white support leg.
+    partial_mask = cv2.bitwise_and(mask, red_mask(reference))
+    partial_lines = gate_models.trim_lines(vertical+horizontal, partial_mask, color_score, bounds)
+    # Preserve the old partial detector's minimum rod length after re-trimming.
+    # Tiny red patches on a white foot must not add an incompatible fourth rod.
+    partial_lines = [line for line in partial_lines if line['hi']-line['lo'] >= 35
+                     and (line['hi']-line['lo'])/max(1, line['width']) >= 5]
+    partial = pipe_groups([line for line in partial_lines if line['vertical']],
+                          [line for line in partial_lines if not line['vertical']], small, reference)
+    # A supported complete model wins over competing fragments of those same rods.
+    partial = [candidate for candidate in partial if not any(
+        sum(any(abs(line['d']@member['d']) > .99 and
+                    abs(endpoints(line).mean(axis=0)@member['n']-member['b']) < max(3, member['width']*.55)
+                    for member in model['lines']) for line in candidate['lines']) >= 2
+        for model in complete)]
+    candidates = complete+partial
     if anchor_bbox is not None:
         anchor=np.asarray(anchor_bbox,float).reshape(2,2)*ratio+offset
         def anchored(candidate):
@@ -395,21 +419,32 @@ class RedGateTracker:
         self.last_observed = None
 
     def update(self, frame, search_bbox=None, anchor_bbox=None, allow_detect=True,
-               prefer_previous_width=False):
+               prefer_previous_width=False, reference_frame=None, valid_mask=None):
         small, ratio, offset = prepare_detection_frame(frame)
+        reference = prepare_detection_frame(reference_frame)[0] if reference_frame is not None else small
+        if reference_frame is not None and reference_frame.shape != frame.shape:
+            raise ValueError('Reference frame must match detection frame dimensions')
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         moved = None
         age = self.index - self.last_observed if self.last_observed is not None else 0
         if self.previous is not None and age <= self.hold_frames:
-            moved = move_with_image(self.previous, self.last_gray, gray, None, small)
+            current_mask, _ = gate_models.combined_evidence(small, reference)
+            if valid_mask is not None:
+                valid_small = np.zeros_like(current_mask)
+                h,w = frame.shape[:2]
+                x,y = offset.astype(int)
+                resized = cv2.resize(np.uint8(valid_mask), (round(w*ratio),round(h*ratio)), interpolation=cv2.INTER_NEAREST)
+                valid_small[y:y+resized.shape[0],x:x+resized.shape[1]] = resized
+                current_mask[valid_small == 0] = 0
+            moved = move_with_image(self.previous, self.last_gray, gray, current_mask, small)
         fresh = None
         lines = ([], [])
         candidate_count = None
         if allow_detect and (self.index % self.detect_every == 0 or moved is None):
             if search_bbox is None:
-                candidates, lines, _ = detect(frame)
+                candidates, lines, _ = detect(frame, reference_frame=reference_frame, valid_mask=valid_mask)
             else:
-                candidates, lines, _ = detect(frame, search_bbox, anchor_bbox)
+                candidates, lines, _ = detect(frame, search_bbox, anchor_bbox, reference_frame, valid_mask)
             candidate_count = len(candidates)
             fresh = select_nearest(candidates, moved)
             if (prefer_previous_width and fresh is not None and moved is not None
@@ -453,7 +488,9 @@ def original_geometry(frame, candidate):
                 corners=[((np.asarray(p)-offset)/ratio).tolist() for p in candidate['corners']],
                 complete=bool(candidate['complete']),
                 pipe_width_px=apparent_pipe_width(candidate)/ratio,
-                observation='tracked' if candidate.get('tracked') else 'detected')
+                observation='tracked' if candidate.get('tracked') else 'detected',
+                model=candidate.get('model', 'endpoint-chain'),
+                side_support=candidate.get('side_support'))
 
 
 def project_gate_geometry(geometry, point_mapper, image_size):
@@ -544,7 +581,8 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
     def warp(points):
         return np.asarray(points)@matrix[:,:2].T+matrix[:,2]
     segments=[];members=[]
-    next_mask=red_mask(next_frame)
+    next_mask=mask if mask is not None else red_mask(next_frame)
+    supports=[]
     for segment,line in zip(previous['segments'],previous['lines']):
         new=warp(segment)
         ok,a,b=cv2.clipLine((0,0,640,360),tuple(np.rint(new[0]).astype(int)),tuple(np.rint(new[1]).astype(int)))
@@ -555,6 +593,12 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
         d=(b-a)/np.linalg.norm(b-a);n=np.array([-d[1],d[0]])
         item=dict(line,d=d,n=n,b=float(a@n),lo=float(a@d),hi=float(b@d),width=line['width']*scale,
                   observed_segment=warp(line.get('observed_segment', segment)))
+        extent=item['observed_segment']@d
+        item.update(strong_lo=float(extent.min()),strong_hi=float(extent.max()))
+        if previous.get('geometry_validated'):
+            support=gate_models.side_evidence(next_mask,item,np.array([a,b]))
+            if support is None:continue
+            supports.append(support)
         segments.append(np.array([a,b]));members.append(item)
     if not segments:return None
     corners=[]
@@ -566,7 +610,8 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
     score=max(np.linalg.norm(b-a)*l['width']**1.5 for (a,b),l in zip(segments,members))
     score*=1+.04*(len(members)-1)
     return dict(previous,segments=segments,lines=members,corners=corners,width=float(np.median([l['width'] for l in members])),
-                score=float(score),complete=len(corners)==4 and len(segments)==4,tracked=True)
+                score=float(score),complete=len(corners)==4 and len(segments)==4,tracked=True,
+                side_support=supports if previous.get('geometry_validated') else None)
 
 
 def overlap(a,b):
@@ -578,6 +623,7 @@ def overlap(a,b):
 def polygon_edges(candidate):
     """矩形管框每个管端只能接一根邻边；部分可见框仍然是同一条链。"""
     if candidate is None:return None
+    if candidate.get('geometry_validated'):return candidate
     segments=[np.asarray(s,float) for s in candidate['segments']]
     members=[]
     for segment,line in zip(segments,candidate['lines']):

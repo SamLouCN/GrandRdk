@@ -9,6 +9,7 @@ CV uses visible pipe width within the ROI; comparable tube diameters are assumed
 Green lines follow supported gate edges, including partial gates.
 Yellow boxes show all current YOLO doors; [selected] marks the CV target.
 Both videos share detections from the corrected frame; raw edges are mapped curves.
+--export-cv-input also shows the actual sharpened, saturation-enhanced CV input.
 """
 import argparse
 import json
@@ -98,6 +99,7 @@ def process_video(source, args, output_dir, detector=None):
     writers = []
     count = found = detected = tracked = complete = 0
     yolo_frames = cv_frames = switches = overflow_frames = 0
+    fresh_complete = four_edges = fresh_pose = 0
     guidance_counts = {}
     guidance_samples = set()
     started = time.perf_counter()
@@ -118,6 +120,7 @@ def process_video(source, args, output_dir, detector=None):
         selection = 'apparent-pipe-width' if detector is None else 'yolo-area-clipped-continuity'
         output_before = output_dir / 'nearest_gate_before.mp4'
         output_after = output_dir / 'nearest_gate_after.mp4'
+        output_cv_input = output_dir / 'nearest_gate_cv_input.mp4'
         print(f'{source.name}: {expected or "?"} frames, {fps:g} fps -> {output_dir}', flush=True)
         with (output_dir / 'rows.jsonl').open('w', encoding='utf-8') as records:
             while args.max_frames is None or count < args.max_frames:
@@ -132,7 +135,9 @@ def process_video(source, args, output_dir, detector=None):
                     tracker = (RedGateTracker(fps, args.detect_every, args.hold_seconds)
                                if detector is None else YoloRedGateTracker(
                                    detector, fps, args.detect_every, args.hold_seconds,
-                                   valid_mask, args.roi_padding, args.cv_contrast))
+                                   valid_mask, args.roi_padding, args.cv_contrast,
+                                   args.cv_clahe_clip, args.cv_clahe_blend,
+                                   args.cv_sharpen, args.cv_saturation))
                     metadata = dict(camera=camera, adapted_camera=adapted,
                                     camera_params=str(args.camera_params.resolve()),
                                     camera_adaptation=adaptation, input_size=list(size),
@@ -145,19 +150,32 @@ def process_video(source, args, output_dir, detector=None):
                                     selection=selection, yolo_enabled=detector is not None,
                                     yolo_boxes_visible=detector is not None,
                                     cv_contrast_gain=args.cv_contrast,
-                                    gate_size_m=[args.gate_width_m, args.gate_height_m],
+                                    cv_clahe_clip=args.cv_clahe_clip, cv_clahe_blend=args.cv_clahe_blend,
+                                    cv_sharpen_amount=args.cv_sharpen, cv_saturation_gain=args.cv_saturation,
+                                    cv_preprocessing_order=['CLAHE', 'contrast', 'value-unsharp', 'saturation'],
+                                    cv_geometry='four-line-color-validated + endpoint-chain partial fallback',
+                                    cv_reference='clean corrected frame for color and white elbows',
+                                    pixel_shift_scale=args.pixel_shift_scale,
+                                    gate_size_reference=[args.gate_width_m, args.gate_height_m],
                                     guidance_ui_only=True)
                     (output_dir / 'camera_used.json').write_text(
                         json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
                     for output in (output_before, output_after):
                         writers.append(VideoOutput(output, fps, size))
+                    if args.export_cv_input:
+                        writers.append(VideoOutput(output_cv_input, fps, size))
                     print(f'  Correction: {size[0]}x{size[1]}, {args.camera_fit}, '
                           f'f_out={corrector.f_out:.2f}px', flush=True)
                 if (frame.shape[1], frame.shape[0]) != size:
                     raise ValueError('Source dimensions changed within a video')
                 fixed = corrector.undistort(frame, args.plane_distance)
-                selected, _ = tracker.update(fixed if detector is not None else
-                                              enhance_cv_contrast(fixed, args.cv_contrast, valid_mask))
+                if detector is not None:
+                    selected, _ = tracker.update(fixed)
+                    cv_frame = tracker.last_cv_frame
+                else:
+                    cv_frame = enhance_cv_contrast(fixed, args.cv_contrast, valid_mask,
+                        args.cv_clahe_clip, args.cv_clahe_blend, args.cv_sharpen, args.cv_saturation)
+                    selected, _ = tracker.update(cv_frame, reference_frame=fixed, valid_mask=valid_mask)
                 status = tracker.last_status
                 yolo_frames += status.get('yolo_count', 0) > 0
                 cv_frames += status.get('detection_ran', False)
@@ -171,7 +189,8 @@ def process_video(source, args, output_dir, detector=None):
                     size)
                 guidance = build_gate_guidance(
                     status, geometry, corrector.output_matrix, size, valid_mask,
-                    (args.gate_width_m, args.gate_height_m))
+                    (args.gate_width_m, args.gate_height_m), args.pixel_shift_scale)
+                fresh_pose += bool(guidance['alignment'] and geometry['observation'] == 'detected')
                 guidance_counts[guidance['mode']] = guidance_counts.get(guidance['mode'], 0)+1
                 yolo_boxes = []
                 raw_yolo_geometry = []
@@ -194,12 +213,16 @@ def process_video(source, args, output_dir, detector=None):
                     detected += geometry['observation'] == 'detected'
                     tracked += geometry['observation'] == 'tracked'
                     complete += geometry['complete']
+                    fresh_complete += bool(geometry['complete'] and geometry['observation'] == 'detected')
+                    four_edges += len(geometry['observed_segments']) == 4
                 row = dict(frame=count, time_s=count/fps, source=str(source.resolve()),
                            img_w=frame.shape[1], img_h=frame.shape[0],
                            coordinate_space='corrected', selection=selection,
                            nearest_gate=geometry, raw_geometry=raw_geometry,
                            display_gate_geometry=display_geometry, guidance=guidance,
                            cv_contrast_gain=args.cv_contrast,
+                           cv_clahe_clip=args.cv_clahe_clip, cv_clahe_blend=args.cv_clahe_blend,
+                           cv_sharpen_amount=args.cv_sharpen, cv_saturation_gain=args.cv_saturation,
                            candidate_count=tracker.last_status['candidate_count'],
                            age_frames=tracker.last_status['age_frames'])
                 if detector is not None:
@@ -220,6 +243,12 @@ def process_video(source, args, output_dir, detector=None):
                 after = draw_gate_guidance(after, guidance, corrector.output_matrix)
                 writers[0].write(before)
                 writers[1].write(after)
+                enhanced_view = None
+                if args.export_cv_input:
+                    enhanced_view = draw_detections(cv_frame, yolo_boxes)
+                    enhanced_view = draw_gate_geometry(enhanced_view, display_geometry, count, fps, 'CV INPUT')
+                    enhanced_view = draw_gate_guidance(enhanced_view, guidance, corrector.output_matrix)
+                    writers[2].write(enhanced_view)
                 sample_modes = {guidance['mode']}
                 if guidance['completion'] and guidance['completion']['segments']:
                     sample_modes.add('completion')
@@ -231,6 +260,8 @@ def process_video(source, args, output_dir, detector=None):
                 if count in sample_indices:
                     save_image(output_dir / f'frame_{count:06d}_before.jpg', before)
                     save_image(output_dir / f'frame_{count:06d}_after.jpg', after)
+                    if enhanced_view is not None:
+                        save_image(output_dir / f'frame_{count:06d}_cv_input.jpg', enhanced_view)
                     samples.append(np.hstack([cv2.resize(before, (480, 270)),
                                               cv2.resize(after, (480, 270))]))
                 count += 1
@@ -244,14 +275,16 @@ def process_video(source, args, output_dir, detector=None):
             raise RuntimeError(f'No readable video frames: {source}')
     finally:
         cap.release()
-        try:
-            if writers:
-                writers[0].close()
-        finally:
-            if len(writers) > 1:
-                writers[1].close()
+        close_errors = []
+        for writer in writers:
+            try:
+                writer.close()
+            except (OSError, RuntimeError) as error:
+                close_errors.append(error)
         if args.show:
             cv2.destroyAllWindows()
+        if close_errors:
+            raise close_errors[0]
     if samples:
         while len(samples) % 2:
             samples.append(np.zeros_like(samples[0]))
@@ -262,6 +295,8 @@ def process_video(source, args, output_dir, detector=None):
                    videos=dict(before=str(output_before.resolve()), after=str(output_after.resolve())),
                    frames=count, fps=fps, size=list(size), gate_frames=found,
                    detected_frames=detected, tracked_frames=tracked, complete_frames=complete,
+                   fresh_complete_frames=fresh_complete, four_observed_edge_frames=four_edges,
+                   fresh_pose_frames=fresh_pose,
                    elapsed_s=round(elapsed, 3), processing_fps=round(count/elapsed, 2),
                    selection=selection,
                    assumption='Gates use comparable physical pipe diameters',
@@ -275,8 +310,15 @@ def process_video(source, args, output_dir, detector=None):
                    weights=str(args.weights.resolve()) if detector is not None else None,
                    device=args.device, conf=args.conf, iou=args.iou, imgsz=args.imgsz,
                    roi_padding=args.roi_padding, cv_contrast_gain=args.cv_contrast,
-                   gate_size_m=[args.gate_width_m, args.gate_height_m],
+                   cv_clahe_clip=args.cv_clahe_clip, cv_clahe_blend=args.cv_clahe_blend,
+                   cv_sharpen_amount=args.cv_sharpen, cv_saturation_gain=args.cv_saturation,
+                   cv_geometry='four-line-color-validated + endpoint-chain partial fallback',
+                   cv_reference='clean corrected frame for color and white elbows',
+                   pixel_shift_scale=args.pixel_shift_scale, metric_distance_available=False,
+                   gate_size_reference=[args.gate_width_m, args.gate_height_m],
                    guidance_ui_only=True, guidance_frames=guidance_counts)
+    if args.export_cv_input:
+        summary['videos']['cv_input'] = str(output_cv_input.resolve())
     (output_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2),
                                             encoding='utf-8')
     print(f'  Done: {count} frames, {found} with gate, {count/elapsed:.1f} processing fps', flush=True)
@@ -297,12 +339,24 @@ def main(argv=None):
     parser.add_argument('--roi-padding', type=float, default=.08,
                         help='Ordinary box padding ratio; clipped targets allow wider overflow')
     parser.add_argument('--cv-only', action='store_true', help='Run the previous CV-only detector')
-    parser.add_argument('--cv-contrast', type=float, default=1.12,
-                        help='CV-only HSV value contrast gain (1..1.5); 1 disables preprocessing')
-    parser.add_argument('--gate-width-m', type=float, default=.7,
-                        help='Physical gate corner-center width for UI pose estimation')
-    parser.add_argument('--gate-height-m', type=float, default=.5,
-                        help='Physical gate corner-center height for UI pose estimation')
+    parser.add_argument('--cv-contrast', type=float, default=1.2,
+                        help='CV-only HSV value contrast gain (1..1.5)')
+    parser.add_argument('--cv-clahe-clip', type=float, default=2.0,
+                        help='Local contrast clip limit (0 disables CLAHE, range 0..8)')
+    parser.add_argument('--cv-clahe-blend', type=float, default=.6,
+                        help='Blend of locally enhanced brightness (0..1)')
+    parser.add_argument('--cv-sharpen', type=float, default=.6,
+                        help='Value-channel unsharp amount (0..2, 0 disables; sigma 1.2px)')
+    parser.add_argument('--cv-saturation', type=float, default=1.25,
+                        help='HSV saturation multiplier (1..2, 1 disables)')
+    parser.add_argument('--export-cv-input', action='store_true',
+                        help='Also export the actual enhanced CV input with shared YOLO/CV overlays')
+    parser.add_argument('--pixel-shift-scale', type=float, default=1.0,
+                        help='Common positive scale applied to X/Y/Z pixel equivalents; no metric distance')
+    parser.add_argument('--gate-width', '--gate-width-m', dest='gate_width_m', type=float, default=.7,
+                        help='Reference gate width; only width/height ratio affects angles and pixel equivalents')
+    parser.add_argument('--gate-height', '--gate-height-m', dest='gate_height_m', type=float, default=.5,
+                        help='Reference gate height in the same arbitrary units as width')
     parser.add_argument('--max-frames', '--limit', type=int, default=None)
     parser.add_argument('--detect-every', type=int, default=3,
                         help='Fresh detection interval; track between detections')
@@ -321,7 +375,14 @@ def main(argv=None):
     if (not np.isfinite(args.cv_contrast) or not 1 <= args.cv_contrast <= 1.5
             or not np.isfinite([args.gate_width_m, args.gate_height_m]).all()
             or min(args.gate_width_m, args.gate_height_m) <= 0):
-        raise ValueError('Invalid CV contrast gain or physical gate dimensions')
+        raise ValueError('Invalid CV contrast gain or reference gate dimensions')
+    if (not np.isfinite([args.cv_clahe_clip, args.cv_clahe_blend, args.pixel_shift_scale]).all()
+            or not 0 <= args.cv_clahe_clip <= 8 or not 0 <= args.cv_clahe_blend <= 1
+            or args.pixel_shift_scale <= 0):
+        raise ValueError('Invalid CLAHE parameters or pixel shift scale')
+    if (not np.isfinite([args.cv_sharpen, args.cv_saturation]).all()
+            or not 0 <= args.cv_sharpen <= 2 or not 1 <= args.cv_saturation <= 2):
+        raise ValueError('Invalid CV sharpening or saturation gain')
     if (not 0 <= args.conf <= 1 or not 0 <= args.iou <= 1 or args.imgsz < 1
             or not 0 <= args.roi_padding <= .5):
         raise ValueError('Invalid YOLO thresholds, image size, or ROI padding')
@@ -351,7 +412,8 @@ def main(argv=None):
         # Never allow a caller's output setting to replace the input video.
         destination = args.out / name
         if video.resolve() in [(destination / name).resolve()
-                               for name in ('nearest_gate_before.mp4', 'nearest_gate_after.mp4')]:
+                               for name in ('nearest_gate_before.mp4', 'nearest_gate_after.mp4',
+                                            'nearest_gate_cv_input.mp4')]:
             raise ValueError('Output video would overwrite the source')
         process_video(video, args, destination, detector)
     return 0

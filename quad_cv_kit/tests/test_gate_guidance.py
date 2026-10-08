@@ -110,7 +110,7 @@ class GuidanceTests(unittest.TestCase):
         pose, reason = estimate_alignment(corners, self.matrix)
         self.assertIsNotNone(pose, reason)
         np.testing.assert_allclose(pose['rotation_xyz_deg'], [12, -20, 8], atol=1e-5)
-        movement = np.asarray(pose['alignment_translation_camera_m'])
+        movement = np.asarray(pose['alignment_translation_model_units'])
         np.testing.assert_allclose(translation-movement, (translation@rotation[:, 2])*rotation[:, 2], atol=1e-6)
         np.testing.assert_allclose(pose['translation_pixel_equivalent_xyz'], 900*movement/2.5, atol=1e-5)
         # After translating then rotating, the center lies on the new forward axis.
@@ -128,6 +128,62 @@ class GuidanceTests(unittest.TestCase):
         corners, _ = self.pose()
         corners[2] += [150, 40]
         self.assertIsNone(estimate_alignment(corners, self.matrix)[0])
+
+    def test_pixel_estimates_ignore_absolute_gate_size_and_apply_scale(self):
+        corners, _ = self.pose()
+        original, _ = estimate_alignment(corners, self.matrix)
+        scaled, _ = estimate_alignment(corners, self.matrix, gate_size=(7., 5.), pixel_scale=.25)
+        np.testing.assert_allclose(scaled['rotation_xyz_deg'], original['rotation_xyz_deg'], atol=1e-5)
+        np.testing.assert_allclose(scaled['translation_scaled_xyz'],
+                                   np.asarray(original['translation_pixel_equivalent_xyz'])*.25, atol=1e-5)
+        self.assertFalse(scaled['metric_distance_available'])
+        self.assertNotIn('alignment_translation_camera_m', scaled)
+
+    def test_clahe_boosts_dark_local_details_without_changing_invalid_pixels(self):
+        hsv = np.full((128, 256, 3), [170, 150, 60], np.uint8)
+        hsv[:, 128:, 2] = 180
+        hsv[32:96, 32:96, 2] = 68
+        frame = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        valid = np.ones(frame.shape[:2], bool)
+        valid[:, :8] = False
+        baseline = cv2.cvtColor(enhance_cv_contrast(frame, 1.12, valid, 0, 0, 0, 1), cv2.COLOR_BGR2HSV)
+        local = enhance_cv_contrast(frame, 1.2, valid, 2, .6, 0, 1)
+        value = cv2.cvtColor(local, cv2.COLOR_BGR2HSV)[:, :, 2]
+        difference = lambda v: float(v[45:80, 45:80].mean()-v[45:80, 15:25].mean())
+        self.assertGreater(difference(value), difference(baseline[:, :, 2]))
+        np.testing.assert_array_equal(local[:, :8], frame[:, :8])
+        np.testing.assert_array_equal(enhance_cv_contrast(frame, 1, valid, 0, 0, 0, 1), frame)
+
+    def test_saturation_increases_color_without_tinting_gray_or_invalid_pixels(self):
+        hsv = np.full((64, 128, 3), [170, 100, 150], np.uint8)
+        hsv[:, 64:, 1] = 0
+        frame = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        original = frame.copy()
+        valid = np.ones(frame.shape[:2], bool)
+        valid[:, :8] = False
+        result = enhance_cv_contrast(frame, 1, valid, 0, 0, 0, 1.25)
+        after = cv2.cvtColor(result, cv2.COLOR_BGR2HSV)
+        self.assertGreater(after[:, 8:64, 1].mean(), 120)
+        self.assertLess(np.abs(after[:, 8:64, 0].astype(float)-170).max(), 2)
+        np.testing.assert_array_equal(result[:, 64:], frame[:, 64:])
+        np.testing.assert_array_equal(result[:, :8], frame[:, :8])
+        np.testing.assert_array_equal(frame, original)
+
+    def test_sharpen_strengthens_soft_edges_and_suppresses_small_noise(self):
+        value = np.full((64, 128), 60, np.uint8)
+        value[:, 64:] = 160
+        value = cv2.GaussianBlur(value, (0, 0), 1.5)
+        frame = np.repeat(value[:, :, None], 3, axis=2)
+        valid = np.ones(value.shape, bool)
+        valid[:, :8] = False
+        enhanced = enhance_cv_contrast(frame, 1, valid, 0, 0, .6, 1)
+        before_edge_contrast = int(frame[32, 65, 0])-int(frame[32, 62, 0])
+        after_edge_contrast = int(enhanced[32, 65, 0])-int(enhanced[32, 62, 0])
+        self.assertGreater(after_edge_contrast, before_edge_contrast)
+        np.testing.assert_array_equal(enhanced[:, :8], frame[:, :8])
+        low_noise = np.full((32, 32, 3), 60, np.uint8)
+        low_noise[::2] = 61
+        np.testing.assert_array_equal(enhance_cv_contrast(low_noise, 1, None, 0, 0, .6, 1), low_noise)
 
 
 if __name__ == '__main__':
