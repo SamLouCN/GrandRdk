@@ -68,6 +68,42 @@ AUV_TOUCH_ACC_BASE_N = 10        # 触壁基线窗口：进入检测后前 N 拍
 AUV_TOUCH_ACC_DROP_RATIO = 0.5   # 触壁判据：当前幅值 < 基线×(1-ratio) 计一次命中
 AUV_TOUCH_ACC_HIT_N = 3          # 连续命中拍数 → 判触壁（20Hz 下 ≈0.15s）
 
+# HitBall（task/task_hit_ball/t_hit_ball.py，2026-10-07 v3.1 落地；方案源 strike_ball_plan.md）
+# 键源：strike v2.1 的 AUV_PID_*/AUV_BALL_*/AUV_RAM_* 改名归入（vservo 统一规划键空间）；
+#      公共层 task/vservo.py 的 KF1D/PID 构造注入这些键，参数独立不串任务。
+AUV_HIT_CAM = 'front'            # 撞球用前视摄像头
+AUV_HIT_WANT = 'ball'            # 撞红球（CANON red-ball→ball）；蓝球待模型实装后换名即接
+AUV_HIT_HEIGHT_CM = 60.0         # 撞球工作高度（距池底），track/ram/confirm 全程沿用
+AUV_HIT_ROUNDS = 3               # 总尝试轮数（含首轮）：失败后退找球重试
+AUV_HIT_TIMEOUT_S = 15.0         # 单轮 track 超时 → 本轮失败（绝不死等）
+AUV_HIT_PID_KP = 25.0            # PID 比例（°/单位ex），TODO 上车调参
+AUV_HIT_PID_KI = 0.0             # PID 积分（实装但默认关，I 限幅见下）
+AUV_HIT_PID_KD = 0.0             # PID 微分
+AUV_HIT_PID_OUT_MAX = 10.0       # 单拍输出限幅（°）
+AUV_HIT_PID_I_MAX = 5.0          # 积分项限幅（°）
+AUV_HIT_YAW_SIGN = 1.0           # ★已拍板：dx>0→右转（yaw 增，右为正）→ 默认 +1；上车确认项
+AUV_HIT_TRACK_SURGE = 0.35       # 跟随段前进推力
+AUV_HIT_RAM_W_RATIO = 0.45       # 近场判据：w_ema/画面宽占比 ≥ 此值
+AUV_HIT_RAM_SEEN_N = 5           # 近场判据连续确认拍数（20Hz ≈0.25s）
+AUV_HIT_RAM_SURGE = 0.9          # 盲冲推力
+AUV_HIT_RAM_S = 1.0              # 盲冲时长（定时必结束）
+AUV_HIT_CONFIRM_S = 0.8          # 撞后确认观察窗（s）：球仍在画面 → 判未撞上
+AUV_HIT_CONFIRM_SEEN_N = 2       # 确认窗内球命中 ≥N 帧判"未撞上"（防单帧闪现）
+AUV_HIT_BACK_S = 2.0             # 每轮后退上限（s）：球重现提前结束；超窗未重现=本轮失败
+AUV_HIT_BACK_SURGE = -0.4        # 倒退推力（负=后退，⚠ 上车首测项；不可用改 0=原地等球 Plan B）
+AUV_HIT_BACK_SEEN_N = 2          # 后退中球重现连续帧确认（原始帧计数，不引 KF）
+AUV_HIT_FAIL_ACTION = 'ascend'   # 轮尽处置：'ascend'=先上浮再置ball_lost | 'skip'=直接置ball_lost
+AUV_HIT_ASCEND_HOLD_S = 6.0      # 上浮保持时长（s，纯定时非闭环）
+AUV_HIT_KF_R_PX2 = 225.0         # KF 量测方差 (15px)²，TODO 实测回填
+AUV_HIT_KF_Q_ACC = 800.0         # KF 过程噪声加速度谱密度，TODO 标定
+AUV_HIT_KF_GATE_NSIGMA = 3.0     # KF 新息门限（+floor≈√R）
+AUV_HIT_KF_RESET_N = 5           # KF 连续拒收 N 帧 → 重置重捕
+AUV_HIT_KF_COAST_S = 0.5         # KF 纯预测滑行窗（≈写端 10Hz 连丢 5 帧）
+AUV_HIT_TRUST_AGE_S = 0.2        # trust 门禁：喂舵新鲜度（≈2 个写帧周期）
+AUV_HIT_KF_SIGMA_MAX = 60.0      # trust 门禁：滤波 σ 上限（px），TODO 实测标定
+AUV_HIT_LOST_S = 2.0             # 真丢处置门限（s）：≥此值本轮失败
+AUV_HIT_W_EMA = 0.3              # 框宽 EMA 系数（近场判据平滑用）
+
 try:                                             # Task1 脚本在 task/ 子目录；move_test 在 sys.path 时引用
     from task import t_task1
     TASK1_TABLE = t_task1.TASK1_TABLE
@@ -99,7 +135,7 @@ except ImportError:
     RETURN_TABLE = []
 
 try:
-    from task import t_hit_ball
+    from task.task_hit_ball import t_hit_ball          # 文件在 task/task_hit_ball/ 子目录
     HIT_BALL_TABLE = t_hit_ball.HIT_BALL_TABLE
 except ImportError:
     HIT_BALL_TABLE = []
@@ -111,7 +147,7 @@ except ImportError:
     PASS_GATE_TABLE = []
 
 try:
-    from task import t_pick_ball
+    from task.task_pick_ball import t_pick_ball        # 文件在 task/task_pick_ball/ 子目录
     PICK_BALL_TABLE = t_pick_ball.PICK_BALL_TABLE
 except ImportError:
     PICK_BALL_TABLE = []
@@ -128,10 +164,11 @@ except ImportError:
 #   DIVE(60)+FWD(x1)=Task1   STRIKE_BALL=HitBall   TURN(θ1)+FWD(x2)=Task2
 #   GATE×N=PassGate   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
-# 当前 t_hit_ball/t_pick_ball 未落地（try-import 置空自动跳过）；PassGateAll 已随
-# task_pass_door 接入（GATE 表非空，其导入链依赖 to32 根目录的 task_pid_controller）。
-# 实际序列（2026-10-07 板端等价路径实测导入）：
-#   Task1 → SearchBall → Task2 → PassGate → Return。
+# 当前 t_hit_ball 已落地（2026-10-07，公共层 task/vservo.py + 轮次重试）；t_pick_ball
+# 仍空骨架（try-import 置空自动跳过）；PassGateAll 已随 task_pass_door 接入
+# （其导入链依赖 to32 根目录的 task_pid_controller）。
+# 实际序列（2026-10-07 板端等价路径实测导入，HitBall 入链后 6 段）：
+#   Task1 → SearchBall → HitBall → Task2 → PassGate → Return。
 STAGE_TABLE = (TASK1_TABLE + SEARCH_BALL_TABLE + HIT_BALL_TABLE + TASK2_TABLE
                + PASS_GATE_TABLE + PICK_BALL_TABLE + RETURN_TABLE)
 
