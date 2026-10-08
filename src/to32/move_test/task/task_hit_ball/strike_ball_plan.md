@@ -1,7 +1,7 @@
 # 「撞球」任务阶段方案（HitBall）v3.1 —— 落地依据（唯一方案源）
 
 状态：**v3.1 已落地**（2026-10-07 17:40：vservo.py + t_hit_ball.py + task_config AUV_HIT_* 30 键 + README_hitball；板端等价导入实测 HitBall 入链 6 段）
-落点：`src/to32/move_test/task/vservo.py`（公共层，新建）/ `task/task_hit_ball/t_hit_ball.py`（状态机，已实现）/ `task_config.py`（AUV_HIT_* 键，已追加）
+落点：`src/to32/move_test/task/task_hit_ball/vservo.py`（公共层，**随本任务文件夹自包含部署**，2026-10-08 用户定）/ `task/task_hit_ball/t_hit_ball.py`（状态机，已实现）/ `task_config.py`（AUV_HIT_* 键，已追加）
 前置总纲：`task/vservo_统一架构与落地规划_2026-10-07.md`（v1.1：公共层零件、三任务参数独立、盲段统一走既有原语）
 使用说明：`task/task_hit_ball/README_hitball.md`（模块划分/状态机/参数速查/上车清单）
 对应工程：GrandRDKv2.5（板端 `/userdata/GrandRDK` 镜像）
@@ -24,7 +24,7 @@
 
 | 模块 | 职责 | 约束 |
 |---|---|---|
-| `task/vservo.py` | 公共零件：KF1D/KF2D/PID/yaw_servo_step/Consec/loss_tier/wrap_deg | **零 task_config 依赖**，参数全部构造注入；不含运动原语 |
+| `task_hit_ball/vservo.py` | 公共零件：KF1D/KF2D/PID/yaw_servo_step/Consec/loss_tier/wrap_deg | **零 task_config 依赖**，参数全部构造注入；不含运动原语；随本文件夹自包含部署（板端整文件夹上传即用） |
 | `task/task_hit_ball/t_hit_ball.py` | HitBallAll 五相位状态机（track/ram/confirm/back/ascend） | 只写状态机；每轮重建 KF/PID（测试模式循环重跑天然安全） |
 | `task_config.py` | AUV_HIT_* 30 键（唯一参数来源） | getattr 兜底；HIT_BALL_TABLE try-import 挂 `task.task_hit_ball` |
 | `t_function.py` | forward_step（ram 盲冲/back 后退，显式 surge+touch_wall）、hover_step（confirm/ascend）、定深链路 | 不动 |

@@ -114,13 +114,13 @@ except ImportError:
     RETURN_TABLE = []
 
 try:
-    from task import t_hit_ball
+    from task.task_hit_ball import t_hit_ball          # 文件在 task/task_hit_ball/ 子目录（vservo 同目录自包含）
     HIT_BALL_TABLE = t_hit_ball.HIT_BALL_TABLE
 except ImportError:
     HIT_BALL_TABLE = []
 
 try:
-    from task import t_pick_ball
+    from task.task_pick_ball import t_pick_ball        # 文件在 task/task_pick_ball/ 子目录
     PICK_BALL_TABLE = t_pick_ball.PICK_BALL_TABLE
 except ImportError:
     PICK_BALL_TABLE = []
@@ -138,8 +138,8 @@ except ImportError:
 #   GATE×N=（穿门段待重写, 2026-10-08 旧 task_pass_door 已整体清理）
 #   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
-# 实际序列（2026-10-08, 穿门清空后）：
-#   Task1 → SearchBall → Task2 → Return。
+# 实际序列（2026-10-08, 穿门清空后；vservo 移入 task_hit_ball/ 自包含、挂点路径修正）：
+#   Task1 → SearchBall → HitBall → Task2 → Return。
 STAGE_TABLE = (TASK1_TABLE + SEARCH_BALL_TABLE + HIT_BALL_TABLE + TASK2_TABLE
                + PICK_BALL_TABLE + RETURN_TABLE)
 

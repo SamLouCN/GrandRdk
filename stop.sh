@@ -14,6 +14,7 @@ pkill -f "src/to32/main.py"          2>/dev/null   # To32 中位机(已注册 SI
 # [2026-10-04 光流停用] 仍保留这行: 万一有旧实例/手动起的 flow_speed 残留, 一并清掉
 pkill -f "src/flow_speed.py"     2>/dev/null   # 光流测速(已停用, 仅清理残留)
 pkill -f "src/show_cam.py"       2>/dev/null   # 第三路相机推流(CAM3 :8084)
+pkill -f "kalman/depth_kalman/main.py" 2>/dev/null # 深度卡尔曼(2026-10-08 起纳入停止范围; main.py 注册了 SIGTERM 处理器, 优雅退出)
 
 sleep 0.5                                    # 给上面的进程留出 SIGTERM 处理时间(默认动作: 退出)
 
@@ -23,7 +24,8 @@ sleep 0.5                                    # 给上面的进程留出 SIGTERM 
 # 进程挂着)。这里在宽限期后对仍存活的进程补一刀 SIGKILL(纯读共享内存, 无状态, 安全)。
 sleep 1.5                                    # 宽限期: 让 SIGTERM 优先走优雅路径
 for pat in "src/front.py" "src/bottom.py" "src/web_server.py" \
-           "src/read_altimeter.py" "src/flow_speed.py" "src/show_cam.py" "src/to32/main.py"; do  # 遍历所有应被停掉的模式
+           "src/read_altimeter.py" "src/flow_speed.py" "src/show_cam.py" "src/to32/main.py" \
+           "kalman/depth_kalman/main.py"; do  # 遍历所有应被停掉的模式
     if pgrep -f "$pat" >/dev/null 2>&1; then  # 还活着: 需要 SIGKILL 兜底
         echo "[stop.sh] 强制结束残留进程: $pat"  # 提示用户: 这条是被强杀的(便于排查)
         pkill -9 -f "$pat" 2>/dev/null       # 发 SIGKILL: 不给进程清理机会, 必定终止
@@ -33,5 +35,6 @@ sleep 0.5                                    # 等 SIGKILL 落实, 避免下一�
 
 echo "[stop.sh] 清理共享内存..."             # 提示开始清理 /dev/shm
 rm -f /dev/shm/momo_*.bin /dev/shm/momo_*.json 2>/dev/null  # 删除所有 momo_ 开头的二进制/JSON(帧、检测、遥测、统计)
+rm -f "$ROOT/src/kalman/depth_kalman/logs/depth_kalman.pid" 2>/dev/null  # 深度卡尔曼 pidfile 一并清掉, 防陈旧 pid 干扰下次判活
 
 echo "[stop.sh] 完成"                        # 全部完成, 给用户收尾提示

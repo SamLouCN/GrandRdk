@@ -34,9 +34,8 @@
 | `t_search_ball.py` | `SearchBallAll`（SEARCH_BALL_TABLE）：右转 60° → 前进 2s → zigzag 扫描，下视见球提前结束 |
 | `t_task4.py` | `Task4All`（TASK4_TABLE）：定深 65cm(离底) → 前进 2s → 悬停 3s（练习段，不入正式序列） |
 | `t_return.py` | `ReturnAll`（RETURN_TABLE）：右转 90° → 前进 5s **touch_wall=True**（触壁提前结束） |
-| `vservo.py` | 视觉伺服公共层：KF1D/KF2D/PID/yaw_servo_step/loss_tier/wrap_deg（撞球/捡球/穿门共用零件库；**零 task_config 依赖**，参数由任务构造注入） |
 | `task_pass_door/` | 穿门全套（**已落地**）：`t_pass_gate.py`（PassGateAll，复用 `TaskPidController` 的 S100 GatePid）+ `gate_config/gate_filter/gate_pid/gate_mission/gate_vision/replay_gate_a` |
-| `task_hit_ball/` | 撞球（**2026-10-07 v3.1 已落地**）：`t_hit_ball.py`（HitBallAll，五相位轮次重试 TRACK→RAM→CONFIRM，轮间 BACK，AUV_HIT_* 参数全在 task_config） |
+| `task_hit_ball/` | 撞球（**2026-10-07 v3.1 已落地，文件夹自包含**）：`t_hit_ball.py`（HitBallAll，五相位轮次重试 TRACK→RAM→CONFIRM，轮间 BACK）+ `vservo.py`（视觉伺服公共层：KF1D/KF2D/PID/yaw_servo_step/loss_tier/wrap_deg，**零 task_config 依赖**，捡球/穿门可复用）+ `README_hitball.md`；AUV_HIT_* 参数全在 task_config |
 | `task_pick_ball/` | 捡球（**空骨架**）：`t_pick_ball.py`，`PICK_BALL_TABLE=[]`（实现后替换 `[PickBallAll]`） |
 
 数据格式与 v2.2 写端**完全兼容**（front/bottom/depth_kalman 不用改）。

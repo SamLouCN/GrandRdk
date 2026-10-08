@@ -10,6 +10,7 @@
 #   show_cam.py    第三路相机 (按需采集: 上位机取流才开相机) -> MJPEG :8084 (上位机 CAM3)
 #   web_server.py  0.0.0.0:5000        -> 读共享内存 (上位机直连 /cam1 /cam2)
 #   src/to32/main.py 中位机               -> 上位机 UDP 8080/8081 + 下位机 CH348 F 口
+#   src/kalman/depth_kalman 深度卡尔曼    -> 读 momo_telemetry/momo_alt, 写 momo_depth (随 run.sh/stop.sh 起停)
 #   Nginx          :80                  -> 静态 + 反代 (网页端, 可 --no-nginx)
 #
 # 用法:
@@ -26,6 +27,7 @@
 #   ./run.sh --to32-dir /path    # To32 目录 (默认 <项目根>/src/to32)
 #   ./run.sh --to32-estop        # 保留 To32 的自动急停+锁存 (默认: 关闭)
 #   ./run.sh --to32-args "--mode rov"   # To32 附加参数透传
+#   ./run.sh --no-depthkf        # 不启动深度卡尔曼 (默认拉起; stop.sh 会一并停掉)
 #   ./run.sh --no-flow           # 不启动光流测速
 #   ./run.sh --flow-args "--fps 30 --port 8000"   # 光流测速附加参数透传
 #   ./run.sh --no-showcam        # 不启动第三路相机推流(CAM3)
@@ -56,6 +58,7 @@ NO_NGINX=0 # 1=不 reload Nginx
 SETUP_ONLY=0 # 1=只做初始化就退出
 NO_ALTIMETER=0 # 1=不启动高度计
 NO_TO32=0 # 1=不启动中位机
+NO_DEPTHKF=0 # 1=不启动深度卡尔曼（默认常驻，见 3.65 段）
 TO32_ESTOP=0 # 1=保留中位机自动急停与锁存
 TO32_DIR="$SRC_DIR/to32" # 中位机目录，可用 --to32-dir 覆盖
 NO_FLOW=0 # 1=不启动光流测速
@@ -82,6 +85,7 @@ while [ $# -gt 0 ]; do # 还有参数就继续解析
         --alt-no-udp)     ALT_ARGS+=("--no-udp"); shift ;;
         --alt-args)       ALT_ARGS_STR="$2"; shift 2 ;;
         --no-to32)        NO_TO32=1; shift ;;
+        --no-depthkf)     NO_DEPTHKF=1; shift ;;
         --to32-dir)       TO32_DIR="$2"; shift 2 ;;
         --to32-estop)     TO32_ESTOP=1; shift ;;
         --to32-args)      TO32_ARGS_STR="$2"; shift 2 ;;
@@ -196,6 +200,8 @@ pkill -f "src/read_altimeter.py" 2>/dev/null # 杀掉上一轮高度计进程
 pkill -f "src/to32/main.py" 2>/dev/null # 杀掉上一轮中位机进程
 pkill -f "src/flow_speed.py" 2>/dev/null # 杀掉上一轮光流进程
 pkill -f "src/show_cam.py" 2>/dev/null # 杀掉上一轮第三路相机进程
+pkill -f "kalman/depth_kalman/main.py" 2>/dev/null # 杀掉上一轮深度卡尔曼（2026-10-08 起随 run.sh 生命周期）
+rm -f "$SRC_DIR/kalman/depth_kalman/logs/depth_kalman.pid" 2>/dev/null # 顺手清掉陈旧 pidfile
 sleep 0.5 # 给被杀进程一点退出时间
 
 # 清理旧的共享内存（避免读到脏数据）
@@ -292,6 +298,43 @@ else # 正常启动中位机
         info "To32 中位机已启动: pid=$PID_TO32" # 打印中位机 PID
     fi # 中位机探活结束
 fi # 中位机启动段结束
+
+# ============================================================
+# 3.65 启动深度卡尔曼 (src/kalman/depth_kalman) —— [2026-10-08 起由本脚本托管]
+#     - 生命周期与 front/bottom/to32 同款: 清理段 pkill 上一轮实例, 本段拉起新的,
+#       stop.sh / Ctrl-C(cleanup) / 主链路退出都会停它。ROV 模式下 $TEL[41/42]
+#       的融合深度/净空恒有值 (tel_builder 持续读 momo_depth.json)。
+#     - 幂等双保险: 本段 pidfile+kill -0 判活 (兜住 kill -9 残留等漏网场景,
+#       活着就复用不起第二个); kalman_launcher.py 进 AUV 模式时同样判活复用 ——
+#       双进程同时写 momo_depth.json 会打架, 任何路径都绝不双开。
+#     - 启动失败仅告警, 不终止 run.sh (AUV 任务会走降级路径)。
+# ============================================================
+DEPTHKF_DIR="$SRC_DIR/kalman/depth_kalman" # 深度卡尔曼工程根（与板端 /userdata/GrandRDK 布局一致）
+DEPTHKF_PIDFILE="$DEPTHKF_DIR/logs/depth_kalman.pid" # run.sh --daemon 写的 pid 文件
+DEPTHKF_PID="" # 汇总展示用，未启动/复用失败时为空
+_depthkf_alive() { # pidfile 判活: 文件在且里面的 pid 活着才返回 0
+    [ -f "$DEPTHKF_PIDFILE" ] || return 1 # 没有 pidfile 视为没在跑
+    kill -0 "$(cat "$DEPTHKF_PIDFILE" 2>/dev/null)" 2>/dev/null # 信号 0 只探活
+}
+if [ "$NO_DEPTHKF" = "1" ]; then # 显式关闭
+    info "--no-depthkf, 跳过深度卡尔曼" # 提示跳过
+elif [ ! -f "$DEPTHKF_DIR/run.sh" ]; then # 工程不存在
+    warn "未找到 $DEPTHKF_DIR/run.sh, 跳过深度卡尔曼" # 告警跳过
+elif _depthkf_alive; then # 漏网实例还在跑（kill -9 残留等）: 复用, 绝不起第二个
+    DEPTHKF_PID="$(cat "$DEPTHKF_PIDFILE" 2>/dev/null)" # 记下 pid 供汇总展示
+    info "深度卡尔曼已在运行 (pid=$DEPTHKF_PID), 复用不重启" # 幂等核心提示
+else # 正常拉起
+    info "启动 depth_kalman (深度卡尔曼, 常驻后台)" # 提示启动
+    ( cd "$DEPTHKF_DIR" && exec ./run.sh --daemon ) 2>&1 \
+        | sed 's/^/[depthkf] /' # 借它的 --daemon 落 pidfile; 输出加前缀防与总 run.sh 的 [run.sh] 混淆
+    sleep 1 # 探活前稍等
+    if _depthkf_alive; then # 探活成功
+        DEPTHKF_PID="$(cat "$DEPTHKF_PIDFILE" 2>/dev/null)" # 记 pid
+        info "深度卡尔曼已启动: pid=$DEPTHKF_PID (日志 $DEPTHKF_DIR/logs/depth.log)" # 打印 pid 与日志位置
+    else # 探活失败
+        warn "深度卡尔曼未存活, 查看 $DEPTHKF_DIR/logs/depth.log (不影响主链路)" # 只告警不终止
+    fi # 深度卡尔曼探活结束
+fi # 深度卡尔曼启动段结束
 
 # ============================================================
 # 3.7 光流测速 (flow_speed.py) —— [2026-10-04 已停用]
@@ -411,6 +454,7 @@ info " 前视 pid : $PID_FRONT" # 打印前视 PID
 info " 下视 pid : $PID_BOTTOM" # 打印下视 PID
 [ -n "$PID_ALT" ]    && info " Alt  pid : $PID_ALT" # 高度计启动成功才打印该行
 [ -n "$PID_TO32" ]   && info " Mid  pid : $PID_TO32" # 中位机启动成功才打印该行
+[ -n "$DEPTHKF_PID" ] && info " DKF  pid : $DEPTHKF_PID" # 深度卡尔曼启动成功才打印该行
 [ -n "$PID_WEB" ]    && info " Web  pid : $PID_WEB" # Web 启动成功才打印该行
 info " 日志目录 : $LOG_DIR" # 打印日志目录
 [ -n "$PID_FLOW" ]   && info " 光流画面 : http://$BOARD_IP:$(read_cfg FLOW_WEB_PORT)/" # 打印光流页面地址
@@ -430,7 +474,8 @@ echo "" # 输出空行
 cleanup() { # 收到 INT/TERM 时的收尾处理
     echo "" # 输出空行
     info "收到停止信号, 清理进程..." # 提示开始清理
-    kill $PID_FRONT $PID_BOTTOM $PID_ALT $PID_TO32 $PID_FLOW $PID_SHOWCAM $PID_WEB 2>/dev/null # 逐个终止子进程，忽略空 PID 与已退出
+    # depth_kalman 2026-10-08 起纳入停止范围（$DEPTHKF_PID 可能来自复用的漏网实例, 一并停）
+    kill $PID_FRONT $PID_BOTTOM $PID_ALT $PID_TO32 $PID_FLOW $PID_SHOWCAM $PID_WEB $DEPTHKF_PID 2>/dev/null # 逐个终止子进程，忽略空 PID 与已退出
     wait 2>/dev/null # 等待所有后台任务收尸
     info "全部已停止" # 提示清理完成
     exit 0 # 正常退出
@@ -440,6 +485,6 @@ trap cleanup INT TERM # 捕获 Ctrl-C 与 TERM 信号
 # 等待任一检测进程退出（有限帧模式会自然退出）
 wait $PID_FRONT $PID_BOTTOM 2>/dev/null # 阻塞等待任一检测进程退出，有限帧模式会自然结束
 info "检测进程已退出" # 提示主链路已结束
-kill $PID_ALT $PID_TO32 $PID_FLOW $PID_SHOWCAM $PID_WEB 2>/dev/null # 主链路退出后停掉其余子进程，防止留下孤儿进程
+kill $PID_ALT $PID_TO32 $PID_FLOW $PID_SHOWCAM $PID_WEB $DEPTHKF_PID 2>/dev/null # 主链路退出后停掉其余子进程，防止留下孤儿进程（含深度卡尔曼）
 wait 2>/dev/null # 等待剩余子进程全部退出
 info "run.sh 结束" # 打印结束提示

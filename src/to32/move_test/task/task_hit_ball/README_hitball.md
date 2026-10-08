@@ -17,7 +17,7 @@ STAGE_TABLE 实测 6 段（板端等价路径导入验证，2026-10-07）。HitB
 
 | 层 | 文件 | 职责 | 关键约束 |
 |---|---|---|---|
-| **公共零件层** | `task/vservo.py` | `KF1D`（1D CV 卡尔曼）/ `KF2D`（捡球备用糖）/ `PID` / `yaw_servo_step`（误差→PID→递推目标角）/ `Consec`（连续命中计数）/ `loss_tier`（丢失三级节拍）/ `wrap_deg` | **零 task_config 依赖**，参数全部构造注入；不含任何推力原语；捡球/穿门将来直接复用 |
+| **公共零件层** | `task_hit_ball/vservo.py`（**本文件夹内，自包含**） | `KF1D`（1D CV 卡尔曼）/ `KF2D`（捡球备用糖）/ `PID` / `yaw_servo_step`（误差→PID→递推目标角）/ `Consec`（连续命中计数）/ `loss_tier`（丢失三级节拍）/ `wrap_deg` | **零 task_config 依赖**，参数全部构造注入；不含任何推力原语；捡球/穿门将来 `from task.task_hit_ball import vservo` 复用 |
 | **任务状态机层** | `task/task_hit_ball/t_hit_ball.py` | `HitBallAll(Stage)`：五相位轮次循环（track / ram / confirm / back / ascend） | 只写状态机；滤波数学在 vservo、运动原语在 t_function；每轮重建 KF/PID 实例 |
 | **参数层** | `task_config.py` | `AUV_HIT_*` 30 键（唯一参数来源） | getattr 兜底；调参不改代码；与其他任务键空间隔离 |
 

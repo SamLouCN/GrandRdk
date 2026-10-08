@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """vservo.py —— 视觉伺服公共层（KF1D/KF2D/PID/yaw_servo_step/丢失节拍工具）
 
-定位（vservo_统一架构与落地规划_2026-10-07 v1.1 §1）：
-    撞球/捡球/穿门三任务共用的"零件库"——只给零件，不给参数：
-    - 本文件 **零 task_config 依赖**（不出现任何 getattr(TC, ...)），
-      全部参数由任务文件在 enter()/重建时构造注入（AUV_<任务>_* 键随任务走）。
+落点（2026-10-08 用户定）：**随撞球任务文件夹自包含部署**——本文件与 t_hit_ball.py
+同目录（task_hit_ball/），板端整文件夹上传即用，不依赖 task/ 根有公共层。
+捡球/穿门将来复用：`from task.task_hit_ball import vservo`，或把本文件复制进
+各自任务文件夹（改哪份要同步哪份）。
+
+零件库原则（vservo_统一架构与落地规划_2026-10-07 v1.1 §1）：
+    - **零 task_config 依赖**（不出现任何 getattr(TC, ...)），全部参数由任务
+      文件在 enter()/重建时构造注入（AUV_<任务>_* 键随任务走）。
     - 运动原语不在这里：盲段统一复用 t_function 的 forward_step/hover_step
       （2026-10-07 09:23 用户拍板，本文件不含任何推力指令）。
 
@@ -17,7 +21,7 @@
     loss_tier       丢失三级节拍：按 age 分 coast / freeze / lost 档
     wrap_deg        角度 wrap 到 [-180, 180)
 
-★ 设计红线（v2.2 viskf 真机教训，详见 task_hit_ball/strike_ball_plan.md §4）：
+★ 设计红线（v2.2 viskf 真机教训，详见 task_hit_ball/strike_ball_plan.md §3）：
     1. trust 门禁：只有"新帧 age ≤ trust_age_s 且 σ ≤ sigma_max"的输出才准进
        PID——绝不拿长时间外推值控舵（外推垃圾喂舵 = 满舵乱转）。
     2. 新息门限 = nsigma·sqrt(S) + floor(sqrt(R))（无 floor 好观测会被误拒，
@@ -44,8 +48,8 @@ class KF1D(object):
         丢帧拍:  kf.predict(now)                → 把状态滚到 now
         喂舵前:  kf.trust_ok(now, sigma_max)    → 只有 True 才准更新 PID
 
-    st 无外置状态：滤波状态全在实例里；测试模式循环重跑须重建实例
-    （任务文件在每轮进入伺服时重建，天然安全）。
+    滤波状态全在实例里（无外置 st）：测试模式循环重跑须重建实例
+    （t_hit_ball 每轮进入 track 时重建，天然安全）。
     """
 
     def __init__(self, r, q_acc, gate_nsigma=3.0, reset_n=5, trust_age_s=0.2):
@@ -199,9 +203,7 @@ def yaw_servo_step(st, pid, err, dt, sign=1.0):
     """前视族共用的一步航向伺服：err → PID → 递推目标角（撞/门同一语义）。
 
     st['yaw_ref'] 由调用方在进入伺服前初始化（= 交棒/起步时的当前实际航向，
-    ★ 取遥测 actual_yaw 原始值，**不镜像** —— 原始值即任务系；固件取负由下发侧
-    mode_auv 镜像一次抵消，这里再镜像 = 伺服符号反转，永远追不上目标）；
-    本函数每拍递推：
+    经 apply_yaw_mirror 镜像到任务系）；本函数每拍递推：
         yaw_ref ← wrap(yaw_ref + sign · PID(err))
     返回 (yaw_ref, out)。
 
@@ -239,7 +241,7 @@ def loss_tier(age, coast_s, lost_s):
         coast_s < age < lost_s → 'freeze'  冻结：yaw_ref 保持上拍 + surge 继续
         age ≥ lost_s           → 'lost'    真丢：触发调用方处置（重试/退出）
 
-    推导（strike_ball_plan.md §4.2）：coast=0.5s ≈ 写端 10Hz 连丢 5 帧；
+    推导（strike_ball_plan.md §3.2）：coast=0.5s ≈ 写端 10Hz 连丢 5 帧；
     lost=2.0s 区分瞬时丢与真丢。门限由调用方传参，本函数不读配置。
     """
     if age >= float(lost_s):

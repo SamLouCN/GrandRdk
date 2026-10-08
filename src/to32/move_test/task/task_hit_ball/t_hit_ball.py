@@ -3,8 +3,9 @@
 
 定位（与 t_task1/t_search_ball 同构；方案源 task_hit_ball/strike_ball_plan.md v3.1）：
     - STAGE_TABLE 一项 = 整个撞球任务，可单独测试（TEST_TABLE 引 HIT_BALL_TABLE）
-    - 模块化分工：滤波/PID/递推环用公共层 task/vservo.py（构造注入 AUV_HIT_* 键，
-      参数独立）；盲段（后退/盲冲/悬停确认/上浮）复用 t_function 原语；
+    - 模块化分工：滤波/PID/递推环用**同目录公共层 vservo.py**（随本文件夹自包含
+      部署，板端不依赖 task/ 根；构造注入 AUV_HIT_* 键，参数独立）；
+      盲段（后退/盲冲/悬停确认/上浮）复用 t_function 原语；
       本文件只写状态机，不含滤波数学、不含推力原语
     - 只闭 yaw：dy 由定深消化；yaw 递推公式
       yaw_ref ← wrap(yaw_ref + AUV_HIT_YAW_SIGN · PID(ex_kf))
@@ -43,7 +44,8 @@ for _p in (_HERE, _PARENT):
 import task_config as TC
 from mission import Stage
 import t_function
-import vservo
+import vservo    # 同目录公共层（_HERE 已入 sys.path；本文件夹自包含，随包上传即用）
+
 
 
 class HitBallAll(Stage):
