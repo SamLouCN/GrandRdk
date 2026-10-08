@@ -16,14 +16,19 @@ def main():
     parser.add_argument('--input', type=Path, default=ROOT/'runs/cv_improved')
     parser.add_argument('--out', type=Path, default=ROOT/'runs/contrast_comparison')
     parser.add_argument('--baseline', type=Path, help='Optional previous output: compare counts and per-frame YOLO detections')
+    parser.add_argument('--verify-source', action='store_true',
+                        help='Decode source videos with ffprobe and require every source frame in the outputs')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     rng = random.Random(20261008)
     validation = {}
     panels = []
     recovered_panels = []
-    for name in ('DOOR_TEST_1', 'DOOR_TEST_2', 'DOOR_TEST_3'):
-        directory = args.input/name
+    directories = sorted(path.parent for path in args.input.glob('*/summary.json'))
+    if not directories:
+        parser.error(f'No completed video outputs found in {args.input}')
+    for directory in directories:
+        name = directory.name
         summary = json.loads((directory/'summary.json').read_text(encoding='utf-8'))
         rows = [json.loads(line) for line in (directory/'rows.jsonl').read_text(encoding='utf-8').splitlines()]
         assert len(rows) == summary['frames']
@@ -72,6 +77,16 @@ def main():
             panels.append(np.hstack(pair))
         validation[name] = dict(frames=len(rows), pose_records=len(poses),
                                  random_frames=indices, videos=probes)
+        if args.verify_source:
+            source_probe = json.loads(subprocess.check_output([
+                'ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height,avg_frame_rate,nb_frames,nb_read_frames',
+                '-of', 'json', summary['source']], text=True))['streams'][0]
+            assert int(source_probe['nb_read_frames']) == len(rows), f'{name}: source frames were skipped'
+            assert [source_probe['width'], source_probe['height']] == summary['size']
+            source_num, source_den = map(float, source_probe['avg_frame_rate'].split('/'))
+            assert abs(source_num/source_den-summary['fps']) < 1e-4
+            validation[name]['source'] = source_probe
         model_counts = {}
         for row in rows:
             gate = row['nearest_gate']

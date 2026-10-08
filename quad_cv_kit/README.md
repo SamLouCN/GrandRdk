@@ -24,6 +24,15 @@ CV 在所选搜索区域内按可见管子的像素粗细选择，粗细相近�
 
 ## CV 预处理与 UI 回正提示
 
+仅导出高对比度预处理视频（不加载 YOLO、不运行门框检测、不叠加标注）：
+
+```powershell
+python demo/demo_preprocess_video.py E:/TEST/DOOR_TEST_4.avi --preview-only
+python demo/demo_preprocess_video.py E:/TEST/DOOR_TEST_4.avi --profile high
+```
+
+输出到 `runs/door4_high_contrast/`：完整视频 `DOOR_TEST_4_high_contrast.mp4`、抽帧档位对照 `comparison.jpg` 和参数记录 `summary.json`。默认沿用摄像头校正，保持源分辨率和帧率；`--no-correction` 可直接增强原画面。`src/cv_preprocessing.py` 先对 HSV 亮度通道双边降噪和轻度高斯平滑，再做 CLAHE、有效像素 1%/99% 分位拉伸、柔和对比度曲线、轻度锐化及饱和度增强。`high` 档采用 CLAHE 限幅 2.5、混合 0.65、曲线参数 1.6、饱和度 1.4 倍、锐化 0.2；另提供 `moderate/strong` 档。增强仍可能放大原视频的压缩块；此入口只验证图像输出，不统计识别率，现有检测入口的默认预处理不随之改变。
+
 从 `D:/Projects/red_gate_improved` v3 选择迁移的部分：LAB 红色通道与多尺度局部色差证据、颜色通道 LSD 候选线、沿杆搜索和短断口连接、独立四线组合、逐边颜色覆盖验证。实现位于 `src/gate_models.py`，不依赖外部目录。新完整框不要求白角先被分割出来：两横两竖四条实测红杆求交，每条边剔除不超过 10% 的端部检查区，分八段检查颜色覆盖，限制红杆向交点的延伸。端部延伸上限为检测画布中的 `max(22px, 2.2*杆宽)`，并检查相对方向、管径、凸性、面积、搜索区域和校正有效像素。没有第四根杆时不生成完整框；残缺前景门继续使用已有端点链逻辑和管径选择。
 
 增强帧用于提线和光流；干净校正帧用于颜色证据和白角判断。增强出的红色只允许补充原色掩膜附近的支持，减少饱和度增强造成的误检。弱 LAB 证据只用于四边联合验证；残缺门再用原有严格红色掩膜裁短杆线，防止偏色白支撑腿被延长成红杆。裁短后仍要求长度至少为检测画布中的 35px、长宽比至少为 5，避免白腿上的短红斑加入近门并导致整组候选被拒绝；残缺门原有的显著红色检查使用增强帧，白角分割单独使用干净帧。已验证的完整四线模型跳过旧端点连通筛选；跟踪时重新验证当前帧各边，失去支持则降级。`nearest_gate.model/side_support` 分别记录模型来源和本帧逐边颜色支持，`observed_segments` 保留测得的红杆范围，白角补线仍单独绘制。四线联合验证可以减少跨门混边，仍不能保证高度重叠门的实例归属。
@@ -38,6 +47,17 @@ python demo/diagnose_gate_models.py runs/cv_gate_models/DOOR_TEST_3 399 --out ru
 ```
 
 三段视频共5145帧的迁移对比已完成：新检测完整框从173帧增至478帧，新检测姿态可用帧从149帧增至315帧；YOLO逐帧检测列表完全一致，九份视频通过全量解码核验，80项回归测试通过。完整框数是可用性指标，尚无逐帧人工真值来计算准确率；部分完整框仍因姿态残差过大而拒绝输出角度和位移。本轮含推理与三视图导出的CPU吞吐量约8.25帧/秒，基线约10.26帧/秒。详情、抽帧与九份视频链接见 [迁移报告](runs/cv_gate_models/migration_report.md)。
+
+新视频4/5/6的测试输出使用 `runs/cv_gate_models_456/<视频名>/`。AVI 若由 OpenCV 读取时提前结束，而独立 FFmpeg 能完整解码，可加 `--reader ffmpeg` 直接流式读取源文件，无需转码或改变分辨率。该参数只切换视频解码，YOLO/CV 参数不变；`summary.json` 记录 `input_reader/expected_frames/input_frame_count_matches`。核验脚本自动发现输入目录下的已完成视频，`--verify-source` 独立解码源文件并检查输出未缺帧。
+
+4/5/6已完整测试共13703帧，完整框276/51/206帧，姿态可用128/37/142帧（包含跟踪）。三个源视频和九份输出全部通过帧数、尺寸与帧率核验；第4段使用FFmpeg解决OpenCV第7531帧提前结束的问题。详情与视频链接见 [4/5/6测试报告](runs/cv_gate_models_456/test_report.md)。
+
+```powershell
+python demo/demo_video_cv_improved.py E:/TEST/DOOR_TEST_4.avi --out runs/cv_gate_models_456 --device cpu --export-cv-input --reader ffmpeg
+python demo/demo_video_cv_improved.py E:/TEST/DOOR_TEST_5.avi --out runs/cv_gate_models_456 --device cpu --export-cv-input
+python demo/demo_video_cv_improved.py E:/TEST/DOOR_TEST_6.avi --out runs/cv_gate_models_456 --device cpu --export-cv-input
+python demo/validate_cv_retest.py --input runs/cv_gate_models_456 --out runs/cv_gate_models_456/validation --verify-source
+```
 
 改进 demo 默认仅增强 CV 输入：HSV 亮度通道 CLAHE（8×8 网格、限幅 2.0、混合比例 0.6）→ 1.20 倍对比度 → 亮度通道反遮罩锐化（强度 0.6、高斯 sigma=1.2px、低于 3 级的亮度细节不增强）→ HSV 饱和度提高至 1.25 倍并限幅。色相保持，避免分别均衡 B/G/R 引起色偏；无效校正边界最终原样恢复。YOLO 输入为干净校正图，CV 光流与新检测使用同一增强帧。`--cv-clahe-clip`（0..8）、`--cv-clahe-blend`（0..1）、`--cv-contrast`（1..1.5）、`--cv-sharpen`（0..2，0 关闭锐化）及 `--cv-saturation`（1..2，1 关闭饱和度提高）可调。`--cv-sharpen 0 --cv-saturation 1` 恢复上一轮仅对比度增强；再加 `--cv-contrast 1 --cv-clahe-clip 0` 完全关闭预处理。参数写入 `camera_used.json`、逐帧记录和汇总。
 
