@@ -25,9 +25,19 @@ st dict 里(键见各函数 docstring)——同一函数可被多个阶段实例
   3. AUV 模式下 0x09 每帧都必须带正的 depth_cm(frame_motion 会把 0 原样下发,
      固件把它当"目标深度 0 = 水面")。原语在未显式给定深时**沿用上一拍的定深目标**
      (st['last_height_cm']),首拍无沿用值时用 AUV_DEFAULT_HEIGHT_CM。
-  4. yaw 坐标系：cmd['yaw'] 一律给**任务系**绝对角；固件系镜像由 mode_auv.tick
-     的 apply_yaw_mirror 统一处理(本文件读回遥测时也用同一函数镜像回来,自逆)。
-  5. 完成判据(2026-10-06 用户口径)：Dive/Turn **无超时兜底** —— 判据失效
+  4. yaw 坐标系(★ 2026-10-08 板端实锤修正，勿再镜像两次)：
+     **遥测 actual_yaw 的原始数值系 == 任务系**(与 ROV 模式 target_yaw_deg 锚定口径、
+     PassGate 直接读 tel['actual_yaw'] 的口径一致)。cmd['yaw'] 给该系的绝对角；
+     固件对 Yaw 取负，只在**下发侧**由 mode_auv.tick 的 apply_yaw_mirror 抵消**一次**。
+     本文件判据侧(yaw_err_deg / _yaw_hold)一律**不做镜像**。
+     两侧都镜像 = 闭环符号反转：实测 err 恒等于「目标 + 当前」(日志里 +123°)、
+     ok_cnt 永远 0 → 任务永久卡在第一个转向子步骤(2026-10-08 to32_main.log 实锤：
+     0x09 yaw 下发 -61.1°，遥测 actual_yaw +62.0°，镜像后 err 恒 123°，t=442s 仍 ok=0/10)。
+  5. 推力坐标系(2026-10-08)：cmd['surge']/cmd['sway'] 给**任务系**值
+     (正 surge = 前进/前冲, 正 sway = 右移)。固件方向由输出侧
+     (mode_auv.tick / test_runner.tick) 按 AUV_SURGE_SIGN / AUV_SWAY_SIGN **各施加一次**
+     —— 原语内不许再乘符号(否则双重取反)，加推力的任务(撞球/过门/捡球)也走同一处。
+  6. 完成判据(2026-10-06 用户口径)：Dive/Turn **无超时兜底** —— 判据失效
      (融合深度缺失 / 无 yaw 遥测)即永不完成、持续下发；Forward/Sway/Hover
      定时即完成方式(touch_wall 模式可被 IMU 触壁判据提前结束)。
 
@@ -67,15 +77,20 @@ def target_depth_cm(target_height_cm):
 
     depth_cm = 实测水深(AUV_POOL_DEPTH_CM) − 目标高度 − 机体高度(20cm)
     例：水深 130、目标高度 60 → depth_cm = 50。
+    ★ 该目标是**固件深度计帧**（深度计装在机体上部，故减机体高度）；判据侧若用
+    融合值（探头帧、比深度计低约一个机体高度）比差，必须换成 clearance 或
+    「pool − 目标高度」——两帧直接相减恒差 ~20cm（见 dive_step）。
+    ⚠ AUV_POOL_DEPTH_CM 必须是**实测水深**：2026-10-08 融合实测 H≈1.068m，
+    而配置仍写 130cm ⇒ 定深目标整体偏深 ~23cm（离底 60cm 实际只到 ~37cm）。
     """
-    pool = float(getattr(TC, 'AUV_POOL_DEPTH_CM', 130))
+    pool = float(getattr(TC, 'AUV_POOL_DEPTH_CM', 106))
     body = float(getattr(TC, 'AUV_BODY_HEIGHT_CM', BODY_HEIGHT_CM))
     return pool - float(target_height_cm) - body
 
 
 def clamp_depth_cm(depth_cm):
     """定深目标安全钳位：下限 = 离面安全余量(防露头红线),上限 = 贴底。"""
-    pool = float(getattr(TC, 'AUV_POOL_DEPTH_CM', 130))
+    pool = float(getattr(TC, 'AUV_POOL_DEPTH_CM', 106))
     body = float(getattr(TC, 'AUV_BODY_HEIGHT_CM', BODY_HEIGHT_CM))
     surf = float(getattr(TC, 'AUV_SURF_SAFE_CM', _SURF_SAFE_CM))
     lo = surf
@@ -84,14 +99,13 @@ def clamp_depth_cm(depth_cm):
 
 
 def yaw_err_deg(actual_yaw_tel, target_yaw_deg):
-    """遥测航向(固件系)与任务系目标角的带符号误差(°),wrap 到 [-180,180]。
+    """遥测航向(任务系)与目标角的带符号误差(°),wrap 到 [-180,180]。
 
-    遥测的 actual_yaw 是固件坐标系(固件对 Yaw 取负),用 apply_yaw_mirror
-    镜像回任务系再比差(mirror 自逆,下发侧 mode_auv 已统一处理)。
+    ★ 判据侧**不做任何镜像**(2026-10-08 修正)：actual_yaw 原始数值即任务系，
+    target_yaw_deg 也是任务系 → 直接相减。固件取负由 mode_auv.tick 在**下发侧**
+    镜像一次抵消；这里再镜像 = 双重镜像 = 符号反转，判据永不满足(见文件头口径 4)。
     """
-    mirror = bool(getattr(TC, 'YAW_MIRROR', True))
-    a = apply_yaw_mirror(actual_yaw_tel, mirror)
-    e = float(target_yaw_deg) - a
+    e = float(target_yaw_deg) - float(actual_yaw_tel)
     while e > 180.0:
         e -= 360.0
     while e < -180.0:
@@ -134,14 +148,15 @@ def _depth_out(st, target_height_cm):
 
 
 def _yaw_hold(st, ctx):
-    """「保持当前航向」：每拍用遥测刷新任务系锁定角(跟随式,抗漂移)。
+    """「保持当前航向」：每拍用遥测刷新锁定角(跟随式,抗漂移)。
 
-    返回任务系 yaw 目标；无遥测时返回上次锁定值,从未有过则 None
+    返回 yaw 目标(**任务系 = 遥测原始数值系，不镜像**；下发侧由 mode_auv 镜像一次)；
+    无遥测时返回上次锁定值,从未有过则 None
     (调用侧回落 0.0 并节流警告 —— 无遥测时航向保持不可靠,运行期须保证 $TEL 正常)。
     """
     y = _tel_f(ctx, 'actual_yaw')
     if y is not None:
-        st['yaw_ref'] = apply_yaw_mirror(y, bool(getattr(TC, 'YAW_MIRROR', True)))
+        st['yaw_ref'] = float(y)
         st['yaw_ok'] = True
     return st.get('yaw_ref')
 
@@ -203,6 +218,36 @@ def _cmd(stage, note, yaw, depth, surge=0.0, sway=0.0):
             'stop': 0}
 
 
+# ------------------------------------------------------------------ 子步骤等待 / 相对转向锁存
+def wait_cmd(stage='Wait', note='等遥测'):
+    """「本拍不下发 0x09」的占位 cmd（mode_auv / test_runner 见 paused 立即 return）。
+
+    用途：子步骤判据所依赖的遥测尚未到位时**等待** —— Mission 不会把本拍当成
+    「阶段完成」(必须返回 None 才算完成)，链路也不会发出危险目标。
+    与 task_pass_door.t_pass_gate 的 `paused=True` 同一契约。
+    """
+    return {'stage': stage, 'note': note, 'paused': True}
+
+
+def lock_turn_target(ctx, st, now, deg, key='turn_tgt', stage='Turn'):
+    """相对转向目标角锁存（Turn 族共用）：当前 yaw + deg（**同系直接相加，不镜像**）。
+
+    返回 float 目标角(任务系)；**未拿到 yaw 遥测 → 返回 None**，调用方必须回
+    wait_cmd()（本拍不下发），等遥测到位后再锁存。★ 绝不允许以 0 兜底：
+    锁 0 = 命令转到绝对航向 0°（错误且危险）；NaN 还会让 0x09 组帧
+    int(round(nan*100)) 抛异常 → 阶段被 Mission 判为异常直接收尾。
+    锁存后本子步骤内不再变化（一次切入只锁一次）。deg 语义：右为正（用户口径）。
+    """
+    if st.get(key) is None:
+        y = _tel_f(ctx, 'actual_yaw')
+        if y is None:
+            _say_throttled(ctx, st, now,
+                           '%s 切入时无 yaw 遥测 → 本拍不下发，等遥测（不以 0 兜底）' % stage)
+            return None
+        st[key] = float(y) + float(deg)
+    return st[key]
+
+
 # ------------------------------------------------------------------ 
 # 原语 1：下潜定深
 def dive_step(ctx, st, now, dt, target_height_cm,
@@ -210,8 +255,14 @@ def dive_step(ctx, st, now, dt, target_height_cm,
     """下潜定深到「距池底 target_height_cm」。
 
     行为(Task.md §4.1 Dive)：surge/sway=0,depth_cm 闭环(固件内),yaw 保持当前航向。
-    完成(2026-10-06 口径)：**kalman 融合深度**(ctx.depth → DepthIF)连续 hold_n 拍
-    落在 [目标±tol_cm] 带内 —— 融合值是唯一判据,不与固件深度计混判。
+    完成(2026-10-08 修帧)：**kalman 融合的「离底净空」clearance**(ctx.depth → DepthIF,
+    即融合自己算的高度计离底高度 m)连续 hold_n 拍落在 [目标高度±tol_cm] 内 ——
+    判据与 target_height_cm 是**同一个物理量、同一个融合源**。
+    ⚠ 旧写法拿融合 D(探头帧：探头装舱底,比上部深度计低约一个机体高度 20cm)去比
+    d_target(固件深度计帧,已减过 20cm 机体高度) = **两帧混比**，实测恒定差 19.5cm
+    > tol 8cm ⇒ Dive 永远完不成（2026-10-08 板端实锤：固件深度 49.6cm / 融合 D 69.4cm）。
+    退化路径：clearance 缺失时改用同帧 D 判据 |D − (AUV_POOL_DEPTH_CM − 目标高度)|
+    (同样不减机体高度)。
     ★ 无兜底(2026-10-06 用户口径)：融合源 !ok(depth_kalman 未起/超期/σ 超限)
     或未入带期间**永不完成**,持续下发定深指令(要完成须先拉起 depth_kalman)。
 
@@ -220,9 +271,9 @@ def dive_step(ctx, st, now, dt, target_height_cm,
         st:                dict —— 本阶段持久状态(函数自管键,见"st 键")
         now:               float —— 当前时间戳(Mission.step 透传)
         dt:                float —— 拍间隔秒数(Mission.step 透传)
-        target_height_cm:  float —— 目标**距池底高度**(cm,必填)。下发前换算
-                           depth_cm = 实测水深 − 目标高度 − 机体高度(20cm),
-                           再经 clamp_depth_cm 钳位
+        target_height_cm:  float —— 目标**距池底高度**(cm,必填)。下发/钳位走
+                           depth_cm = AUV_POOL_DEPTH_CM − 目标高度 − 机体高度(20cm)
+                           （固件深度计装在机体上部,故减去机体高度）
         tol_cm:            float | None —— 定深带半宽(cm)。None = AUV_DEPTH_TOL_CM(缺省 5)
         hold_n:            int | None —— 带内保持拍数。None = AUV_DEPTH_HOLD_N(缺省 15,20Hz≈0.75s)
         stage:             str —— 阶段名(日志/展示用,默认 'Dive')
@@ -241,36 +292,54 @@ def dive_step(ctx, st, now, dt, target_height_cm,
     d_target = clamp_depth_cm(target_depth_cm(target_height_cm))
     elapsed = now - st['t0']
 
-    # 完成判据：只看 kalman 融合深度(DepthIF)落带才计数；
-    # 融合源 !ok(depth_kalman 未起/超期/σ 超限)不判带内 → 永不完成(无兜底)。
+    # 完成判据(★ 2026-10-08 修帧，见 docstring)：只看融合 clearance(离底净空) vs 目标高度；
+    # 退化到融合 D 时用同帧目标(pool − 目标高度，不减机体高度)。融合源 !ok → 不判带内。
     depth_if = getattr(ctx, 'depth', None)
-    d_now = None
+    h_now = None                               # 离底净空(cm，主判据)
+    d_now = None                               # 融合深度(cm，退化判据 + 日志)
     if depth_if is not None:
-        d = depth_if.read(now)                 # DepthIF 永不抛；!ok 时 D 为 None
-        if d.get('ok') and d.get('D') is not None:
+        d = depth_if.read(now)                 # DepthIF 永不抛；!ok 时字段为 None
+        if d.get('ok'):
             try:
-                d_now = float(d['D']) * 100.0  # 融合深度 m → cm
+                if d.get('clearance') is not None:
+                    h_now = float(d['clearance']) * 100.0
+                if d.get('D') is not None:
+                    d_now = float(d['D']) * 100.0
             except (TypeError, ValueError):
-                d_now = None
-    if d_now is not None and abs(d_now - d_target) <= tol_cm:
-        st['ok_cnt'] += 1
-    else:
-        st['ok_cnt'] = 0
+                h_now = d_now = None
+
+    judge_d = float(getattr(TC, 'AUV_POOL_DEPTH_CM', 106.0)) - float(target_height_cm)
+    if h_now is not None:                      # 主判据：离底净空 vs 目标离底高度(同帧同量)
+        in_band = abs(h_now - float(target_height_cm)) <= tol_cm
+        _say_throttled(ctx, st, now,
+                       '%s 净空=%.1fcm 目标=%.0fcm(融合D=%s) ok=%d/%d t=%.1fs'
+                       % (stage, h_now, target_height_cm,
+                          ('%.1f' % d_now) if d_now is not None else 'None',
+                          st['ok_cnt'], hold_n, elapsed))
+    elif d_now is not None:                    # 退化判据：同帧 D vs (pool − 目标高度)
+        in_band = abs(d_now - judge_d) <= tol_cm
+        _say_throttled(ctx, st, now,
+                       '%s 无净空字段 → 退化 D 判据 D=%.1f 目标=%.1f ok=%d/%d t=%.1fs'
+                       % (stage, d_now, judge_d, st['ok_cnt'], hold_n, elapsed))
+    else:                                      # 融合源不可用 → 不判带内(无兜底)
+        in_band = False
+        _say_throttled(ctx, st, now, '%s 融合深度源 !ok(无净空/深度) → 不判带内(无兜底)' % stage)
+    st['ok_cnt'] = st['ok_cnt'] + 1 if in_band else 0
     done = (st['ok_cnt'] >= hold_n)
-    why = '融合深度带内保持 %d 拍' % st['ok_cnt']
+    why = ('带内保持 %d 拍(%s)'
+           % (st['ok_cnt'],
+              ('净空 %.1f/%.0fcm' % (h_now, target_height_cm)) if h_now is not None
+              else ('融合D %.1f/%.1fcm' % (d_now or 0.0, judge_d))))
 
     yaw_ref = _yaw_hold(st, ctx)
     if yaw_ref is None:
         _say_throttled(ctx, st, now, '%s 无 yaw 遥测,航向保持不可靠(下发 0)' % stage)
 
     if done:
-        ctx.say('%s 完成：目标高度 %.0fcm(depth=%.0fcm),%s'
+        ctx.say('%s 完成：目标高度 %.0fcm(下发 depth=%.0fcm),%s'
                 % (stage, target_height_cm, d_target, why))
         return None
 
-    _say_throttled(ctx, st, now, '%s d_now=%s 目标=%.0fcm ok=%d/%d t=%.1fs'
-                   % (stage, ('%.1f' % d_now) if d_now is not None else 'None',
-                      d_target, st['ok_cnt'], hold_n, elapsed))
     return _cmd(stage, '定深%.0f(距底%.0f)' % (d_target, target_height_cm),
                 yaw=yaw_ref, depth=d_target)
 
@@ -342,9 +411,9 @@ def turn_step(ctx, st, now, dt, target_yaw_deg,
     """定向旋转到任务系绝对航向 target_yaw_deg(可选同时调深 —— Turn 兼职变深)。
 
     行为(Task.md §4.1 Turn)：yaw_deg 闭环在固件内(0x09 直接给目标绝对角),
-    surge/sway=0；下发值 = 任务系目标(mode_auv 统一镜像到固件系)。
-    完成(2026-10-06 口径)：**只看输入的目标航向** —— |mirror(actual_yaw) − target|
-    连续 hold_n 拍 < tol_deg 即完成。
+    surge/sway=0；下发值 = 任务系目标(mode_auv 在下发侧镜像**一次**——判据侧不镜像)。
+    完成(2026-10-08 修正口径)：**只看输入的目标航向** —— |actual_yaw − target|
+    连续 hold_n 拍 < tol_deg 即完成(actual_yaw 原始数值即任务系)。
     ★ 无兜底(2026-10-06 用户口径)：遥测无 yaw → 无法判到位,**永不完成**,
     持续下发转向指令(不按时间接受当前航向)。
 
@@ -353,8 +422,8 @@ def turn_step(ctx, st, now, dt, target_yaw_deg,
         st:                dict —— 本阶段持久状态(函数自管键,见"st 键")
         now:               float —— 当前时间戳(Mission.step 透传)
         dt:                float —— 拍间隔秒数(Mission.step 透传)
-        target_yaw_deg:    float —— 目标航向(**任务系**绝对角,°)。固件系镜像由
-                           mode_auv 统一处理(本文件读回遥测时用 apply_yaw_mirror 镜像回来)
+        target_yaw_deg:    float —— 目标航向(**任务系**绝对角,°)，用
+                           t_function.lock_turn_target() 从遥测锁存当前 yaw + 转角得到
         target_height_cm:  float | None —— 可选调深(距池底 cm)。None = 沿用上一拍
         tol_deg:           float | None —— 到位容差(°)。None = AUV_YAW_TOL_DEG(缺省 3.0)
         hold_n:            int | None —— 到位保持拍数。None = AUV_YAW_HOLD_N(缺省 10,≈0.5s)
@@ -390,8 +459,9 @@ def turn_step(ctx, st, now, dt, target_yaw_deg,
     d_target = _depth_out(st, target_height_cm)
 
     if done:
-        ctx.say('%s 完成：目标航向 %.1f°(下发 %.1f°),%s'
-                % (stage, target_yaw_deg, apply_yaw_mirror(target_yaw_deg, bool(getattr(TC, 'YAW_MIRROR', True))), why))
+        ctx.say('%s 完成：目标航向 %.1f°(0x09 yaw=%.1f°),%s'
+                % (stage, target_yaw_deg,
+                   apply_yaw_mirror(target_yaw_deg, bool(getattr(TC, 'YAW_MIRROR', True))), why))
         return None
 
     _say_throttled(ctx, st, now, '%s err=%s ok=%d/%d t=%.1fs depth=%.0fcm'
@@ -417,8 +487,9 @@ def sway_step(ctx, st, now, dt, duration_s, direction=1.0,
         now:               float —— 当前时间戳(Mission.step 透传)
         dt:                float —— 拍间隔秒数(Mission.step 透传)
         duration_s:        float —— 横移时长(秒),唯一完成判据
-        direction:         float —— 横移方向：+1 = 右移(sway>0),-1 = 左移。
-                           最终下发 = AUV_SWAY_SIGN × direction × 推力幅度
+        direction:         float —— 横移方向：+1 = 右移,-1 = 左移（**任务系**）。
+                           符号标定键 AUV_SWAY_SIGN 不在本函数乘，统一在输出侧
+                           (mode_auv/test_runner) 随 surge 一起施加一次 —— 别两处都乘
         target_height_cm:  float | None —— 行进定深(距池底 cm)。None = 沿用上一拍
                            (st['last_height_cm'],首拍 AUV_DEFAULT_HEIGHT_CM)
         sway:              float | None —— 横移推力幅度 [-1,1]。None = AUV_SWAY_THRUST(缺省 0.5)
@@ -431,7 +502,7 @@ def sway_step(ctx, st, now, dt, duration_s, direction=1.0,
     st.setdefault('t0', now)
     if sway is None:
         sway = float(getattr(TC, 'AUV_SWAY_THRUST', 0.5))   # TODO: 横移推力档上车实测
-    sign = float(getattr(TC, 'AUV_SWAY_SIGN', 1.0)) * float(direction)
+    sign = 1.0 if float(direction) >= 0 else -1.0           # 任务系方向（+1 = 右移）
     duration_s = float(duration_s)
     elapsed = now - st['t0']
 

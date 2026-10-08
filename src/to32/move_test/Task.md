@@ -61,11 +61,12 @@ DIVE(60cm) → FWD(x1) → STRIKE_BALL → TURN(55cm,θ1) → FWD(x2) → GATE_1
 >
 > 例：水深 130cm、撞球工作高度 60cm → depth_cm = 130 − 60 − 20 = **50**。
 > 实测水深进 task_config（池深实测后填写），机体高度 20cm 为固定常数。
+> ⚠ 2026-10-08：融合实测 H≈1.068m（momo_depth.json），配置仍 130cm ⇒ 目标整体偏深 ~23cm（离底 60cm 实际 ~37cm）。下发用固件深度计帧（减机体高度），判据用融合净空 —— 两者帧不同，别混比。
 
 #### Dive（下潜定深）→ `t_function.dive_step`
 - **参数**：`target_height_cm`（距池底 cm，必填）、`tol_cm`（定深带半宽，默认 5）、`hold_n`（带内保持拍数，默认 15）。
 - **行为**：depth_cm 闭环（固件内），surge/sway=0，yaw 保持当前航向。
-- **完成**：kalman 融合深度连续 hold_n 拍落在目标带内（只看融合深度，不与固件深度计混判）。
+- **完成**：kalman 融合的**离底净空 `clearance`** 连续 hold_n 拍落在 [目标离底高度±tol_cm] 内（★ 2026-10-08 修帧：净空/目标高度是同一个物理量、同一个融合源；旧写法拿融合 D（探头帧，比上部深度计低约一个机体高度 20cm）比「pool − 高度 − 20」（固件深度计帧），两帧混比恒差 ~19.5cm > tol 8cm ⇒ Dive 永远完不成）。clearance 缺失时退化为同帧 D 判据 `|D − (AUV_POOL_DEPTH_CM − 目标高度)|`。
 - **无兜底**（2026-10-06 用户口径）：融合源失效/未入带 → 永不完成，持续下发定深指令。
 
 #### Forward（定时直行）→ `t_function.forward_step`
@@ -75,8 +76,8 @@ DIVE(60cm) → FWD(x1) → STRIKE_BALL → TURN(55cm,θ1) → FWD(x2) → GATE_1
 
 #### Turn（定向旋转）→ `t_function.turn_step`
 - **参数**：`target_yaw_deg`（任务系绝对航向 °，必填）、可选 `target_height_cm`（**Turn 兼职变深**：转向同时调深）、`tol_deg`（到位容差，默认 3°）、`hold_n`（到位保持拍数，默认 10）。
-- **行为**：yaw_deg 闭环（固件内），surge/sway=0；下发值 = 任务系目标（固件系镜像由 mode_auv 统一处理）。
-- **完成**：|mirror(actual_yaw) − target| 连续 hold_n 拍 < tol_deg。
+- **行为**：yaw_deg 闭环（固件内），surge/sway=0；下发值 = 任务系目标（固件取负由 mode_auv 在**下发侧镜像一次**抵消；判据侧不镜像）。
+- **完成**：`|actual_yaw − target|` 连续 hold_n 拍 < tol_deg（`actual_yaw` 原始值即任务系，不镜像；两侧都镜像会符号反转，err 永不归零 —— 2026-10-08 修正）。
 - **无兜底**（2026-10-06 用户口径）：遥测无 yaw → 无法判到位，永不完成，持续下发转向指令。
 
 ### 4.2 任务阶段

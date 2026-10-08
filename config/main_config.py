@@ -42,6 +42,7 @@ JPU_LIB = os.path.join(PATH_LIBS, 'libmjpg_hw.so')  # JPU 硬件解码库绝对�
 # ======================                                                        # 注释: 分隔线
 SHM_DIR          = os.environ.get('GRDK_SHM_DIR') or '/dev/shm'  # 共享内存根(tmpfs)；GRDK_SHM_DIR=测试接缝，仅供无硬件测试重定向（见 hwless_tests/README_hwless_tests.md §八）
 SHM_FRAME_FRONT  = f'{SHM_DIR}/momo_frame_front.bin'  # 前视 JPEG 帧文件，web_server 的 /cam1 读它
+SHM_FRAME_FRONT_CV = f'{SHM_DIR}/momo_frame_front_cv.bin'  # 前视【干净帧】(无检测框叠加)，专供过门 CV 找红杆；web 仍读上面带框帧
 SHM_FRAME_BOTTOM = f'{SHM_DIR}/momo_frame_bottom.bin'  # 下视 JPEG 帧文件，web_server 的 /cam2 读它
 SHM_DET_FRONT    = f'{SHM_DIR}/momo_det_front.json'  # 前视最近一帧检测结果 JSON(检测框列表)
 SHM_DET_BOTTOM   = f'{SHM_DIR}/momo_det_bottom.json'  # 下视最近一帧检测结果 JSON

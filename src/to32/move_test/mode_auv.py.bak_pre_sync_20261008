@@ -30,7 +30,6 @@ from mode_base import ModeBase
 import task_config as TC
 import obs
 from mission import Mission, apply_yaw_mirror
-from kalman_launcher import DepthKalmanLauncher  # [2026-10-08 接回] 观测进程托管
 
 
 class AuvMode(ModeBase):
@@ -60,9 +59,6 @@ class AuvMode(ModeBase):
         # 每次进入都重建状态机：保证每次切进 AUV 都从头跑
         self.mission = Mission(TC, vision=obs.VisionIF(log=self.log),
                                depth=obs.DepthIF(log=self.log), log=self.log, task_pids=self.ctx.task_pids)
-        # [2026-10-08 接回托管] 进 AUV 自动拉起 depth_kalman（幂等：已在跑就复用）
-        self.depth_kalman = DepthKalmanLauncher(TC, log=self.log)
-        self.depth_kalman.ensure_started()
         n = len(getattr(TC, 'STAGE_TABLE', []) or [])
         if n == 0:
             self.log("[AUV] 阶段表为空（v2.5 骨架）—— 状态机开机即 DONE，不会下发运动指令")
@@ -81,10 +77,6 @@ class AuvMode(ModeBase):
                 self.log("[AUV] 退出停推帧下发异常: %r" % e)
         self.state = "idle"
         self.mission = None            # 丢弃状态机：阶段/计时器不残留到下次
-        dk = getattr(self, 'depth_kalman', None)  # [2026-10-08] 只停自己起的那个
-        if dk is not None:
-            dk.stop()
-            self.depth_kalman = None
         super().on_exit(next_id)
 
     # ---------------- 事件 ----------------
@@ -109,19 +101,14 @@ class AuvMode(ModeBase):
             return
         self.state = "run" if cmd["stage"] not in ("DONE", "ABORT") else "idle"
         yaw = apply_yaw_mirror(cmd["yaw"], self.yaw_mirror)
-        # 推力符号在**输出侧**统一施加（2026-10-08）：任务系 → 固件系的换算只在这一处，
-        # 覆盖 forward_step/sway_step/撞球 ram·back/过门 surge（它们各自的 cmd 都到这里）。
-        # AUV_SURGE_SIGN / AUV_SWAY_SIGN 都是「上车方向标定键」，默认 1.0 = 直通。
-        surge = max(-1.0, min(1.0, float(cmd["surge"]) * float(getattr(TC, 'AUV_SURGE_SIGN', 1.0))))
-        sway = max(-1.0, min(1.0, float(cmd["sway"]) * float(getattr(TC, 'AUV_SWAY_SIGN', 1.0))))
         self.send_downlink(
             S.frame_motion(
                 pitch_deg=0.0,            # 任务脚本不控俯仰
                 yaw_deg=yaw,              # 目标航向绝对角
                 roll_deg=0.0,
                 depth_cm=cmd["depth"],    # 目标深度(cm，固件内闭环)
-                surge=surge,
-                sway=sway,
+                surge=cmd["surge"],
+                sway=cmd["sway"],
                 stick_stop=cmd["stop"]),  # 仅任务结束时置 1 停推
             self._note(now, cmd))
 

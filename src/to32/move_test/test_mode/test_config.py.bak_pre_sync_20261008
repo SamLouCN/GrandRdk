@@ -110,4 +110,5 @@ class EchoObs(Stage):
 # ★★ 测试表：Stage 类列表（单阶段/多阶段/任意组合，写法同 task_config.STAGE_TABLE）★★
 # 2026-10-06 仿真：已实现的 5 个任务（Task1/Task2/SearchBall/Task4/Return）整表串联；
 # 改这一行即可切测试内容。
-TEST_TABLE = ( TASK2_TABLE + RETURN_TABLE)
+TEST_TABLE = (TASK1_TABLE + TASK2_TABLE + SEARCH_BALL_TABLE
+              + TASK4_TABLE + RETURN_TABLE)

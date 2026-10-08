@@ -55,7 +55,7 @@ class SearchBallAll(Stage):
 
     每个子步骤独立 st dict；转向子步骤在切入时读当前 yaw 遥测锁存目标角
     （当前 yaw + 右转量，直接相加不做镜像 —— 用户口径），读不到遥测 →
-    该子步骤永不完成（无兜底）。
+    本拍不发 0x09 并等待（不以 0 兜底）；遥测始终不来 → 永不完成。
     """
 
     NAME = 'SearchBall'
@@ -63,7 +63,6 @@ class SearchBallAll(Stage):
     def enter(self, now):
         self.idx = 0                       # 当前内部子步骤
         self.sts = [{} for _ in range(6)]  # 每个子步骤独立的 st dict
-        self.turn_tgt = None               # 转向子步骤锁存的目标角
 
     def step(self, now, dt):
         while self.idx < 6:
@@ -74,7 +73,9 @@ class SearchBallAll(Stage):
                 return None
             st = self.sts[i]
             if i == 0:                     # ① 右转 60°
-                tgt = self._turn_target(float(getattr(TC, 'AUV_SEARCH_BALL_TURN_DEG', 60.0)))
+                tgt = self._turn_target(now, st, float(getattr(TC, 'AUV_SEARCH_BALL_TURN_DEG', 60.0)))
+                if tgt is None:            # 未拿到 yaw 遥测 → 本拍不下发 0x09（等待，不推进）
+                    return t_function.wait_cmd(self.NAME, '等 yaw 遥测(Turn 目标未锁存)')
                 cmd = t_function.turn_step(
                     self.ctx, st, now, dt,
                     target_yaw_deg=tgt,
@@ -112,17 +113,13 @@ class SearchBallAll(Stage):
             return cmd                     # 本子步骤未完成 → 下发这一拍
         return None                        # 全部子步骤完成 = 任务阶段完成
 
-    def _turn_target(self, deg):
-        """转向目标角：切入时读当前 yaw，锁存 当前yaw + 右转量（直接相加不镜像）。"""
-        if self.turn_tgt is None:
-            tel = self.ctx.tel or {}
-            y = tel.get('actual_yaw')
-            if y is not None:
-                self.turn_tgt = float(y) + float(deg)
-            else:
-                self.turn_tgt = float('nan')   # 无兜底：目标角未定 → 永不完成
-                self.ctx.say('%s 切入时无 yaw 遥测，无法定目标角（无兜底，持续下发）' % self.NAME)
-        return self.turn_tgt
+    def _turn_target(self, now, st, deg):
+        """转向目标角：切入时读当前 yaw，锁存 当前yaw + 右转量（同系直接相加不镜像）。
+
+        未拿到 yaw 遥测 → 返回 None（调用方回 wait_cmd：本拍不下发、不推进）；
+        绝不以 0 兜底（锁 0 = 命令转到绝对航向 0°），也不给 NaN（0x09 组帧会抛异常）。
+        """
+        return t_function.lock_turn_target(self.ctx, st, now, deg, stage=self.NAME)
 
     def _ball_found(self, now):
         """下视摄像头是否识别到球（canonical 'ball'）。视觉缺失/异常一律按没找到。"""

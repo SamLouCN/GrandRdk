@@ -199,7 +199,9 @@ def yaw_servo_step(st, pid, err, dt, sign=1.0):
     """前视族共用的一步航向伺服：err → PID → 递推目标角（撞/门同一语义）。
 
     st['yaw_ref'] 由调用方在进入伺服前初始化（= 交棒/起步时的当前实际航向，
-    经 apply_yaw_mirror 镜像到任务系）；本函数每拍递推：
+    ★ 取遥测 actual_yaw 原始值，**不镜像** —— 原始值即任务系；固件取负由下发侧
+    mode_auv 镜像一次抵消，这里再镜像 = 伺服符号反转，永远追不上目标）；
+    本函数每拍递推：
         yaw_ref ← wrap(yaw_ref + sign · PID(err))
     返回 (yaw_ref, out)。
 

@@ -41,7 +41,7 @@ for _p in (_HERE, _PARENT):
         sys.path.insert(0, _p)
 
 import task_config as TC
-from mission import Stage, apply_yaw_mirror
+from mission import Stage
 import t_function
 import vservo
 
@@ -293,7 +293,9 @@ class HitBallAll(Stage):
         tel = self.ctx.tel or {}
         y = tel.get('actual_yaw')
         if y is not None:
-            self.servo['yaw_ref'] = apply_yaw_mirror(float(y), bool(getattr(TC, 'YAW_MIRROR', True)))
+            # ★ 不镜像：actual_yaw 原始值即任务系（固件取负由下发侧 mode_auv 镜像一次抵消；
+            #   这里再镜像一次 = 伺服符号反转，yaw_ref 会朝反方向递推 → 永远撞不上）。
+            self.servo['yaw_ref'] = float(y)
         else:
             self.servo['yaw_ref'] = 0.0      # 无遥测按 0（v2.1 口径）；上车保证 $TEL 正常
             self.ctx.say('%s 无 yaw 遥测，递推初值按 0' % self.NAME)

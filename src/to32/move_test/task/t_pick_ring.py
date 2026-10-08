@@ -88,8 +88,11 @@ class PickRingAll(Stage):
                                               target_height_cm=h,
                                               stage='PickRing/Forward')
             elif act[0] == 'turn':                 # 右转 180°（目标 = 当前 yaw + 转角）
+                tgt = self._turn_target(now, st, act[1])
+                if tgt is None:                    # 未拿到 yaw 遥测 → 本拍不发 0x09（等待，不推进）
+                    return t_function.wait_cmd(self.NAME, '等 yaw 遥测(Turn 目标未锁存)')
                 cmd = t_function.turn_step(self.ctx, st, now, dt,
-                                           target_yaw_deg=self._turn_target(st, act[1]),
+                                           target_yaw_deg=tgt,
                                            target_height_cm=h,
                                            stage='PickRing/Turn')
             else:                                  # 横移 0.5s（+1 右 / -1 左）
@@ -105,22 +108,14 @@ class PickRingAll(Stage):
         self.ctx.say('%s 开环扫描完成（%d 循环），阶段结束' % (self.NAME, self.n))
         return None                                # 全部子步骤完成 = 任务阶段完成
 
-    def _turn_target(self, st, deg):
-        """转向目标角：本子步骤首拍读当前 yaw 锁存 当前yaw+右转量（直接相加不镜像）。
+    def _turn_target(self, now, st, deg):
+        """转向目标角：本子步骤首拍读当前 yaw 锁存 当前yaw+右转量（同系直接相加不镜像）。
 
-        锁存进本子步骤自己的 st dict（各次转向互不串）；无 yaw 遥测 →
-        NaN（turn_step 无兜底：目标角未定 → 永不完成，持续下发转向指令，
-        与 t_search_ball._turn_target 同款既有口径）。
+        锁存进本子步骤自己的 st dict（各次转向互不串）；未拿到 yaw 遥测 → 返回 None
+        （调用方回 wait_cmd：本拍不下发、不推进），**不以 0 兜底**（锁 0 = 命令转到
+        绝对航向 0°），也不给 NaN（0x09 组帧 int(round(nan*100)) 会抛异常）。
         """
-        if st.get('_tgt') is None:
-            tel = self.ctx.tel or {}
-            y = tel.get('actual_yaw')
-            if y is not None:
-                st['_tgt'] = float(y) + float(deg)
-            else:
-                st['_tgt'] = float('nan')
-                self.ctx.say('%s 转向切入时无 yaw 遥测，无法定目标角（无兜底，持续下发）' % self.NAME)
-        return st['_tgt']
+        return t_function.lock_turn_target(self.ctx, st, now, deg, stage=self.NAME)
 
 
 # 阶段注册表：task_config.PICK_RING_TABLE 引用（一项 = 整个捡环任务；空表 = 开机即 DONE）

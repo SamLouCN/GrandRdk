@@ -29,10 +29,6 @@ import protocol as P  # 新上位机二进制PID校验；只中继0x01，不放�
 from collections import OrderedDict
 from task_pid_controller import TaskPidController
 import tel_builder as TB  # $TEL 统一映射组帧（回落用）
-try:  # [2026-10-08 接回] 下位机遥测落盘（depth_kalman/viskf 的输入源）
-    import tel_shm_sink
-except ImportError:
-    tel_shm_sink = None
 from mode_base import ModeBase  # 模式基类（AUV 占位壳继承它）
 from mode_idle import IdleMode  # [2026-10-04] IDLE 待命模式（上电默认，等上位机 $CMD.mode）
 from mode_rov import RovMode  # ROV 遥控模式实现
@@ -93,8 +89,6 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
         self._log_fn = log  # 日志输出函数（通常由 main 注入）
         self.task_pids = TaskPidController()
         self._task_pid_cache = OrderedDict()
-        self.tel_sink = (tel_shm_sink.make_sink(self._log_fn)  # [2026-10-08] 遥测落盘
-                         if tel_shm_sink is not None else None)
 
         self.modes = {}  # 模式表：模式 id -> 模式实例
         self._register_modes()  # 注册全部可用模式
@@ -355,17 +349,6 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
         # [2026-10-04] IDLE 待命期抑制链路层兜底 0x0C 补发（下位机保持安静）。
         idle_id = int(getattr(self.cfg, "MODE_IDLE", -1))  # 待命态 id
         self.link_stm32.poll_suspended = (new_id == idle_id)  # 进 IDLE 置位，出 IDLE 清位
-        # [2026-10-08 修复⑤] 切模式前先垫一发 START(0x00)：固件可能因任意来源处于 STANDBY
-        #   （UI 急停 / STM32 复位残留 / LoRa 侧急停），而 0x05/0x06 清不掉 STANDBY、只有 0x00 能解。
-        #   顺序必须是 START 在模式帧之前：先清 STANDBY，再由 on_enter 的 0x05/0x06 设定新模式；
-        #   反序会因固件按 Last_Con_Mode 恢复而变回旧模式。START 仅 STANDBY 时生效，幂等安全。
-        #   排除切 IDLE：待命是"中位机放手"，若此时把固件拉起来会跑 Last_Con_Mode，有意外动作风险。
-        #   收益：失控时"切一次模式"即成万能救援键（v2.4/v2.5 通吃）。
-        if new_id != idle_id:  # 只对实体模式（ROV/AUV/...）垫 START
-            try:  # 发送异常不影响切模式
-                self.link_stm32.send(S.frame_mode(S.MODE_START), "0x04 START(切模式前清 STANDBY)")  # 清固件 STANDBY
-            except Exception:  # 兜底
-                pass  # 发送失败继续切模式
         self.modes[new_id].on_enter(old_id)  # 新模式进入并下发 0x04 模式码
         self.log("[MODE] 当前模式 -> %s" % self.modes[new_id].name)  # 打印当前模式名
         if not initial:  # 仅上位机触发的切换才落记忆
@@ -463,14 +446,6 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
         if self.estop_latch and not bool(getattr(self.cfg, "ESTOP_LATCH", True)):  # 未开真锁存时，新指令自动解除
             self.estop_latch = False  # 清除锁存
             self.log("[ESTOP] 收到新 $CMD -> 解除急停锁存")  # 打印解除提示
-            # [2026-10-08 修复①] 板端清了锁存 ≠ 固件清了状态：$ESTOP# 已让固件进 STANDBY，
-            #   而 START 原本只在 release_estop 一条窄路发出（此处只清标志）→ 固件残留 STANDBY，
-            #   0x09 被门控吞掉 = 摇杆无效、切模式无效，只能重启。这里补发 START(0x00) 实现自愈。
-            #   固件侧仅 STANDBY 时生效、正常态为空操作，幂等安全。
-            try:  # 发送异常不能打断 $CMD 主链
-                self.link_stm32.send(S.frame_mode(S.MODE_START), "0x04 START(锁存自动解除自愈)")  # 清固件 STANDBY
-            except Exception:  # 兜底
-                pass  # 发送失败不影响本帧处理
         # [2026-10-04] 待命态（IDLE）特殊处理：
         #   只有**显式带 mode 字段**的 $CMD 才把中位机从 IDLE 切走；
         #   否则（老格式 $CMD 只有 6 字段）保持待命，避免"缺字段默认成 ROV=0"误激活。
@@ -513,8 +488,6 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             return  # 不做后续处理
         self.stats["tel"] += 1  # 遥测帧计数
         self.last_tel = tel  # 保存最新遥测，供 $TEL 与状态上报
-        if self.tel_sink is not None:  # [2026-10-08] 每帧遥测落盘（所有模式通用）
-            self.tel_sink.write(tel)
         if not self.anchored:  # 首次收到遥测需要锚定
             self._anchor(tel)  # 用实测值初始化模式内部目标量
         try:  # 模式处理异常不能拖垮串口读线程
