@@ -104,6 +104,15 @@ AUV_HIT_KF_SIGMA_MAX = 60.0      # trust 门禁：滤波 σ 上限（px），TOD
 AUV_HIT_LOST_S = 2.0             # 真丢处置门限（s）：≥此值本轮失败
 AUV_HIT_W_EMA = 0.3              # 框宽 EMA 系数（近场判据平滑用）
 
+# PickRing（task/t_pick_ring.py，2026-10-08）：纯开环捡环扫描（不碰视觉，固定编排）
+#   定深40cm(离底) → N×[前进1s→转180°→右移0.5s→前进1s→转180°→左移0.5s]；
+#   车身系下朝南"右移"与朝北"左移"地理同向 → 每循环净横移 2×0.5s 蛇形梯级推进
+AUV_PICK_RING_HEIGHT_CM = 40.0   # 全程定深：距池底高度(cm)
+AUV_PICK_RING_FWD_S = 1.0        # 单段前进时长(s)
+AUV_PICK_RING_TURN_DEG = 180.0   # 旋转角：相对当前 yaw **右转**(°，右为正，负=左)
+AUV_PICK_RING_SWAY_S = 0.5       # 单段横移时长(s)
+AUV_PICK_RING_CYCLES = 3         # 扫描循环次数（整段任务 = 1+6×N 个子步骤）
+
 try:                                             # Task1 脚本在 task/ 子目录；move_test 在 sys.path 时引用
     from task import t_task1
     TASK1_TABLE = t_task1.TASK1_TABLE
@@ -152,12 +161,19 @@ try:
 except ImportError:
     PICK_BALL_TABLE = []
 
+try:
+    from task import t_pick_ring                       # 文件在 task/ 平级（2026-10-08）
+    PICK_RING_TABLE = t_pick_ring.PICK_RING_TABLE
+except ImportError:
+    PICK_RING_TABLE = []
+
 # 阶段注册（2026-10-06）：每个任务各自整体为一个阶段，可单独测试
 #   跑 Task1：       STAGE_TABLE = TASK1_TABLE       （定深 60cm(离底) → 前进 3s）
 #   跑 Task2：       STAGE_TABLE = TASK2_TABLE       （右转 120° → 前进 3s → 左转 60° → 定深 55cm(离底)）
 #   跑搜索球：       STAGE_TABLE = SEARCH_BALL_TABLE （转向 60° → 前进 2s → zigzag 扫描找球）
 #   跑 Task4：       STAGE_TABLE = TASK4_TABLE       （定深 65cm(离底) → 前进 2s → 悬停 3s）
 #   跑 Return：      STAGE_TABLE = RETURN_TABLE      （右转 90° → 前进 5s，触壁提前结束）
+#   跑捡环（开环）： STAGE_TABLE = PICK_RING_TABLE   （定深40cm → 3×蛇形梯级扫描；默认不入主序列）
 #   单独调试任意段： 把 STAGE_TABLE 换成对应单表即可（测试模式走 TEST_TABLE，互不影响）
 # 空表 = 开机即 DONE（安全停推）；任务脚本缺失时该表 try-import 置空，拼接时自动跳过。
 # [2026-10-07 接回主链路] 正式比赛全序列（Task.md §3 直译）：
