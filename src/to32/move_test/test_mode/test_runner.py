@@ -101,6 +101,8 @@ class TestMode(ModeBase):
                     "0x09 测试模式退出停推")
             except Exception as e:
                 self.log("[TEST] 退出停推帧下发异常: %r" % e)
+        if self.mission is not None:
+            self.mission.close()
         self.mission = None              # 丢弃状态机：计时器/锁存不残留到下次进入
         dk = getattr(self, 'depth_kalman', None)  # [2026-10-08] 只停自己起的那个
         if dk is not None:

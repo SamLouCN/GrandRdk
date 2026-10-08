@@ -38,6 +38,7 @@ import numpy as np
 import main_config as MC                                              # 主配置模块，提供共享内存名等全局常量
 from main_config import DEFAULT_CONFIG as CFG                         # 默认配置字典，本脚本所有参数都从这里读
 from function import YoloDetector, format_detection, draw_detections  # YOLO 检测器、检测结果格式化、画检测框
+from stage_model import StageDetector
 from shm_writer import ShmFrameWriter, ShmJsonWriter                  # 共享内存写端：帧二进制写与 JSON 写
 
 
@@ -303,7 +304,7 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
 def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检测 worker：推理并把帧与结果写进共享内存
            frame_w, det_w):  # 共享内存写端：帧二进制与检测结果 JSON
     """检测 worker：检测 -> 写帧/检测结果到共享内存。"""
-    detector = YoloDetector(YOLO_CFG) if YOLO_ENABLED else None  # 每个线程独立建检测器，避免跨线程争用模型资源
+    detector = StageDetector(YOLO_CFG, YoloDetector, shm_dir=MC.SHM_DIR) if YOLO_ENABLED else None
     idx = 0  # 本 worker 的检测序号，用于终端输出计数
     while not stop.is_set():  # 停止事件未置位就持续取帧
         try:  # 取队列可能超时
@@ -321,6 +322,11 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             stats.add('detect', t1 - t0)  # 记录本次检测耗时
         else:  # 不开统计时走同一逻辑但不计时
             dets = detector.detect(frame, nv12=nv12) if detector is not None else []  # 与上面等价，只是省掉计时开销
+
+        if detector is not None and not detector.is_current():
+            continue  # 推理期间已切模型，丢弃旧结果。
+        if detector is not None and not detector.ready:
+            status = 'model_error'
 
         if log_writer is not None:  # 开了日志才写
             log_writer.write(fid, dets, status=status)  # 每帧落一条日志
@@ -343,12 +349,16 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                         pass  # 忽略异常，继续处理下一帧
 
             # ---- 写检测结果 JSON ----
+            if detector is not None and not detector.is_current():
+                continue  # JPEG 编码期间也可能发生阶段切换。
             if det_w is not None:  # 检测 JSON 写端存在才写
                 try:  # 写失败不中断
                     det_w.write({  # 写入本帧检测结果
                         'frame': fid,  # 帧号，供消费端对齐画面
                         'ts': time.time(),  # 时间戳，供消费端判断数据是否过期
                         'dets': dets,  # 检测目标列表
+                        'stage': detector.stage if detector is not None else 'IDLE',
+                        'model_path': detector.cfg['model_path'] if detector is not None else None,
                     })
                 except Exception:  # 写 JSON 异常一概忽略
                     pass  # 跳过本帧，下一帧再试
