@@ -51,9 +51,6 @@ FPS = max(1, min(int(CAM.get('fps', 60)), 60))  # 期望帧率，钳在 1~60 之
 MARK_POINT = CAM.get('mark_point')  # 标定点坐标，用于把像素位置换算成实际距离
 Q_SIZE = int(CFG.get('CAMERA_QUEUE_SIZE', 8))  # 采集队列容量，满了就丢帧不让内存涨
 LOOP_SLEEP = float(CFG.get('LOOP_SLEEP', 0.0))  # 采集循环每帧额外休眠，给其他线程让 CPU
-CV_FRAME_MIN_INTERVAL_S = 0.10  # 干净帧最小写入间隔(节流): 过门 CV 只要 ~10Hz, 不按相机全速二次编码
-CV_FRAME_JPEG_QUALITY = 85      # 干净帧 JPEG 质量: 红杆边缘足够, 比 q100 明显省 CPU
-_cv_last_t = 0.0                # 最近一次干净帧写入时刻（模块级, 多 worker 共享节流）
 SHOW = bool(CFG.get('SHOW', True))  # 是否弹窗显示画面，板端无屏时应关掉
 N_WORKERS = int(CFG.get('N_WORKERS', 3))  # 检测 worker 线程数，决定推理并行度
 TIMING = bool(CFG.get('ENABLE_TIMING', False))  # 是否统计各阶段耗时
@@ -304,7 +301,7 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
 
 
 def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检测 worker：推理并把帧与结果写进共享内存
-           frame_w, det_w, cv_w=None):  # 共享内存写端：帧二进制、检测结果 JSON 与【干净帧】(CV 专用，可缺省)
+           frame_w, det_w):  # 共享内存写端：帧二进制与检测结果 JSON
     """检测 worker：检测 -> 写帧/检测结果到共享内存。"""
     detector = YoloDetector(YOLO_CFG) if YOLO_ENABLED else None  # 每个线程独立建检测器，避免跨线程争用模型资源
     idx = 0  # 本 worker 的检测序号，用于终端输出计数
@@ -337,31 +334,13 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             # ---- 写帧到共享内存 ----
             if frame_w is not None:  # 帧共享内存写端存在才写
                 ok, buf = cv2.imencode(  # 编码为 JPEG，比原始 BGR 小得多
-                    '.jpg', vis,
+                    '.jpg', vis,  
                     [cv2.IMWRITE_JPEG_QUALITY, MC.WEB_MJPEG_QUALITY])  # 压缩质量取全局配置，平衡带宽与画面清晰度
                 if ok:  # 编码成功才有数据可写
-                    try:
+                    try:  
                         frame_w.write(buf.tobytes())  # 把 JPEG 字节写入共享内存 /dev/shm
                     except Exception:  # 写失败不影响主流程
                         pass  # 忽略异常，继续处理下一帧
-
-            # ---- 写【干净帧】到 CV 专用共享内存（2026-10-08 过门找红杆用）----
-            # OpenCV 找红杆要吃原始像素：黄框线宽 2 正好压在 ~8px 宽的红杆上会把线切断。
-            # frame 本体自始未被画过（draw_detections 内部先 copy），这里直接编码原始帧。
-            # ★节流: CV 只需 ~10Hz, 相机 200fps 全速二次编码会显著抬高 CPU（回传被饿死的元凶之一）
-            if cv_w is not None:  # 干净帧写端存在才写
-                global _cv_last_t
-                now_cv = time.time()
-                if now_cv - _cv_last_t >= CV_FRAME_MIN_INTERVAL_S:
-                    try:
-                        ok_cv, buf_cv = cv2.imencode(  # 编码原始帧（无任何叠加）
-                            '.jpg', frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, CV_FRAME_JPEG_QUALITY])
-                        if ok_cv:  # 编码成功才写
-                            cv_w.write(buf_cv.tobytes())  # 写入 momo_frame_front_cv.bin
-                            _cv_last_t = now_cv
-                    except Exception:  # 编码/写失败一概不影响主流程
-                        pass  # CV 侧按丢帧处理
 
             # ---- 写检测结果 JSON ----
             if det_w is not None:  # 检测 JSON 写端存在才写
@@ -466,11 +445,9 @@ def main():  # 程序入口：组装参数、起线程、收尾
                          'label': 'door', 'score': 0.92}]
         globals()["YoloDetector"] = _StubDet  # 必须写全局：worker() 读的是模块级名字
     frame_w = ShmFrameWriter(MC.SHM_FRAME_FRONT, W, H)  # 帧共享内存写端，路径见 MC.SHM_FRAME_FRONT
-    cv_w    = ShmFrameWriter(MC.SHM_FRAME_FRONT_CV, W, H)  # 【干净帧】写端，专供过门 CV 找红杆（无叠加框）
     det_w   = ShmJsonWriter(MC.SHM_DET_FRONT)  # 检测结果 JSON 写端
     stats_w = ShmJsonWriter(MC.SHM_STATS_FRONT)  # 统计 JSON 写端
     print(f'[*] [{TASK}] 帧共享 : {MC.SHM_FRAME_FRONT}', flush=True)  # 打印帧共享内存路径，便于部署时核对
-    print(f'[*] [{TASK}] CV帧共享: {MC.SHM_FRAME_FRONT_CV}', flush=True)  # 打印干净帧路径，便于部署时核对
     print(f'[*] [{TASK}] 检测共享: {MC.SHM_DET_FRONT}', flush=True)  # 打印检测共享内存路径
     print(f'[*] [{TASK}] 统计共享: {MC.SHM_STATS_FRONT}', flush=True)  # 打印统计共享内存路径
 
@@ -479,7 +456,7 @@ def main():  # 程序入口：组装参数、起线程、收尾
     cap = open_camera(device, index)  # 打开相机，内部优先尝试硬解
     if cap is None:  # 相机打开失败
         print(f'[{TASK}] 真实相机打开失败: device={device} index={index}，进程退出', flush=True)  # 打印失败详情，便于现场排查设备号
-        frame_w.close(); det_w.close(); stats_w.close(); cv_w.close()  # 退出前先释放已创建的共享内存写端
+        frame_w.close(); det_w.close(); stats_w.close()  # 退出前先释放已创建的共享内存写端
         return 1  # 返回非零退出码，供看门狗判定启动失败
 
     src_is_hw = cap is not None and hasattr(cap, 'grab_raw_nv12') and hasattr(cap, 'read_both')  # 用鸭子类型判断是不是硬解相机对象
@@ -500,7 +477,7 @@ def main():  # 程序入口：组装参数、起线程、收尾
         threads.append(threading.Thread(  # 追加一个 worker 线程
             target=worker,  # 线程入口为 worker
             args=(i, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 第 i 个 worker 的全部入参
-                  frame_w, det_w, cv_w),  # 共享内存写端：帧、检测结果与干净帧(CV)
+                  frame_w, det_w),  # 共享内存写端：帧与检测结果
             daemon=True))  # 守护线程属性
     if show:  # 需要显示才起显示线程
         threads.append(threading.Thread(  # 追加显示线程
@@ -519,7 +496,6 @@ def main():  # 程序入口：组装参数、起线程、收尾
         if log_writer is not None:  # 日志对象存在才关闭
             log_writer.close()  # 关闭逐帧日志文件
         frame_w.close()  # 关闭帧共享内存写端
-        cv_w.close()  # 关闭干净帧共享内存写端
         det_w.close()  # 关闭检测 JSON 写端
         stats_w.close()  # 关闭统计 JSON 写端
         if enable_timing:  # 开了统计才打印汇总

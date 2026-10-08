@@ -27,7 +27,7 @@ st dict 里(键见各函数 docstring)——同一函数可被多个阶段实例
      (st['last_height_cm']),首拍无沿用值时用 AUV_DEFAULT_HEIGHT_CM。
   4. yaw 坐标系(★ 2026-10-08 板端实锤修正，勿再镜像两次)：
      **遥测 actual_yaw 的原始数值系 == 任务系**(与 ROV 模式 target_yaw_deg 锚定口径、
-     PassGate 直接读 tel['actual_yaw'] 的口径一致)。cmd['yaw'] 给该系的绝对角；
+     任务阶段直接读 tel['actual_yaw'] 的口径一致)。cmd['yaw'] 给该系的绝对角；
      固件对 Yaw 取负，只在**下发侧**由 mode_auv.tick 的 apply_yaw_mirror 抵消**一次**。
      本文件判据侧(yaw_err_deg / _yaw_hold)一律**不做镜像**。
      两侧都镜像 = 闭环符号反转：实测 err 恒等于「目标 + 当前」(日志里 +123°)、
@@ -224,7 +224,6 @@ def wait_cmd(stage='Wait', note='等遥测'):
 
     用途：子步骤判据所依赖的遥测尚未到位时**等待** —— Mission 不会把本拍当成
     「阶段完成」(必须返回 None 才算完成)，链路也不会发出危险目标。
-    与 task_pass_door.t_pass_gate 的 `paused=True` 同一契约。
     """
     return {'stage': stage, 'note': note, 'paused': True}
 

@@ -8,9 +8,9 @@
 惯例: 与设备/相机相关的真值不在 quick_config 写死; 通过 camera_ports.py 按 USB 物理口解析。  # 注释: 配置按惯例说明
 """                                                                          # 注释: 文档字符串结束
 
-# YOLO模型(2026-10-07 双模型: 前视/下视各用独立 .hbm, 各带独立类别集)
+# YOLO模型(2026-10-08 回退单模型: 前视/下视同一份 door_3, 只有 door 一个类别)
 YOLO_MODEL_FRONT  = 'door_3_640x640.hbm'  # 前视模型: door_3, 只识别 door
-YOLO_MODEL_BOTTOM = 'bottom.hbm'          # 下视模型: 识别 ring/red-ball/yellow-ball
+YOLO_MODEL_BOTTOM = 'door_3_640x640.hbm'  # 下视模型: 同 door_3, 只识别 door(2026-10-08 回退)
 YOLO_MODEL        = 'test_nashe_640x640_nv12.hbm'  # 旧单模型, 两路不再引用(兼容/回退参考)
 
 # === 相机(按 USB 物理口绑定, 见 camera_ports.py) ===                          # 注释: 分组标题
@@ -28,12 +28,12 @@ FRONT_FPS       = 250  # 前视相机请求帧率(实测低于此值, 受 USB �
 BOTTOM_FPS      = 250  # 下视相机请求帧率(同上)  # 注释: 帧率上限
 
 # === 识别目标(模型类别顺序在各路 CLASS_NAMES, 这里只列出"实际想筛出谁") ===         # 注释: 分组标题
-# [2026-10-07 双模型拆分] 前视 door_3 只识别 door, 撞球不再走前视(撞球用下视 red-ball);
-#   下视 bottom 可识别 ring/red-ball/yellow-ball, 当前只筛 red-ball。
+# [2026-10-08 回退单模型] 两路都用 door_3, 类别只有 door; 下视不再有 ring/red-ball/yellow-ball。
+#   ⚠ 影响: t_search_ball 的"下视见 ball 即完成"快路径、捡球方案的 poll('bottom','ball') 将永不成立。
 FRONT_TARGETS   = ['door']                 # 前视目标类别: 只 door(过门)
-BOTTOM_TARGETS  = ['red-ball']             # 下视目标类别: 只 red-ball(撞球/捡球定位)
+BOTTOM_TARGETS  = ['door']                 # 下视目标类别: 只 door(2026-10-08 回退)
 FRONT_CLASS_NAMES  = ['door']              # door_3 模型类别(索引0=door)
-BOTTOM_CLASS_NAMES = ['ring', 'red-ball', 'yellow-ball']  # bottom 模型类别(索引0=ring,1=red-ball,2=yellow-ball)
+BOTTOM_CLASS_NAMES = ['door']              # 下视同 door_3, 索引0=door(2026-10-08 回退)
 CLASS_NAMES     = ['door', 'red-ball', 'yellow-ball']     # 旧单模型类别(兼容/回退参考)
 
 # === 检测阈值 ===                                                              # 注释: 分组标题

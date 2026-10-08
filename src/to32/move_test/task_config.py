@@ -120,12 +120,6 @@ except ImportError:
     HIT_BALL_TABLE = []
 
 try:
-    from task.task_pass_door import t_pass_gate
-    PASS_GATE_TABLE = t_pass_gate.PASS_GATE_TABLE
-except ImportError:
-    PASS_GATE_TABLE = []
-
-try:
     from task import t_pick_ball
     PICK_BALL_TABLE = t_pick_ball.PICK_BALL_TABLE
 except ImportError:
@@ -141,14 +135,13 @@ except ImportError:
 # 空表 = 开机即 DONE（安全停推）；任务脚本缺失时该表 try-import 置空，拼接时自动跳过。
 # [2026-10-07 接回主链路] 正式比赛全序列（Task.md §3 直译）：
 #   DIVE(60)+FWD(x1)=Task1   STRIKE_BALL=HitBall   TURN(θ1)+FWD(x2)=Task2
-#   GATE×N=PassGate   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
+#   GATE×N=（穿门段待重写, 2026-10-08 旧 task_pass_door 已整体清理）
+#   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
-# 当前 t_hit_ball/t_pick_ball 未落地（try-import 置空自动跳过）；PassGateAll 已随
-# task_pass_door 接入（GATE 表非空，其导入链依赖 to32 根目录的 task_pid_controller）。
-# 实际序列（2026-10-07 板端等价路径实测导入）：
-#   Task1 → SearchBall → Task2 → PassGate → Return。
+# 实际序列（2026-10-08, 穿门清空后）：
+#   Task1 → SearchBall → Task2 → Return。
 STAGE_TABLE = (TASK1_TABLE + SEARCH_BALL_TABLE + HIT_BALL_TABLE + TASK2_TABLE
-               + PASS_GATE_TABLE + PICK_BALL_TABLE + RETURN_TABLE)
+               + PICK_BALL_TABLE + RETURN_TABLE)
 
 # 注：测试模式（test_mode/）的测试表在 test_mode/test_config.py 的 TEST_TABLE 配置，
 #     写法与本文件 STAGE_TABLE 相同（Stage 类列表表达式，可单阶段/多阶段任意拼），
