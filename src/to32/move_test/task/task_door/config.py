@@ -1,0 +1,109 @@
+"""穿门唯一参数入口；单位写在字段名中，TODO 项必须实车测量。
+
+70×50 cm 必须与 CV 四条管中心线交点对应的矩形尺寸一致。
+速度是指定推力下的实际平移速度，不是推力值本身。
+"""
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class DoorConfig:
+    image_width: int = 1280
+    image_height: int = 720
+    gate_width_m: float = .70
+    gate_height_m: float = .50
+    area_near: float = .50
+    area_commit: float = .80
+    center_tolerance_px: float = 8.
+    stable_frames: int = 5
+    filter_alpha: float = .5
+    pause_error_px: float = 40.
+
+    # 与算法库 after demo 一致：YOLO 吃干净校正帧；CV 吃普通增强帧。
+    camera_params_path: str = str(Path(__file__).resolve().parents[5] /
+                                  'quad_cv_kit/camera_correction_params.json')
+    camera_fit: str = 'center-crop'  # TODO: 核对前视采集裁剪模式及水下内参
+    correction_plane_distance_m: object = None  # 未知距离时沿用库的远场近似
+    contrast_gain: float = 1.2
+    sharpen_amount: float = .6
+    cv_every_frames: int = 1
+    roi_padding: float = .08
+    min_score: float = .5
+    boundary_margin_px: float = 4.
+    target_iou_min: float = .15
+    target_area_ratio_min: float = .4
+    target_lost_s: float = 1.5
+    vision_stale_s: float = .5
+    observe_frames: int = 5
+
+    # TODO: 相机 -> 机器人，机器人坐标采用 X右/Y下/Z前。
+    camera_to_robot_rotation: tuple = ((1., 0., 0.), (0., 1., 0.), (0., 0., 1.))
+    camera_position_robot_m: tuple = (0., 0., 0.)
+    yaw_sign: float = 1.  # 任务系右转为正；固件镜像仍只在输出壳施加
+    depth_sign: float = 1.  # 图像向下 -> 增加水面以下深度
+    sway_sign: float = 1.  # 任务系向右为正
+    initial_depth_cm: float = 26.  # TODO: 入段无深度遥测时的保持目标
+    min_depth_cm: float = 25.  # TODO: 可运行深度范围（需结合机体及池深）
+    max_depth_cm: float = 86.
+    yaw_step_max_deg: float = 3.  # TODO: 控制步长、增益及容差
+    yaw_gain: float = .5
+    yaw_tolerance_deg: float = 3.
+    normal_yaw_tolerance_deg: float = .3  # CV法线容差需兼容8px中心要求
+    yaw_command_tolerance_deg: float = .3
+    depth_step_max_cm: float = 2.
+    depth_tolerance_cm: float = 1.
+    translation_tolerance_m: float = .01
+    unactuated_tilt_max_deg: float = 12.
+    vertical_gain: float = .5
+    yolo_range_max_m: float = 3.
+    sway_step_max_m: float = .03
+    motion_timeout_s: float = 6.
+    settle_s: float = .3
+    align_timeout_s: float = 30.
+    approach_timeout_s: float = 60.
+    target_episode_timeout_s: float = 180.
+
+    # TODO: 分别测量各档推力的速度；暂为估算，距离执行采用定时开环。
+    approach_surge: float = .35
+    blind_surge: float = .5
+    exit_surge: float = .35
+    sway_thrust: float = .35
+    blind_speed_mps: float = .25
+    exit_speed_mps: float = .20
+    sway_speed_mps: float = .15
+    blind_distance_m: float = .80
+    blind_extra_s: float = 0.  # TODO: 从静止加速、惯性等实测补偿
+    exit_distance_m: float = .50  # TODO: 无门搜索后的直行距离，再交给下一任务
+    probe_step_m: float = .03
+    probe_max_travel_m: float = .18
+    probe_max_steps: int = 6
+    probe_max_s: float = 15.
+    width_trend_min_fraction: float = .03
+    search_angle_deg: float = 45.
+    search_observe_s: float = .6
+    search_timeout_s: float = 15.
+
+    def validate(self):
+        import math
+        if not 0 < self.area_near < self.area_commit <= 1:
+            raise ValueError('屏占比必须满足 0 < near < commit <= 1')
+        positive = ('image_width', 'image_height', 'gate_width_m', 'gate_height_m',
+                    'center_tolerance_px', 'stable_frames', 'observe_frames',
+                    'blind_speed_mps', 'exit_speed_mps', 'sway_speed_mps',
+                    'blind_distance_m', 'exit_distance_m', 'probe_step_m',
+                    'probe_max_steps', 'vision_stale_s', 'motion_timeout_s',
+                    'align_timeout_s', 'search_timeout_s', 'cv_every_frames',
+                    'normal_yaw_tolerance_deg', 'approach_timeout_s', 'target_episode_timeout_s')
+        if any(not math.isfinite(float(getattr(self, k))) or getattr(self, k) <= 0
+               for k in positive):
+            raise ValueError('尺寸、计数、速度、距离和超时必须为正有限值')
+        if not 0 < self.filter_alpha <= 1 or not 0 < self.min_depth_cm < self.max_depth_cm:
+            raise ValueError('滤波系数或深度限值无效')
+        for k in ('approach_surge', 'blind_surge', 'exit_surge', 'sway_thrust'):
+            if not 0 < getattr(self, k) <= 1:
+                raise ValueError(k + ' 必须在 (0,1]')
+        return self
+
+
+CONFIG = DoorConfig()

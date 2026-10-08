@@ -34,6 +34,7 @@ import numpy as np  # 数值数组，供图像处理与帧共享使用
 import main_config as MC  # 全局配置模块，提供共享内存名与画质参数
 from main_config import DEFAULT_CONFIG as CFG  # 默认配置字典
 from function import YoloDetector, format_detection, draw_detections  # 检测器、结果格式化与绘制
+from stage_model import StageDetector
 from shm_writer import ShmFrameWriter, ShmJsonWriter  # 共享内存帧写端与 JSON 写端
 
 
@@ -318,7 +319,7 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
 def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检测线程：推理并写共享内存
            frame_w, det_w):  # 帧共享写端与检测结果共享写端
     """检测 worker：检测 -> 写帧/检测结果到共享内存。"""
-    detector = YoloDetector(YOLO_CFG) if YOLO_ENABLED else None  # 每线程独立实例化检测器，关闭时为 None
+    detector = StageDetector(YOLO_CFG, YoloDetector, shm_dir=MC.SHM_DIR) if YOLO_ENABLED else None
     idx = 0  # 打印用的全局检测序号
     while not stop.is_set():  # 未收到停止信号就持续取帧
         try:  # 带超时取帧
@@ -336,6 +337,11 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             stats.add('detect', t1 - t0)  # 记录本次检测耗时
         else:  # 不计时，直接推理
             dets = detector.detect(frame, nv12=nv12) if detector is not None else []  # 执行检测
+
+        if detector is not None and not detector.is_current():
+            continue  # 推理期间已切模型，丢弃旧结果。
+        if detector is not None and not detector.ready:
+            status = 'model_error'
 
         if log_writer is not None:  # 开了日志才写
             log_writer.write(fid, dets, status=status)  # 记录本帧检测结果
@@ -358,12 +364,16 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                         pass  # 继续处理下一帧
 
             # ---- 写检测结果 JSON ----
+            if detector is not None and not detector.is_current():
+                continue  # JPEG 编码期间也可能发生阶段切换。
             if det_w is not None:  # 检测共享写端存在才写
                 try:  # 写共享内存可能异常
                     det_w.write({  # 写入检测结果 JSON
                         'frame': fid,  # 对应帧号
                         'ts': time.time(),  # 写入时间戳
                         'dets': dets,  # 本帧检测列表
+                        'stage': detector.stage if detector is not None else 'IDLE',
+                        'model_path': detector.cfg['model_path'] if detector is not None else None,
                     })
                 except Exception:  # 写失败忽略
                     pass  # 继续处理

@@ -32,6 +32,7 @@ from src.yolo_quad import (DEFAULT_CLASSES, DEFAULT_WEIGHTS, YoloQuadDetector,
                            draw_detections, project_detection_geometry)
 from src.yolo_red_gate import YoloRedGateTracker
 from src.gate_guidance import (enhance_cv_contrast, build_gate_guidance, draw_gate_guidance)
+from src.video_input import FFmpegVideoInput
 
 VIDEO_SUFFIXES = {'.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv', '.mts'}
 
@@ -92,7 +93,8 @@ def save_image(path, frame):
 
 def process_video(source, args, output_dir, detector=None):
     camera = load_camera_params(args.camera_params)
-    cap = cv2.VideoCapture(str(source))
+    reader = getattr(args, 'reader', 'opencv')
+    cap = FFmpegVideoInput(source) if reader == 'ffmpeg' else cv2.VideoCapture(str(source))
     if not cap.isOpened():
         cap.release()
         raise RuntimeError(f'Cannot open video: {source}')
@@ -142,6 +144,7 @@ def process_video(source, args, output_dir, detector=None):
                                     camera_params=str(args.camera_params.resolve()),
                                     camera_adaptation=adaptation, input_size=list(size),
                                     output_size=list(size), fps=fps,
+                                    input_reader=reader,
                                     output_matrix=corrector.output_matrix.tolist(),
                                     plane_distance_m=args.plane_distance,
                                     shared_detections=True, inference_coordinates='corrected',
@@ -294,6 +297,8 @@ def process_video(source, args, output_dir, detector=None):
     summary = dict(source=str(source.resolve()),
                    videos=dict(before=str(output_before.resolve()), after=str(output_after.resolve())),
                    frames=count, fps=fps, size=list(size), gate_frames=found,
+                   expected_frames=expected, input_reader=reader,
+                   input_frame_count_matches=count == expected if expected else None,
                    detected_frames=detected, tracked_frames=tracked, complete_frames=complete,
                    fresh_complete_frames=fresh_complete, four_observed_edge_frames=four_edges,
                    fresh_pose_frames=fresh_pose,
@@ -336,6 +341,8 @@ def main(argv=None):
     parser.add_argument('--iou', type=float, default=.7)
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--device', default='cpu', help='YOLO inference device: cpu or GPU index')
+    parser.add_argument('--reader', choices=['opencv', 'ffmpeg'], default='opencv',
+                        help='Use FFmpeg if OpenCV stops reading an otherwise decodable video early')
     parser.add_argument('--roi-padding', type=float, default=.08,
                         help='Ordinary box padding ratio; clipped targets allow wider overflow')
     parser.add_argument('--cv-only', action='store_true', help='Run the previous CV-only detector')

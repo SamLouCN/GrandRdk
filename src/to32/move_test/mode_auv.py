@@ -80,6 +80,8 @@ class AuvMode(ModeBase):
             except Exception as e:
                 self.log("[AUV] 退出停推帧下发异常: %r" % e)
         self.state = "idle"
+        if self.mission is not None:
+            self.mission.close()
         self.mission = None            # 丢弃状态机：阶段/计时器不残留到下次
         dk = getattr(self, 'depth_kalman', None)  # [2026-10-08] 只停自己起的那个
         if dk is not None:

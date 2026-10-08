@@ -162,9 +162,11 @@ except ImportError:
 #   GATE×N=（穿门段待重写, 2026-10-08 旧 task_pass_door 已整体清理）
 #   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
-# 实际序列（2026-10-08, 穿门清空后；vservo 移入 task_hit_ball/ 自包含、挂点路径修正）：
-#   Task1 → SearchBall → HitBall → Task2 → Return。
-STAGE_TABLE = (TASK1_TABLE + SEARCH_BALL_TABLE + HIT_BALL_TABLE + TASK2_TABLE
+# 穿门参数单独集中于 task/task_door/config.py，不在此复制。
+from task.task_door.t_door import DOOR_TABLE
+
+# Task1 → SearchBall → HitBall → Task2 → Door → PickBall → Return。
+STAGE_TABLE = (TASK1_TABLE + SEARCH_BALL_TABLE + HIT_BALL_TABLE + TASK2_TABLE + DOOR_TABLE
                + PICK_BALL_TABLE + RETURN_TABLE)
 
 # 注：测试模式（test_mode/）的测试表在 test_mode/test_config.py 的 TEST_TABLE 配置，

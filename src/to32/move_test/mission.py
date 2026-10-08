@@ -19,7 +19,9 @@ cmd 字段语义（mode_auv 据此组 0x09）：
   - 阶段完成判据由原语/阶段自定；t_function 的 Dive/Turn 已按用户口径移除超时
     兜底（判据失效即持续执行），如需超时安全退出须在 Stage 层自行实现
 """
+from stage_base import Stage, apply_yaw_mirror  # 保留旧接口，在注册任务前提供契约
 import task_config as TC
+from stage_model import publish_stage
 
 
 class Ctx(object):
@@ -36,31 +38,6 @@ class Ctx(object):
     def say(self, msg):
         if self.log:
             self.log('[mission] ' + msg)
-
-
-def apply_yaw_mirror(yaw, mirror):
-    """固件对 Yaw 取负归一化，此处镜像取反抵消；并归一化到 [-180, 180]"""
-    y = -float(yaw) if mirror else float(yaw)
-    while y > 180.0:
-        y -= 360.0
-    while y < -180.0:
-        y += 360.0
-    return y
-
-
-class Stage(object):
-    """阶段基类：子类填 NAME，覆写 enter/step"""
-    NAME = '?'
-
-    def __init__(self, ctx):
-        self.ctx = ctx
-
-    def enter(self, now):
-        """进入本阶段时调用一次：初始化计时器等"""
-
-    def step(self, now, dt):
-        """每拍调用：返回 cmd dict；返回 None = 本阶段完成"""
-        raise NotImplementedError
 
 
 class _StopCmd(object):
@@ -89,9 +66,20 @@ class Mission(object):
         self.current = None            # 当前 Stage 实例
         self.done = False              # True = 全部阶段跑完
         self._stop_sent = False        # 收尾 stop 帧只发一拍
-        self.stage = 'IDLE'            # 对外展示的当前阶段名
+        self._set_stage('IDLE')        # 对外展示，同时通知视觉进程。
         self.ctx.say('任务状态机就绪（阶段数=%d%s）'
                      % (len(self.table), '，空表=开机即停' if not self.table else ''))
+
+    def _set_stage(self, stage):
+        self.stage = stage
+        try:
+            publish_stage(stage, shm_dir=getattr(self.cfg, 'AUV_SHM_DIR', TC.AUV_SHM_DIR))
+        except OSError as exc:
+            self.ctx.say('视觉阶段发布失败: %r' % exc)
+
+    def close(self):
+        """离开 AUV / TEST 时恢复视觉默认配置。"""
+        self._set_stage('IDLE')
 
     # ------------------------------------------------------------ 主循环
     def step(self, now, dt, tel=None):
@@ -113,12 +101,12 @@ class Mission(object):
                 if self.idx >= len(self.table):  # 阶段表跑完
                     self.done = True
                     self._stop_sent = True     # 收尾帧随本拍返回，不再重发
-                    self.stage = 'DONE'
+                    self._set_stage('DONE')
                     self.ctx.say('全部阶段完成')
                     return _StopCmd.make()
                 cls = self.table[self.idx]
                 self.current = cls(self.ctx)
-                self.stage = getattr(cls, 'NAME', cls.__name__)
+                self._set_stage(getattr(cls, 'NAME', cls.__name__))
                 self.current.enter(now)
                 self.ctx.say('→ 阶段 %d/%d: %s'
                              % (self.idx + 1, len(self.table), self.stage))
@@ -128,7 +116,7 @@ class Mission(object):
                 self.ctx.say('阶段 %s 异常: %r —— 立即停推收尾' % (self.stage, e))
                 self.done = True
                 self._stop_sent = True           # 收尾帧随本拍返回，不再重发
-                self.stage = 'DONE'
+                self._set_stage('DONE')
                 return _StopCmd.make('ABORT')
             if cmd is None:                      # 本阶段完成 → 同拍切下一阶段
                 self.ctx.say('阶段 %s 完成' % self.stage)
