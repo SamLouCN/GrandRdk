@@ -102,6 +102,10 @@ class StageDetector:
         except (OSError, ValueError, KeyError, TypeError):
             return self.stage
 
+    def current_stage(self):
+        """供前视预处理选择赛段；实际推理仍会再次核对模型阶段。"""
+        return self._stage()
+
     def detect(self, frame, nv12=None):
         self.stage = self._stage()
         self.cfg = model_config(self.stage, self.base_cfg)

@@ -56,6 +56,7 @@ TASK2_TABLE = TC.TASK2_TABLE
 SEARCH_BALL_TABLE = TC.SEARCH_BALL_TABLE
 TASK4_TABLE = TC.TASK4_TABLE
 RETURN_TABLE = TC.RETURN_TABLE
+DOOR_TABLE = TC.DOOR_TABLE  # 单独测试门任务时设置 TEST_TABLE = DOOR_TABLE
 
 # ---------------- 测试框架自身配置 ----------------
 TEST_MODE_ENABLED = True       # 总开关：True = 切 AUV 即进测试模式；False = 现状不变

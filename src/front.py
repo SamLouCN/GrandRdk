@@ -41,6 +41,19 @@ from function import YoloDetector, format_detection, draw_detections  # YOLO 检
 from stage_model import StageDetector
 from shm_writer import ShmFrameWriter, ShmJsonWriter                  # 共享内存写端：帧二进制写与 JSON 写
 
+_door_pipeline = None
+_door_pipeline_lock = threading.Lock()
+
+
+def door_pipeline():
+    """只在 PassGate 加载算法库；所有前视 worker 共享一个门跟踪器。"""
+    global _door_pipeline
+    with _door_pipeline_lock:
+        if _door_pipeline is None:
+            from to32.move_test.task.task_door.front_pipeline import DoorFrontPipeline
+            _door_pipeline = DoorFrontPipeline(MC.SHM_DIR)
+        return _door_pipeline
+
 
 TASK = 'front'                                                        # 任务名，用于日志前缀和共享内存命名
 CAM = CFG['FRONT_CAMERA']                                             # 前视相机参数：分辨率、帧率、设备号、像素格式
@@ -257,7 +270,7 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
             if enable_timing:  # 只在开启统计时才计时
                 stats.add('capture', t1 - t0)  # 记录本次采集耗时
             try:  # 入队可能超时
-                q.put((fid, frame, nv12), timeout=1.0)  # 最多等 1 秒，避免 worker 全挂时无限阻塞
+                q.put((fid, frame, nv12, time.time()), timeout=1.0)  # 采集时间用于拒绝积压旧帧
             except queue.Full:  # 队列已满，本帧丢弃
                 if log_writer is not None:  # 开了日志才记
                     log_writer.write(fid, [], status='dropped')  # 记录丢帧，用于分析背压情况
@@ -313,9 +326,26 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             continue  # 继续下一轮等待，不退出线程
         if item is None:  # 收到生产者放的结束哨兵
             break  # 退出 worker 循环
-        fid, frame, nv12 = item  # 拆包得到帧号、BGR 帧、NV12 原始数据
+        fid, frame, nv12, captured_at = item  # 同帧图像及采集时间
         status = 'no_yolo' if detector is None else 'done'  # 未启用 YOLO 时日志状态标记为 no_yolo
-        if enable_timing:  # 只在开启统计时计时
+        door_published = False
+        if detector is not None and detector.current_stage() == 'PassGate':
+            if frame is None and nv12 is not None:
+                frame = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+            try:
+                t0 = time.perf_counter()
+                result = door_pipeline().process(fid, frame, detector, captured_at,
+                                                 frame_w, det_w, MC.WEB_MJPEG_QUALITY)
+                if result is None:
+                    continue
+                frame, dets = result
+                door_published = True
+                if enable_timing:
+                    stats.add('detect', time.perf_counter()-t0)
+            except Exception as exc:
+                print('[front][PassGate] 视觉处理失败: %r' % exc, flush=True)
+                continue
+        elif enable_timing:  # 只在开启统计时计时
             t0 = time.perf_counter()  # 检测开始时刻
             dets = detector.detect(frame, nv12=nv12) if detector is not None else []  # 有 NV12 就直接喂给模型，省一次色彩转换
             t1 = time.perf_counter()  # 检测结束时刻
@@ -338,9 +368,9 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             vis = draw_detections(frame, dets) if dets else frame  # 有检测目标就画框，否则直接用原图
 
             # ---- 写帧到共享内存 ----
-            if frame_w is not None:  # 帧共享内存写端存在才写
+            if frame_w is not None and not door_published:  # 门流程已发布干净校正图
                 ok, buf = cv2.imencode(  # 编码为 JPEG，比原始 BGR 小得多
-                    '.jpg', vis,  
+                    '.jpg', frame,
                     [cv2.IMWRITE_JPEG_QUALITY, MC.WEB_MJPEG_QUALITY])  # 压缩质量取全局配置，平衡带宽与画面清晰度
                 if ok:  # 编码成功才有数据可写
                     try:  
@@ -351,11 +381,13 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             # ---- 写检测结果 JSON ----
             if detector is not None and not detector.is_current():
                 continue  # JPEG 编码期间也可能发生阶段切换。
-            if det_w is not None:  # 检测 JSON 写端存在才写
+            if det_w is not None and not door_published:  # 门流程已发布同帧几何
                 try:  # 写失败不中断
                     det_w.write({  # 写入本帧检测结果
                         'frame': fid,  # 帧号，供消费端对齐画面
                         'ts': time.time(),  # 时间戳，供消费端判断数据是否过期
+                        'capture_ts': captured_at,
+                        'status': status,
                         'dets': dets,  # 检测目标列表
                         'stage': detector.stage if detector is not None else 'IDLE',
                         'model_path': detector.cfg['model_path'] if detector is not None else None,

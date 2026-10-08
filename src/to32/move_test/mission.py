@@ -19,6 +19,7 @@ cmd 字段语义（mode_auv 据此组 0x09）：
   - 阶段完成判据由原语/阶段自定；t_function 的 Dive/Turn 已按用户口径移除超时
     兜底（判据失效即持续执行），如需超时安全退出须在 Stage 层自行实现
 """
+from stage_base import Stage, apply_yaw_mirror  # 保留旧接口，在注册任务前提供契约
 import task_config as TC
 from stage_model import publish_stage
 
@@ -37,31 +38,6 @@ class Ctx(object):
     def say(self, msg):
         if self.log:
             self.log('[mission] ' + msg)
-
-
-def apply_yaw_mirror(yaw, mirror):
-    """固件对 Yaw 取负归一化，此处镜像取反抵消；并归一化到 [-180, 180]"""
-    y = -float(yaw) if mirror else float(yaw)
-    while y > 180.0:
-        y -= 360.0
-    while y < -180.0:
-        y += 360.0
-    return y
-
-
-class Stage(object):
-    """阶段基类：子类填 NAME，覆写 enter/step"""
-    NAME = '?'
-
-    def __init__(self, ctx):
-        self.ctx = ctx
-
-    def enter(self, now):
-        """进入本阶段时调用一次：初始化计时器等"""
-
-    def step(self, now, dt):
-        """每拍调用：返回 cmd dict；返回 None = 本阶段完成"""
-        raise NotImplementedError
 
 
 class _StopCmd(object):
