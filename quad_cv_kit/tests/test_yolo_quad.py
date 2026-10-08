@@ -38,6 +38,18 @@ class Boxes:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_boxes_only_does_not_run_legacy_cv(self):
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        boxes = Boxes([[100, 150, 900, 650]], [.9], [0])
+        model = SimpleNamespace(names={0: 'door'},
+                                predict=Mock(return_value=[SimpleNamespace(boxes=boxes)]))
+        detector = YoloQuadDetector(model=model)
+        with patch('src.yolo_quad.detect_in_box', side_effect=AssertionError('Unexpected CV')):
+            detections = detector.detect_boxes(frame)
+        self.assertEqual(detections[0]['bbox'], [100, 150, 900, 650])
+        self.assertNotIn('quad', detections[0])
+        self.assertIs(model.predict.call_args.kwargs['source'], frame)
+
     def test_rectangle_lengths_and_angles(self):
         edges = edge_metrics([(10, 10), (110, 10), (110, 60), (10, 60)])
         for name in ('top', 'bottom'):

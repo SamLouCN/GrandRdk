@@ -1,4 +1,4 @@
-"""独立 OpenCV 视频实验；不改原任务工程。检测结果由每帧图像产生。"""
+"""红管门框检测与最近门短时跟踪；demo/demo_video_cv_improved.py 为批量入口。"""
 from pathlib import Path
 import argparse
 import json
@@ -275,7 +275,8 @@ def pipe_groups(vertical,horizontal,frame):
             if all(np.linalg.norm(p-q)>15 for q in corners):corners.append(p)
         segments=[]
         for i,l in zip(indices,members):
-            ends=endpoints(l).copy()
+            l['observed_segment'] = endpoints(l).copy()
+            ends=l['observed_segment'].copy()
             for a,b,p in joints:
                 if i in (a,b):
                     ends[np.argmin(np.linalg.norm(ends-p,axis=1))]=p
@@ -298,12 +299,227 @@ def intersection(a, b):
     return np.linalg.solve(m, [a['b'], b['b']])
 
 
-def detect(frame):
-    small,_,_=prepare_detection_frame(frame)
+def detect(frame, search_bbox=None, anchor_bbox=None):
+    """Detect in a masked ROI, retaining the full-frame processing scale."""
+    small,ratio,offset=prepare_detection_frame(frame)
     mask=red_mask(small)
+    if search_bbox is not None:
+        points=np.asarray(search_bbox,float).reshape(2,2)*ratio+offset
+        low=np.floor(points[0]).astype(int);high=np.ceil(points[1]).astype(int)
+        low=np.clip(low,[0,0],[640,360]);high=np.clip(high,[0,0],[640,360])
+        roi_mask=np.zeros_like(mask)
+        roi_mask[low[1]:high[1],low[0]:high[0]]=255
+        mask=cv2.bitwise_and(mask,roi_mask)
+        small=small.copy();small[roi_mask==0]=0
     vertical,horizontal=get_lines(small,mask)
     candidates=pipe_groups(vertical,horizontal,small)
+    if anchor_bbox is not None:
+        anchor=np.asarray(anchor_bbox,float).reshape(2,2)*ratio+offset
+        def anchored(candidate):
+            for segment in candidate['segments']:
+                points=np.linspace(segment[0],segment[1],40)
+                if np.count_nonzero(np.all((points>=anchor[0]-3)&(points<=anchor[1]+3),axis=1))>=2:
+                    return True
+            return False
+        candidates=[c for c in candidates if anchored(c)]
     return candidates, (vertical,horizontal), mask
+
+
+def apparent_pipe_width(candidate):
+    """Length-weighted median tube width in the 640x360 detection canvas.
+
+    For gates built from the same tubing, apparent tube width is a depth
+    proxy even when most of the nearer gate has left the image.
+    """
+    measurements = []
+    for line, segment in zip(candidate['lines'], candidate['segments']):
+        width = float(line['width'])
+        length = float(np.linalg.norm(segment[1] - segment[0]))
+        if np.isfinite(width) and width > 0 and length > 0:
+            measurements.append((width, length * float(line.get('support', 1))))
+    if not measurements:
+        return float(candidate['width'])
+    measurements.sort()
+    half = sum(weight for _, weight in measurements) * .5
+    total = 0.0
+    for width, weight in measurements:
+        total += weight
+        if total >= half:
+            return width
+    return measurements[-1][0]
+
+
+def select_nearest(candidates, previous=None, width_tolerance=.12):
+    """Select thickest supported gate; use continuity only within a depth tie.
+
+    Normalize the connected edge chains before ranking, so unrelated pipes
+    discarded by polygon_edges cannot determine which gate is nearest.
+    """
+    usable = [polygon_edges(c) for c in candidates]
+    usable = [c for c in usable if c is not None and c['segments']]
+    if not usable:
+        return None
+    for candidate in usable:
+        candidate['apparent_width'] = apparent_pipe_width(candidate)
+    thickest = max(c['apparent_width'] for c in usable)
+    tied = [c for c in usable
+            if c['apparent_width'] >= thickest * (1 - width_tolerance)]
+    if previous is not None:
+        matching = [c for c in tied if overlap(c, previous)]
+        if matching:
+            tied = matching
+    # Visible length helps break width ties; completeness alone earns no bonus.
+    return max(tied, key=lambda c: (sum(np.linalg.norm(s[1]-s[0])
+                                      for s in c['segments']),
+                                   c['apparent_width']))
+
+
+class RedGateTracker:
+    """Nearest red gate, with bounded image-supported tracking between detections."""
+
+    def __init__(self, fps=30, detect_every=3, hold_seconds=.2):
+        if not np.isfinite(fps) or fps <= 0 or detect_every < 1 or hold_seconds < 0:
+            raise ValueError('Invalid frame rate or tracking settings')
+        self.detect_every = int(detect_every)
+        self.hold_frames = int(round(fps * hold_seconds))
+        self.previous = None
+        self.last_gray = None
+        self.last_observed = None
+        self.index = 0
+        self.last_status = {}
+
+    def reset(self):
+        """Discard old target motion when switching to a different YOLO door."""
+        self.previous = None
+        self.last_gray = None
+        self.last_observed = None
+
+    def update(self, frame, search_bbox=None, anchor_bbox=None, allow_detect=True,
+               prefer_previous_width=False):
+        small, ratio, offset = prepare_detection_frame(frame)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        moved = None
+        age = self.index - self.last_observed if self.last_observed is not None else 0
+        if self.previous is not None and age <= self.hold_frames:
+            moved = move_with_image(self.previous, self.last_gray, gray, None, small)
+        fresh = None
+        lines = ([], [])
+        candidate_count = None
+        if allow_detect and (self.index % self.detect_every == 0 or moved is None):
+            if search_bbox is None:
+                candidates, lines, _ = detect(frame)
+            else:
+                candidates, lines, _ = detect(frame, search_bbox, anchor_bbox)
+            candidate_count = len(candidates)
+            fresh = select_nearest(candidates, moved)
+            if (prefer_previous_width and fresh is not None and moved is not None
+                    and apparent_pipe_width(fresh) < apparent_pipe_width(moved)*.7):
+                # A thin background gate must not replace a still-supported near pipe.
+                fresh = None
+        selected = fresh if fresh is not None else polygon_edges(moved)
+        if fresh is not None:
+            selected = dict(selected, tracked=False)
+            self.last_observed = self.index
+        elif selected is not None:
+            selected = dict(selected, tracked=True)
+        if selected is not None:
+            selected['apparent_width'] = apparent_pipe_width(selected)
+        self.last_status = dict(frame=self.index, candidate_count=candidate_count,
+                                detection_ran=candidate_count is not None,
+                                observation=('tracked' if selected.get('tracked') else 'detected')
+                                if selected else 'missing',
+                                age_frames=self.index-self.last_observed
+                                if selected and self.last_observed is not None else None,
+                                ratio=ratio, offset=offset.tolist())
+        self.previous, self.last_gray = selected, gray
+        self.index += 1
+        return selected, lines
+
+
+def original_geometry(frame, candidate):
+    """Return serializable geometry in source-image pixels, including padding offset."""
+    if candidate is None:
+        return None
+    _, ratio, offset = prepare_detection_frame(frame)
+    segments = [(np.asarray(s)-offset)/ratio for s in candidate['segments']]
+    points = np.concatenate(segments)
+    low, high = points.min(axis=0), points.max(axis=0)
+    height, width = frame.shape[:2]
+    bbox = [float(np.clip(low[0], 0, width-1)), float(np.clip(low[1], 0, height-1)),
+            float(np.clip(high[0], 0, width-1)), float(np.clip(high[1], 0, height-1))]
+    return dict(bbox=bbox, segments=[s.tolist() for s in segments],
+                observed_segments=[((np.asarray(line.get('observed_segment', segment))-offset)/ratio).tolist()
+                                   for line, segment in zip(candidate['lines'], candidate['segments'])],
+                corners=[((np.asarray(p)-offset)/ratio).tolist() for p in candidate['corners']],
+                complete=bool(candidate['complete']),
+                pipe_width_px=apparent_pipe_width(candidate)/ratio,
+                observation='tracked' if candidate.get('tracked') else 'detected')
+
+
+def project_gate_geometry(geometry, point_mapper, image_size):
+    """Map corrected edges as sampled curves; never bridge invalid raw pixels."""
+    if geometry is None:
+        return None
+    width, height = image_size
+
+    def valid(points):
+        return (np.isfinite(points).all(axis=1)
+                & (points[:, 0] >= 0) & (points[:, 0] <= width-1)
+                & (points[:, 1] >= 0) & (points[:, 1] <= height-1))
+
+    paths = []
+    for segment in geometry['segments']:
+        a, b = np.asarray(segment, dtype=float)
+        count = max(2, int(np.ceil(np.linalg.norm(b-a)/8)) + 1)
+        samples = a + np.linspace(0, 1, count)[:, None] * (b-a)
+        mapped = np.asarray(point_mapper(samples), dtype=float)
+        run = []
+        for point, keep in zip(mapped, valid(mapped)):
+            if keep:
+                run.append(point.tolist())
+            else:
+                if len(run) >= 2:
+                    paths.append(run)
+                run = []
+        if len(run) >= 2:
+            paths.append(run)
+    corners = []
+    if geometry['corners']:
+        mapped = np.asarray(point_mapper(geometry['corners']), dtype=float)
+        corners = [p.tolist() for p, keep in zip(mapped, valid(mapped)) if keep]
+    return dict(edge_paths=paths, corners=corners, complete=geometry['complete'],
+                source_edge_count=len(geometry['segments']),
+                observation=geometry['observation'])
+
+
+def draw_gate_geometry(frame, geometry, index=0, fps=30, view=''):
+    """Draw supported straight or mapped curved edges, without a bounding box."""
+    result = frame.copy()
+    if geometry is not None:
+        paths = geometry.get('edge_paths', geometry.get('segments', []))
+        for path in paths:
+            points = np.rint(path).astype(np.int32)
+            cv2.polylines(result, [points], False, (0, 255, 0), 3, cv2.LINE_AA)
+        for point in geometry['corners']:
+            cv2.circle(result, tuple(np.rint(point).astype(int)), 5,
+                       (0, 255, 0), -1, cv2.LINE_AA)
+        edges = geometry.get('source_edge_count', len(paths))
+        caption = (f'Nearest gate | {geometry["observation"]} | '
+                   f'{edges} edges | {index/fps:.1f}s')
+    else:
+        caption = f'No supported gate | {index/fps:.1f}s'
+    if view:
+        caption = f'{view} | {caption}'
+    cv2.putText(result, caption, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, .6,
+                (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(result, caption, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, .6,
+                (0, 255, 0) if geometry else (255, 255, 255), 1, cv2.LINE_AA)
+    return result
+
+
+def draw_nearest(frame, candidate, index=0, fps=30):
+    """Draw only supported edges of the single nearest gate, in source pixels."""
+    return draw_gate_geometry(frame, original_geometry(frame, candidate), index, fps)
 
 
 def move_with_image(previous,gray,next_gray,mask,next_frame):
@@ -318,10 +534,11 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
     pts=cv2.goodFeaturesToTrack(gray,100,.015,5,mask=band,blockSize=5)
     if pts is None or len(pts)<8:return None
     moved,status,error=cv2.calcOpticalFlowPyrLK(gray,next_gray,pts,None,winSize=(25,25),maxLevel=3)
+    if moved is None or status is None or error is None:return None
     good=(status.reshape(-1)>0)&(error.reshape(-1)<35)
     if good.sum()<8:return None
     matrix,inliers=cv2.estimateAffinePartial2D(pts[good],moved[good],method=cv2.RANSAC,ransacReprojThreshold=2.5)
-    if matrix is None or inliers.sum()<8:return None
+    if matrix is None or inliers is None or inliers.sum()<8:return None
     scale=float(np.hypot(matrix[0,0],matrix[1,0]))
     if not .9<scale<1.1:return None
     def warp(points):
@@ -336,7 +553,8 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
         _,z,_=samples(next_mask,a,b,max(4,int(line['width']*.6)))
         if z.any(axis=1).mean()<.58:continue
         d=(b-a)/np.linalg.norm(b-a);n=np.array([-d[1],d[0]])
-        item=dict(line,d=d,n=n,b=float(a@n),lo=float(a@d),hi=float(b@d),width=line['width']*scale)
+        item=dict(line,d=d,n=n,b=float(a@n),lo=float(a@d),hi=float(b@d),width=line['width']*scale,
+                  observed_segment=warp(line.get('observed_segment', segment)))
         segments.append(np.array([a,b]));members.append(item)
     if not segments:return None
     corners=[]
@@ -453,6 +671,8 @@ def main():
             c.set(1,int(index));ok,f=c.read()
             if not ok:continue
             candidates,lines,mask=detect(f)
+            selected=select_nearest(candidates)
+            candidates=[selected] if selected is not None else []
             a=draw(f,candidates,lines,index,fps,debug=True)
             cv2.imencode('.jpg',a)[1].tofile(str(out.parent/f'debug_{index}.jpg'))
             rows.append(cv2.resize(a,(480,270)))
@@ -464,32 +684,18 @@ def main():
             '-preset','fast','-threads','2','-crf','20','-pix_fmt','yuv420p','-movflags','+faststart',str(out)],stdin=subprocess.PIPE)
         records=[]
         i=0
-        previous=None;last_gray=None
+        tracker=RedGateTracker(fps)
         while True:
             ok,f=c.read()
             if not ok:break
-            small,_,_=prepare_detection_frame(f)
-            gray=cv2.cvtColor(small,cv2.COLOR_BGR2GRAY)
-            moved=move_with_image(previous,last_gray,gray,None,small) if previous is not None else None
-            if i%3==0:
-                candidates,lines,mask=detect(f)
-                if moved is not None:
-                    matching=[q for q in candidates if overlap(q,moved)]
-                    if matching and len(matching[0]['segments'])>=len(moved['segments']):
-                        previous=matching[0]
-                    elif not candidates or candidates[0]['score']<moved['score']*1.15:
-                        previous=moved
-                    else:previous=candidates[0]
-                else:previous=candidates[0] if candidates else None
-            else:previous=moved;lines=([],[])
-            selected=polygon_edges(previous)
-            candidates=[selected] if selected is not None else []
-            annotated=draw(f,candidates,lines,i,fps)
+            selected,lines=tracker.update(f)
+            annotated=draw_nearest(f,selected,i,fps)
             encoder.stdin.write(annotated.tobytes())
-            records.append(dict(frame=i,segments=[s.tolist() for s in selected['segments']] if selected else [],
-                                corners=[p.tolist() for p in selected['corners']] if selected else [],
-                                width=selected['width'] if selected else None))
-            last_gray=gray
+            geometry=original_geometry(f,selected)
+            records.append(dict(frame=i,coordinate_space='original',nearest_gate=geometry,
+                                segments=geometry['segments'] if geometry else [],
+                                corners=geometry['corners'] if geometry else [],
+                                width=geometry['pipe_width_px'] if geometry else None))
             i+=1
             if i%150==0:print(i,n,flush=True)
             if args.limit and i>=args.limit:break

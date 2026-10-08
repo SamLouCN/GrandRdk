@@ -102,7 +102,8 @@ class YoloQuadDetector(GateQuadProcessor):
         if device is not None:
             self.predict_opts['device'] = device
 
-    def detect(self, frame):
+    def detect_boxes(self, frame):
+        """Current whole-door boxes without running a CV fitting stage."""
         result = self.model.predict(source=frame, **self.predict_opts)[0]
         boxes = result.boxes
         detections = []
@@ -113,7 +114,10 @@ class YoloQuadDetector(GateQuadProcessor):
             detections = [dict(class_id=int(i), label=self.names[int(i)],
                                score=float(s), bbox=list(map(float, b)), bbox_source='yolo')
                           for b, s, i in zip(bboxes, scores, class_ids)]
-        return self.process(frame, detections)
+        return detections
+
+    def detect(self, frame):
+        return self.process(frame, self.detect_boxes(frame))
 
 def find_bbox_red(frame, min_area=600):
     """Optional CV-only locator: the largest red connected component."""
