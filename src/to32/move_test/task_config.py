@@ -83,6 +83,27 @@ AUV_TOUCH_ACC_BASE_N = 10        # 触壁基线窗口：进入检测后前 N 拍
 AUV_TOUCH_ACC_DROP_RATIO = 0.5   # 触壁判据：当前幅值 < 基线×(1-ratio) 计一次命中
 AUV_TOUCH_ACC_HIT_N = 3          # 连续命中拍数 → 判触壁（20Hz 下 ≈0.15s）
 
+# HitBall_v2（task/t_hit_ball_v2.py，2026-10-08 用户新流程：扫视找球 → 对准 → 冲撞）
+# Step1 摇摆找球：相对当前 yaw 沿 YAW_TRAJ 轨迹分小步来回摆，前视见球即退出摇摆。
+#   未挂 STAGE_TABLE（撞球 v2 落地中）；测试用 TEST_TABLE = HIT_BALL_TABLE 引本表。
+AUV_HIT_V2_CAM = 'front'           # 撞球用前视摄像头
+AUV_HIT_V2_WANT = 'ball'           # 撞红球（CANON red-ball→ball）
+AUV_HIT_V2_YAW_TRAJ = [5, 10, 15, 10, 5, -5, -10, -15, -10, -5]  # 相对当前 yaw 的摇摆轨迹(°，循环)
+AUV_HIT_V2_TURN_TOL_DEG = 3.0      # 单小步转向到位容差(°)
+AUV_HIT_V2_TURN_HOLD_N = 10        # 单小步到位保持拍数(20Hz≈0.5s)
+AUV_HIT_V2_HEIGHT_CM = 60.0        # 摇摆/对准期间保持的距池底高度(cm)
+# Step2 对准（悬停调 yaw：KF 滤 cx → 像素误差×deg/px → 递推目标角；误差≤tol 保持 N 帧完成）
+AUV_HIT_V2_FOV_DEG = 120.0       # 前视水平视场角(°)，角度换算分母：deg/px = FOV / 画面宽
+AUV_HIT_V2_ALIGN_PX_TOL = 20.0   # 对准容差：滤波后球心距画面中心像素误差 ≤ 此值(px)
+AUV_HIT_V2_ALIGN_HOLD_N = 20     # 对准保持帧数：误差带内连续 N 帧 → 锁定航向完成
+AUV_HIT_V2_YAW_SIGN = 1.0        # ★ dx>0 → 右转（yaw 增，右为正）→ 默认 +1；上车确认项
+AUV_HIT_V2_KF_R_PX2 = 225.0      # KF 量测方差 (15px)²，TODO 实测回填
+AUV_HIT_V2_KF_Q_ACC = 800.0      # KF 过程噪声加速度谱密度
+AUV_HIT_V2_KF_GATE_NSIGMA = 3.0  # KF 新息门限
+AUV_HIT_V2_KF_RESET_N = 5        # KF 连续拒收 N 帧 → 重置重捕
+AUV_HIT_V2_KF_TRUST_AGE_S = 0.2  # trust 门禁：喂舵新鲜度(≈2 个写帧周期)
+AUV_HIT_V2_KF_SIGMA_MAX = 60.0   # trust 门禁：滤波 σ 上限(px)，TODO 实测标定
+
 try:                                             # Task1 脚本在 task/ 子目录；move_test 在 sys.path 时引用
     from task import t_task1
     TASK1_TABLE = t_task1.TASK1_TABLE
