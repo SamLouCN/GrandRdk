@@ -64,7 +64,7 @@ class DoorSimFrameProcessor:
                                           detect_every=cfg.cv_every_frames,
                                           hold_seconds=cfg.hold_seconds,
                                           valid_mask=self.valid_mask,
-                                          roi_padding=cfg.roi_padding)
+                                          roi_padding=cfg.roi_padding, profile_cv=cfg.cv_profile)
 
     def process(self, frame):
         if frame is None or frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:

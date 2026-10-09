@@ -22,6 +22,7 @@ class DoorSimConfig:
     min_score: float = .5
     vision_stale_s: float = .5
     jpeg_quality: int = 85
+    cv_profile: bool = True  # 每帧分段计时；窗口统计及慢帧日志用来定位 CV 瓶颈。
 
     def validate(self):
         limits = {'contrast_gain': (1, 1.5), 'sharpen_amount': (0, 2),

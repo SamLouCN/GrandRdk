@@ -17,8 +17,11 @@ def samples(mask, a, b, radius=5):
     length = np.linalg.norm(b-a)
     points = np.linspace(a, b, max(10, int(length)))
     normal = np.array([-(b-a)[1], (b-a)[0]]) / max(length, 1)
-    probes = points[:, None, :] + np.arange(-radius, radius+1)[None, :, None]*normal
-    xs, ys = np.rint(probes[..., 0]).astype(int), np.rint(probes[..., 1]).astype(int)
+    # Keep separate coordinate arrays; the Nx(2r+1)x2 probe tensor and its
+    # strided views were allocated for every seed, trim and model side.
+    offsets = np.arange(-radius, radius+1)[None, :]
+    xs = np.rint(points[:, 0, None] + offsets*normal[0]).astype(int)
+    ys = np.rint(points[:, 1, None] + offsets*normal[1]).astype(int)
     valid = (xs >= 0) & (xs < mask.shape[1]) & (ys >= 0) & (ys < mask.shape[0])
     support = mask[np.clip(ys, 0, mask.shape[0]-1), np.clip(xs, 0, mask.shape[1]-1)] > 0
     return points, support & valid, normal

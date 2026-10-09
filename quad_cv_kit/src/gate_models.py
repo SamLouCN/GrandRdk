@@ -12,26 +12,37 @@ import numpy as np
 from .gate_line_geometry import endpoints, intersection, samples
 
 
-def tube_evidence(frame):
+def tube_evidence(frame, profile=None, prefix='color'):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
-    chroma = lab[:, :, 1]
-    local = np.maximum.reduce([chroma-cv2.GaussianBlur(chroma, (0, 0), sigma)
-                                for sigma in (3, 9, 18)])
+    # Only the a-channel is used. Keep it contiguous for all three blurs.
+    chroma = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)[:, :, 1].astype(np.float32)
+    if profile is not None:
+        profile.mark(prefix+'.convert')
+    local = chroma-cv2.GaussianBlur(chroma, (0, 0), 3)
+    for sigma in (9, 18):
+        np.maximum(local, chroma-cv2.GaussianBlur(chroma, (0, 0), sigma), out=local)
+    if profile is not None:
+        profile.mark(prefix+'.blur')
     hue, saturation, value = cv2.split(hsv)
     colored = (((hue < 14) | (hue > 118)) & (saturation > 4)) | (
         (saturation < 60) & (chroma > 126) & (local > 3))
     red = colored & (chroma > 125) & (value > 18) & ((local > 1.3) | (chroma > 136))
     mask = cv2.morphologyEx(np.uint8(red)*255, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     score = np.clip((chroma-125)/15, 0, 1)*np.clip(local/4, 0, 1)*colored
+    if profile is not None:
+        profile.mark(prefix+'.threshold')
     return mask, np.float32(score)
 
 
-def combined_evidence(enhanced, reference):
+def combined_evidence(enhanced, reference, profile=None, prefix='color'):
     """Enhanced pixels can strengthen only locally supported reference colors."""
-    mask, score = tube_evidence(reference)
-    additional, _ = tube_evidence(enhanced)
-    mask |= additional & cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    mask, score = tube_evidence(reference, profile, prefix+'.reference')
+    if enhanced is not reference:
+        additional, _ = tube_evidence(enhanced, profile, prefix+'.enhanced')
+        mask |= additional & cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    if profile is not None:
+        profile.mark(prefix+'.combine')
+        profile.count('color_evidence_calls')
     return mask, score
 
 
@@ -113,7 +124,7 @@ def side_evidence(mask, line, segment):
     return float(occupancy.mean())
 
 
-def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_mask=None):
+def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_mask=None, profile=None):
     """Enumerate four independent lines, not transitively connected pipe groups."""
     candidates = []
     for vs in combinations(vertical, 2):
@@ -121,31 +132,61 @@ def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_m
         if left['d']@right['d'] < .90:
             continue
         for hs in combinations(horizontal, 2):
+            if profile is not None:
+                profile.count('quad_combinations')
             top, bottom = sorted(hs, key=lambda line: endpoints(line).mean(axis=0)[1])
             if top['d']@bottom['d'] < .90:
+                if profile is not None:
+                    profile.mark('models.precheck')
                 continue
             lines = [top, right, bottom, left]
             widths = np.array([line['width'] for line in lines])
             if widths.max()/widths.min() > 2.4:
+                if profile is not None:
+                    profile.mark('models.precheck')
                 continue
+            if profile is not None:
+                profile.mark('models.precheck')
             corners = [intersection(lines[index-1], line) for index, line in enumerate(lines)]
             if any(corner is None for corner in corners):
+                if profile is not None:
+                    profile.mark('models.geometry')
                 continue
             quad = np.float32(corners)
             x0, y0, x1, y1 = bounds
             if (not cv2.isContourConvex(quad) or cv2.contourArea(quad) < 900
                     or np.any(quad < [x0, y0]) or np.any(quad > [x1-1, y1-1])):
+                if profile is not None:
+                    profile.mark('models.geometry')
                 continue
             segments = [np.array([corners[index], corners[(index+1) % 4]]) for index in range(4)]
             lengths = np.array([np.linalg.norm(b-a) for a, b in segments])
             if lengths.min() < 25 or lengths.max()/lengths.min() > 5:
+                if profile is not None:
+                    profile.mark('models.geometry')
                 continue
+            if profile is not None:
+                profile.mark('models.geometry')
             if valid_mask is not None:
                 probes = np.rint(np.vstack([np.linspace(a, b, 33) for a, b in segments])).astype(int)
                 if not valid_mask[probes[:, 1], probes[:, 0]].all():
+                    if profile is not None:
+                        profile.mark('models.valid_mask')
                     continue
-            supports = [side_evidence(mask, line, segment) for line, segment in zip(lines, segments)]
-            if any(support is None for support in supports) or np.mean(supports) < .73:
+            if profile is not None:
+                profile.mark('models.valid_mask')
+            supports = []
+            for line, segment in zip(lines, segments):
+                support = side_evidence(mask, line, segment)
+                if profile is not None:
+                    profile.count('model_side_checks')
+                if support is None:
+                    break
+                supports.append(support)
+            if profile is not None:
+                profile.mark('models.color_support')
+                profile.count('quad_color_checks')
+            if len(supports) != 4 or np.mean(supports) < .73:
                 continue
             measured_lines = []
             for line, segment in zip(lines, segments):
@@ -157,4 +198,9 @@ def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_m
             candidates.append(dict(lines=measured_lines, segments=segments, corners=list(corners), quad=quad,
                 complete=True, width=width, score=float(np.sqrt(area)*width**.7*np.mean(supports)),
                 geometry_validated=True, model='four-line-color-validated', side_support=list(supports)))
-    return sorted(candidates, key=lambda candidate: candidate['score'], reverse=True)
+            if profile is not None:
+                profile.mark('models.accept')
+    result = sorted(candidates, key=lambda candidate: candidate['score'], reverse=True)
+    if profile is not None:
+        profile.mark('models.finish')
+    return result

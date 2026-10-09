@@ -76,9 +76,9 @@ class YoloRedGateTracker:
     def __init__(self, detector, fps=30, detect_every=3, hold_seconds=.2,
                  valid_mask=None, roi_padding=.08, cv_contrast=1.2,
                  cv_clahe_clip=2.0, cv_clahe_blend=.6,
-                 cv_sharpen=.6, cv_saturation=1.25):
+                 cv_sharpen=.6, cv_saturation=1.25, profile_cv=False):
         self.detector = detector
-        self.cv = RedGateTracker(fps, detect_every, hold_seconds)
+        self.cv = RedGateTracker(fps, detect_every, hold_seconds, profile=profile_cv)
         self.valid_mask = valid_mask
         self.roi_padding = roi_padding
         self.cv_contrast = cv_contrast

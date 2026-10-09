@@ -8,11 +8,13 @@ import numpy as np
 if __package__:
     from .gate_line_geometry import endpoints, intersection, samples
     from . import gate_models
+    from .cv_profile import CvFrameProfile
 else:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.gate_line_geometry import endpoints, intersection, samples
     from src import gate_models
+    from src.cv_profile import CvFrameProfile
 
 
 def red_mask(frame):
@@ -80,10 +82,11 @@ def line_from_segment(mask, ends, min_support=.6):
     residual=np.abs(pts@normal-origin@normal)
     if np.percentile(residual,90)>5:
         return None
-    if (t.max()-t.min())/max(1,np.median(widths))<5:
+    width=float(np.median(widths))
+    if (t.max()-t.min())/max(1,width)<5:
         return None
     return dict(d=direction, n=normal, b=float(origin@normal), lo=float(t.min()), hi=float(t.max()),
-                width=float(np.median(widths)), support=float(good.mean()), vertical=vertical)
+                width=width, support=float(good.mean()), vertical=vertical)
 
 
 def elbow_mask(frame):
@@ -95,9 +98,20 @@ def elbow_mask(frame):
     return np.uint8(keep[labels])*255
 
 
-def tube_contrast(frame,line):
-    b,g,r=cv2.split(frame.astype(np.float32))
-    signal=np.log((r+10)/(g+10))
+def contrast_signal(frame, profile=None):
+    green = frame[:, :, 1].astype(np.float32)
+    red = frame[:, :, 2].astype(np.float32)
+    signal = np.log((red+10)/(green+10))
+    if profile is not None:
+        profile.mark('lines.contrast_full_image')
+        profile.count('contrast_full_image_calls')
+    return signal
+
+
+def tube_contrast(frame,line,profile=None, *, signal=None):
+    # A search shares these two maps across all rods, never across frames.
+    if signal is None:
+        signal = contrast_signal(frame, profile)
     ends=endpoints(line)
     p=np.linspace(ends[0],ends[1],max(20,int(line['hi']-line['lo'])))
     width=line['width']
@@ -108,33 +122,86 @@ def tube_contrast(frame,line):
     z=signal[np.clip(y,0,frame.shape[0]-1),np.clip(x,0,frame.shape[1]-1)]
     delta=np.mean(z[:,1:4],axis=1)-(z[:,0]+z[:,4])/2
     delta=delta[valid.all(axis=1)]
+    if profile is not None:
+        profile.mark('lines.contrast_sample')
     if len(delta)<20:return 0,0
     return float(np.median(delta)),float(np.mean(delta>.035))
 
 
-def get_lines(frame, mask, reference_frame=None):
+def eligible_segments(mask, segments):
+    """Exact cheap rejections before allocating per-pixel cross sections."""
+    segments = np.asarray(segments, dtype=float).reshape(-1, 4)
+    delta = segments[:, 2:]-segments[:, :2]
+    keep = (np.linalg.norm(delta, axis=1) >= 32) & (
+        (np.abs(delta[:, 0]) < np.abs(delta[:, 1])*.65) |
+        (np.abs(delta[:, 1]) < np.abs(delta[:, 0])*.7))
+    segments = segments[keep]
+    # Only reject rectangles with no red pixels at all. The 11px halo covers
+    # every rounded +/-10px normal probe; faint and interrupted rods survive.
+    low = np.floor(np.minimum(segments[:, :2], segments[:, 2:])-11).astype(int)
+    high = np.ceil(np.maximum(segments[:, :2], segments[:, 2:])+11).astype(int)+1
+    low = np.clip(low, [0, 0], [mask.shape[1], mask.shape[0]])
+    high = np.clip(high, [0, 0], [mask.shape[1], mask.shape[0]])
+    integral = cv2.integral(np.uint8(mask > 0))
+    hits = (integral[high[:, 1], high[:, 0]] - integral[low[:, 1], high[:, 0]] -
+            integral[high[:, 1], low[:, 0]] + integral[low[:, 1], low[:, 0]])
+    return segments[hits > 0]
+
+
+def get_lines(frame, mask, reference_frame=None, profile=None, extraction_bounds=None):
+    profile = profile or CvFrameProfile()
     lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
     segments = []
     reference_frame = frame if reference_frame is None else reference_frame
     chroma = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2LAB)[:, :, 1]
-    for img in (mask, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.createCLAHE(2., (8, 8)).apply(chroma)):
-        found = lsd.detect(img)[0]
+    inputs = (mask, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.createCLAHE(2., (8, 8)).apply(chroma))
+    x0, y0, x1, y1 = 0, 0, mask.shape[1], mask.shape[0]
+    if extraction_bounds is not None:
+        bx0, by0, bx1, by1 = extraction_bounds
+        if bx1 <= bx0 or by1 <= by0:
+            profile.mark('lines.prepare')
+            return [], []
+        # Retain the masked boundary's neighborhood for LSD gradients. CLAHE
+        # remains on the full canvas so its tile scale and color values agree.
+        # LSD's default 0.8 resize must keep the full-canvas sampling grid:
+        # multiples of five give integer origins and dimensions at that scale.
+        x0, y0 = max(0, (bx0-16)//5*5), max(0, (by0-16)//5*5)
+        x1, y1 = min(mask.shape[1], (bx1+20)//5*5), min(mask.shape[0], (by1+20)//5*5)
+    segment_offset = np.array([x0, y0, x0, y0])
+    if profile.enabled:
+        profile.meta['line_extraction_size'] = [int(x1-x0), int(y1-y0)]
+    profile.mark('lines.prepare')
+    for name, img in zip(('mask', 'gray', 'chroma'), inputs):
+        found = lsd.detect(np.ascontiguousarray(img[y0:y1, x0:x1]))[0]
+        profile.mark('lines.lsd_'+name)
+        profile.count('lsd_'+name+'_segments', 0 if found is None else len(found))
         if found is not None:
-            segments.extend(found.reshape(-1, 4))
-    hough=cv2.HoughLinesP(mask,1,np.pi/720,35,minLineLength=55,maxLineGap=10)
+            segments.extend(found.reshape(-1, 4)+segment_offset)
+    hough=cv2.HoughLinesP(np.ascontiguousarray(mask[y0:y1, x0:x1]),1,np.pi/720,35,minLineLength=55,maxLineGap=10)
+    profile.mark('lines.hough')
+    profile.count('hough_segments', 0 if hough is None else len(hough))
     if hough is not None:
-        segments.extend(hough.reshape(-1,4))
+        segments.extend(hough.reshape(-1,4)+segment_offset)
+    raw_count = len(segments)
+    segments = eligible_segments(mask, segments)
+    profile.mark('lines.prefilter')
+    profile.count('prefilter_segments', len(segments))
     lines = [q for s in segments if (q := line_from_segment(mask, s, .48)) is not None]
     lines.sort(key=lambda q: (q['hi']-q['lo'])*q['support'], reverse=True)
+    profile.mark('lines.fit_filter')
+    profile.count('raw_segments', raw_count)
+    profile.count('fitted_lines', len(lines))
     merged = []
     for line in lines:
         group = None
+        line_ends = endpoints(line)
+        mid = line_ends.mean(axis=0)
         for old in merged:
+            profile.count('merge_comparisons')
             if old['vertical'] != line['vertical'] or np.dot(old['d'], line['d']) < .988:
                 continue
-            mid = endpoints(line).mean(axis=0)
             distance = abs(mid@old['n']-old['b'])
-            projected = endpoints(line)@old['d']
+            projected = line_ends@old['d']
             gap = max(old['lo']-projected.max(), projected.min()-old['hi'], 0)
             if (distance < max(2.5, .45*min(old['width'], line['width']))
                     and gap < min(34, max(12, 2.5*old['width']))):
@@ -143,11 +210,14 @@ def get_lines(frame, mask, reference_frame=None):
         if group is None:
             merged.append(line)
         else:
-            q = endpoints(line)@group['d']
+            q = line_ends@group['d']
             group['lo'] = min(group['lo'], float(q.min()))
             group['hi'] = max(group['hi'], float(q.max()))
             group['width'] = (group['width']+line['width'])/2
+    profile.mark('lines.merge')
+    profile.count('merged_lines', len(merged))
     split=[]
+    signals = None
     for line in merged:
         a,b=endpoints(line)
         p,z,_=samples(mask,a,b,max(2,int(line['width']*.4)))
@@ -160,8 +230,15 @@ def get_lines(frame, mask, reference_frame=None):
             lo,hi=p[run[[0,-1]]]@line['d']
             if (hi-lo)/max(line['width'],1)<5:continue
             item=dict(line,lo=float(lo),hi=float(hi),support=float(occupancy[run].mean()))
-            contrast, fraction = max((tube_contrast(source, item) for source in (reference_frame, frame)),
+            profile.mark('lines.split')
+            if signals is None:
+                reference_signal = contrast_signal(reference_frame, profile)
+                enhanced_signal = (reference_signal if reference_frame is frame else contrast_signal(frame, profile))
+                signals = (reference_signal, enhanced_signal)
+            contrast, fraction = max((tube_contrast(source, item, profile if profile.enabled else None, signal=signal)
+                                     for source, signal in zip((reference_frame, frame), signals)),
                                      key=lambda measurement: measurement[0])
+            profile.mark('lines.contrast_sample')
             if contrast>.035 and fraction>.48:
                 item['contrast']=contrast
                 split.append(item)
@@ -169,6 +246,8 @@ def get_lines(frame, mask, reference_frame=None):
     # 长线优先；不让浮尘短线导致组合数失控。
     vertical = [q for q in merged if q['vertical']][:10]
     horizontal = [q for q in merged if not q['vertical']][:10]
+    profile.mark('lines.split')
+    profile.count('supported_lines', len(merged))
     return vertical, horizontal
 
 
@@ -289,13 +368,27 @@ def pipe_groups(vertical,horizontal,frame,reference_frame=None):
     return groups
 
 
-def detect(frame, search_bbox=None, anchor_bbox=None, reference_frame=None, valid_mask=None):
-    """Detect in a masked ROI, retaining the full-frame processing scale."""
-    small,ratio,offset=prepare_detection_frame(frame)
+def detect(frame, search_bbox=None, anchor_bbox=None, reference_frame=None, valid_mask=None, profile=None,
+           *, _prepared=None, _evidence=None):
+    """Extract lines in the ROI, retaining full-frame scale and color context."""
+    profile = profile or CvFrameProfile()
     if reference_frame is not None and reference_frame.shape != frame.shape:
         raise ValueError('Reference and enhanced frames must have identical dimensions')
-    reference = small if reference_frame is None else prepare_detection_frame(reference_frame)[0]
-    mask, color_score = gate_models.combined_evidence(small, reference)
+    if _prepared is None:
+        small,ratio,offset=prepare_detection_frame(frame)
+        reference = small if reference_frame is None else prepare_detection_frame(reference_frame)[0]
+    else:
+        small, reference, ratio, offset = _prepared
+    profile.mark('detect.prepare')
+    if _evidence is None:
+        mask, color_score = gate_models.combined_evidence(small, reference, profile=profile, prefix='detect.color')
+    else:
+        # Tracking and search see the same prepared frame. Copy before masking
+        # the ROI, and keep this cache local to update (never reuse old colors).
+        mask, color_score = _evidence
+        mask = mask.copy()
+        profile.mark('detect.color.reuse')
+        profile.count('color_evidence_reuses')
     width, height = round(frame.shape[1]*ratio), round(frame.shape[0]*ratio)
     bounds = (int(offset[0]), int(offset[1]), int(offset[0])+width, int(offset[1])+height)
     small_valid = None
@@ -315,27 +408,41 @@ def detect(frame, search_bbox=None, anchor_bbox=None, reference_frame=None, vali
         reference=reference.copy();reference[roi_mask==0]=0
         bounds = (max(bounds[0], low[0]), max(bounds[1], low[1]),
                   min(bounds[2], high[0]), min(bounds[3], high[1]))
-    vertical,horizontal=get_lines(small,mask,reference)
+    profile.mark('detect.roi')
+    if profile.enabled:
+        profile.meta['roi_fraction'] = round(max(0, bounds[2]-bounds[0])*max(0, bounds[3]-bounds[1])/(640*360), 4)
+    vertical,horizontal=get_lines(small,mask,reference,profile, extraction_bounds=bounds)
     recovered = gate_models.trim_lines(vertical+horizontal, mask, color_score, bounds)
     vertical = [line for line in recovered if line['vertical']][:10]
     horizontal = [line for line in recovered if not line['vertical']][:10]
-    complete = gate_models.complete_models(vertical, horizontal, mask, bounds, small_valid)
+    profile.mark('detect.trim_complete')
+    profile.count('vertical_lines', len(vertical))
+    profile.count('horizontal_lines', len(horizontal))
+    complete = gate_models.complete_models(vertical, horizontal, mask, bounds, small_valid, profile=profile)
+    profile.mark('detect.complete_models')
+    profile.count('complete_candidates', len(complete))
     # The weak LAB evidence is safe only with four-side geometric validation.
     # Partial chains have no enclosing model to stop a warm white support leg.
     partial_mask = cv2.bitwise_and(mask, red_mask(reference))
+    profile.mark('detect.partial_mask')
     partial_lines = gate_models.trim_lines(vertical+horizontal, partial_mask, color_score, bounds)
     # Preserve the old partial detector's minimum rod length after re-trimming.
     # Tiny red patches on a white foot must not add an incompatible fourth rod.
     partial_lines = [line for line in partial_lines if line['hi']-line['lo'] >= 35
                      and (line['hi']-line['lo'])/max(1, line['width']) >= 5]
+    profile.mark('detect.trim_partial')
+    profile.count('partial_lines', len(partial_lines))
     partial = pipe_groups([line for line in partial_lines if line['vertical']],
                           [line for line in partial_lines if not line['vertical']], small, reference)
+    profile.mark('detect.partial_groups')
+    profile.count('partial_candidates', len(partial))
     # A supported complete model wins over competing fragments of those same rods.
     partial = [candidate for candidate in partial if not any(
         sum(any(abs(line['d']@member['d']) > .99 and
                     abs(endpoints(line).mean(axis=0)@member['n']-member['b']) < max(3, member['width']*.55)
                     for member in model['lines']) for line in candidate['lines']) >= 2
         for model in complete)]
+    profile.mark('detect.deduplicate')
     candidates = complete+partial
     if anchor_bbox is not None:
         anchor=np.asarray(anchor_bbox,float).reshape(2,2)*ratio+offset
@@ -346,6 +453,8 @@ def detect(frame, search_bbox=None, anchor_bbox=None, reference_frame=None, vali
                     return True
             return False
         candidates=[c for c in candidates if anchored(c)]
+    profile.mark('detect.anchor_filter')
+    profile.count('final_candidates', len(candidates))
     return candidates, (vertical,horizontal), mask
 
 
@@ -401,7 +510,7 @@ def select_nearest(candidates, previous=None, width_tolerance=.12):
 class RedGateTracker:
     """Nearest red gate, with bounded image-supported tracking between detections."""
 
-    def __init__(self, fps=30, detect_every=3, hold_seconds=.2):
+    def __init__(self, fps=30, detect_every=3, hold_seconds=.2, profile=False):
         if not np.isfinite(fps) or fps <= 0 or detect_every < 1 or hold_seconds < 0:
             raise ValueError('Invalid frame rate or tracking settings')
         self.detect_every = int(detect_every)
@@ -411,6 +520,7 @@ class RedGateTracker:
         self.last_observed = None
         self.index = 0
         self.last_status = {}
+        self.profile_enabled = profile
 
     def reset(self):
         """Discard old target motion when switching to a different YOLO door."""
@@ -420,15 +530,19 @@ class RedGateTracker:
 
     def update(self, frame, search_bbox=None, anchor_bbox=None, allow_detect=True,
                prefer_previous_width=False, reference_frame=None, valid_mask=None):
+        profile = CvFrameProfile(self.profile_enabled)
         small, ratio, offset = prepare_detection_frame(frame)
         reference = prepare_detection_frame(reference_frame)[0] if reference_frame is not None else small
         if reference_frame is not None and reference_frame.shape != frame.shape:
             raise ValueError('Reference frame must match detection frame dimensions')
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        profile.mark('tracker.prepare')
         moved = None
+        evidence = None
         age = self.index - self.last_observed if self.last_observed is not None else 0
         if self.previous is not None and age <= self.hold_frames:
-            current_mask, _ = gate_models.combined_evidence(small, reference)
+            current_mask, current_score = gate_models.combined_evidence(small, reference, profile=profile, prefix='track.color')
+            evidence = (current_mask, current_score)
             if valid_mask is not None:
                 valid_small = np.zeros_like(current_mask)
                 h,w = frame.shape[:2]
@@ -436,21 +550,33 @@ class RedGateTracker:
                 resized = cv2.resize(np.uint8(valid_mask), (round(w*ratio),round(h*ratio)), interpolation=cv2.INTER_NEAREST)
                 valid_small[y:y+resized.shape[0],x:x+resized.shape[1]] = resized
                 current_mask[valid_small == 0] = 0
-            moved = move_with_image(self.previous, self.last_gray, gray, current_mask, small)
+            profile.mark('track.valid_mask')
+            if profile.enabled:
+                moved = move_with_image(self.previous, self.last_gray, gray, current_mask, small, profile=profile)
+            else:
+                moved = move_with_image(self.previous, self.last_gray, gray, current_mask, small)
+        profile.mark('track.finish')
         fresh = None
         lines = ([], [])
         candidate_count = None
+        search_reason = 'disabled'
         if allow_detect and (self.index % self.detect_every == 0 or moved is None):
+            search_reason = ('no_previous' if self.previous is None else 'hold_expired' if age > self.hold_frames else
+                             'tracking_failed' if moved is None else 'scheduled')
+            profile_kwargs = {'profile': profile} if profile.enabled else {}
+            profile_kwargs.update(_prepared=(small, reference, ratio, offset), _evidence=evidence)
             if search_bbox is None:
-                candidates, lines, _ = detect(frame, reference_frame=reference_frame, valid_mask=valid_mask)
+                candidates, lines, _ = detect(frame, reference_frame=reference_frame, valid_mask=valid_mask, **profile_kwargs)
             else:
-                candidates, lines, _ = detect(frame, search_bbox, anchor_bbox, reference_frame, valid_mask)
+                candidates, lines, _ = detect(frame, search_bbox, anchor_bbox, reference_frame, valid_mask, **profile_kwargs)
             candidate_count = len(candidates)
             fresh = select_nearest(candidates, moved)
             if (prefer_previous_width and fresh is not None and moved is not None
                     and apparent_pipe_width(fresh) < apparent_pipe_width(moved)*.7):
                 # A thin background gate must not replace a still-supported near pipe.
                 fresh = None
+        elif allow_detect:
+            search_reason = 'interval_tracking'
         selected = fresh if fresh is not None else polygon_edges(moved)
         if fresh is not None:
             selected = dict(selected, tracked=False)
@@ -459,6 +585,7 @@ class RedGateTracker:
             selected = dict(selected, tracked=True)
         if selected is not None:
             selected['apparent_width'] = apparent_pipe_width(selected)
+        profile.mark('tracker.select')
         self.last_status = dict(frame=self.index, candidate_count=candidate_count,
                                 detection_ran=candidate_count is not None,
                                 observation=('tracked' if selected.get('tracked') else 'detected')
@@ -466,6 +593,11 @@ class RedGateTracker:
                                 age_frames=self.index-self.last_observed
                                 if selected and self.last_observed is not None else None,
                                 ratio=ratio, offset=offset.tolist())
+        if profile.enabled:
+            profile.meta.update(mode='search' if candidate_count is not None else 'track' if moved is not None else 'idle',
+                                search_reason=search_reason, input_size=[frame.shape[1], frame.shape[0]],
+                                canvas_size=[640, 360], opencv_threads=cv2.getNumThreads())
+            self.last_status['cv_profile'] = profile.finish()
         self.previous, self.last_gray = selected, gray
         self.index += 1
         return selected, lines
@@ -559,7 +691,7 @@ def draw_nearest(frame, candidate, index=0, fps=30):
     return draw_gate_geometry(frame, original_geometry(frame, candidate), index, fps)
 
 
-def move_with_image(previous,gray,next_gray,mask,next_frame):
+def move_with_image(previous,gray,next_gray,mask,next_frame,profile=None):
     """仅跨相邻帧用图像运动移动标注，每三帧重新检测所有管子。"""
     if previous is None:return None
     band=np.zeros_like(gray)
@@ -569,12 +701,21 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
     for q in previous['corners']:
         cv2.circle(band,tuple(np.rint(q).astype(int)),12,255,-1)
     pts=cv2.goodFeaturesToTrack(gray,100,.015,5,mask=band,blockSize=5)
+    if profile is not None:
+        profile.mark('track.features')
+        profile.count('track_features', 0 if pts is None else len(pts))
     if pts is None or len(pts)<8:return None
     moved,status,error=cv2.calcOpticalFlowPyrLK(gray,next_gray,pts,None,winSize=(25,25),maxLevel=3)
+    if profile is not None:
+        profile.mark('track.optical_flow')
     if moved is None or status is None or error is None:return None
     good=(status.reshape(-1)>0)&(error.reshape(-1)<35)
+    if profile is not None:
+        profile.count('track_good_features', good.sum())
     if good.sum()<8:return None
     matrix,inliers=cv2.estimateAffinePartial2D(pts[good],moved[good],method=cv2.RANSAC,ransacReprojThreshold=2.5)
+    if profile is not None:
+        profile.mark('track.ransac')
     if matrix is None or inliers is None or inliers.sum()<8:return None
     scale=float(np.hypot(matrix[0,0],matrix[1,0]))
     if not .9<scale<1.1:return None
@@ -600,7 +741,10 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
             if support is None:continue
             supports.append(support)
         segments.append(np.array([a,b]));members.append(item)
-    if not segments:return None
+    if not segments:
+        if profile is not None:
+            profile.mark('track.revalidate')
+        return None
     corners=[]
     for q in previous['corners']:
         q=warp(np.array([q]))[0]
@@ -609,6 +753,8 @@ def move_with_image(previous,gray,next_gray,mask,next_frame):
             corners.append(q)
     score=max(np.linalg.norm(b-a)*l['width']**1.5 for (a,b),l in zip(segments,members))
     score*=1+.04*(len(members)-1)
+    if profile is not None:
+        profile.mark('track.revalidate')
     return dict(previous,segments=segments,lines=members,corners=corners,width=float(np.median([l['width'] for l in members])),
                 score=float(score),complete=len(corners)==4 and len(segments)==4,tracked=True,
                 side_support=supports if previous.get('geometry_validated') else None)

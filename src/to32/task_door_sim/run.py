@@ -27,11 +27,13 @@ def main(argv=None):
                         help='CV 完整搜索间隔；其余帧按当前图像跟踪，默认 3')
     parser.add_argument('--jpeg-quality', type=int, default=CONFIG.jpeg_quality,
                         help='共享 JPEG 质量，默认 85')
+    parser.add_argument('--no-cv-profile', action='store_true', help='关闭 CV 内部性能诊断')
     # front.py 的 --frames/--device/--index/--timing/--log 等原样传给它。
     args, front_args = parser.parse_known_args(argv)
     cfg = replace(CONFIG, correction_enabled=not args.no_correction,
                   contrast_gain=args.contrast, sharpen_amount=args.sharpen,
-                  cv_every_frames=args.cv_every, jpeg_quality=args.jpeg_quality).validate()
+                  cv_every_frames=args.cv_every, jpeg_quality=args.jpeg_quality,
+                  cv_profile=not args.no_cv_profile).validate()
     if args.shm_dir:
         shm_dir = Path(args.shm_dir).resolve()
         shm_dir.mkdir(parents=True, exist_ok=True)

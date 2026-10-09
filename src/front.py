@@ -17,6 +17,7 @@ front.py — 前视任务入口（真实相机 + YOLO 检测输出）
     所有数据依靠 To32 中位机回传的真实链路, 板端只做采集/检测/转发, 不再生成伪造帧。
 """
 import argparse  
+import json
 import os   
 import queue  
 import signal
@@ -350,6 +351,10 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
     idx = 0  # 本 worker 的检测序号，用于终端输出计数
     next_vision_error_log = 0.0
     next_stream_log = 0.0
+    cv_reporter = None
+    if door_sim_processor is not None and getattr(getattr(door_sim_processor, 'cfg', None), 'cv_profile', False):
+        from quad_cv_kit.src.cv_profile import CvProfileReporter
+        cv_reporter = CvProfileReporter()
     while not stop.is_set():  # 停止事件未置位就持续取帧
         try:  # 取队列可能超时
             item = q.get(timeout=0.5)  # 半秒超时，保证能及时响应停止事件
@@ -370,6 +375,10 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             try:
                 frame, dets, door_sim_observation = door_sim_processor.process(frame)
                 status = 'done'
+                if cv_reporter is not None:
+                    profile = door_sim_observation.get('yolo', {}).get('cv_profile')
+                    for report in cv_reporter.add(profile, fid):
+                        print('[front][DoorSim][CVProfile] '+json.dumps(report, ensure_ascii=False), flush=True)
             except Exception as exc:
                 # 算法故障仍发布当前相机画面，避免 cam1 因反复丢帧停在旧图。
                 now = time.monotonic()

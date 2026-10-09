@@ -28,6 +28,81 @@ CV 完整搜索默认每 3 个处理帧运行一次，间隔帧使用当前图�
 录像仍按顺序处理。`door_sim.timing_ms` 分列校正、增强、YOLO、CV、绘制耗时，
 `door_sim.stream` 记录 JPEG 大小、编码、共享写入及采集到发布的延迟。
 启用时间统计时每 2 秒打印一条 DoorSim 处理统计；原简化 fps 仍是采集帧率。
+
+### OpenCV 内部性能定位
+
+DoorSim 默认开启内部诊断；颜色、几何和跟踪判定阈值沿用原值。每个处理帧记录
+`door_sim.yolo.cv_profile`，完整内容可从 `/api/detections` 的前视数据读取。
+`[front][DoorSim][CVProfile]` 日志包含两类记录：
+
+- `event=slow`：CV 耗时至少 100ms 的帧，最多每秒打印一次，包含最慢的 6 个子阶段及候选数量。
+- `event=window`：每 2 秒分别汇总 `search`（完整搜索）、`track`（图像跟踪）、`idle`（无搜索/无成功跟踪）
+  的均值、P95、最大值，并保留该窗口最慢帧的细节，避免周期采样漏掉卡顿。
+  分布最多保留最近 256 个样本，窗口最慢帧单独保留。
+
+`stages_ms` 为顺序分段耗时，可相加，不重复累计父子阶段。
+`thread_cpu_ms` / `stages_thread_cpu_ms` 为调用线程的 CPU 时间，不包括 OpenCV 的其他工作线程；
+它们与墙钟时间的差值只能辅助判断调度/等待，不能直接等同于 CPU 总使用率。
+统计范围为 `RedGateTracker.update`，外层 `CV=` 还包含 YOLO 目标关联等少量开销。
+慢帧日志的 `search_reason=tracking_failed` 表示因跟踪失败重新搜索，
+`scheduled` 为定期搜索，`no_previous` 为未持有上一目标，`hold_expired` 为跟踪时效已过。
+
+| 子阶段或计数 | 用于定位 |
+| --- | --- |
+| `detect.color.*` / `track.color.*` | 颜色转换、三尺度高斯模糊、阈值及颜色证据合并 |
+| `lines.lsd_*` / `lines.hough` | 三路 LSD 和 Hough 线段提取 |
+| `lines.prefilter` / `lines.fit_filter` / `lines.merge` | 廉价预筛选、保留线段的拟合、嵌套合并 |
+| `lines.contrast_full_image` | 每次搜索构造干净图/增强图的红绿对数比缓存，最多两次 |
+| `models.geometry` / `models.valid_mask` / `models.color_support` | 四边组合几何、有效区和逐边颜色证据检查 |
+| `track.features` / `track.optical_flow` / `track.ransac` / `track.revalidate` | 跟踪各阶段 |
+| `raw_segments` / `merge_comparisons` | 输入线段数量、合并比较次数 |
+| `quad_combinations` / `quad_color_checks` | 枚举组合数、进入四边颜色检查的模型数 |
+| `raw_segments` / `prefilter_segments` / `fitted_lines` | 预筛选前、昂贵拟合前、拟合通过的线段数 |
+| `model_side_checks` | 实际执行的逐边验证次数；遇到不支持的边立即淘汰该组合 |
+| `contrast_full_image_calls` / `color_evidence_calls` / `color_evidence_reuses` | 对比度缓存构造、颜色证据计算及同帧复用次数 |
+| `line_extraction_size` | LSD/Hough 实际处理尺寸；输出坐标仍属于 640×360 画布 |
+
+诊断仍随原启动命令运行；需要关闭时使用 `--door-sim-args "--no-cv-profile"`。
+离线诊断入口不需要模型/BPU，可以用固定原图 ROI 检查慢帧或录像：
+
+```bash
+python3 quad_cv_kit/demo/profile_red_gate.py --source /path/slow.jpg --roi 100 80 1200 710 --frames 8 --out /tmp/cv_profile.json
+python3 quad_cv_kit/demo/profile_red_gate.py --source /path/door.mp4 --frames 100 --out /tmp/cv_profile.json
+# 固定种子的复杂线段场景，用于复现组合开销，不能代替板端现场结论：
+python3 quad_cv_kit/demo/profile_red_gate.py --synthetic clutter --frames 8 --opencv-threads 3 --out /tmp/cv_profile.json
+```
+
+离线入口在未校正输入上运行 CV，增强参数为 DoorSim 默认值；不执行 YOLO，
+默认搜索全图，`--roi` 为原图坐标。`--python-profile /tmp/cv.prof` 可额外保存 cProfile 数据，
+该选项会增加测量开销。板端定位以实际 DoorSim 输出为准。
+
+### 已实施的 CV 搜索优化
+
+- 干净图、增强图的红绿对数比按搜索帧懒加载，每张图只计算一次，各候选杆共用。
+- 批量排除长度/方向不合格的线段；积分图只排除采样覆盖区完全无红像素的线段，
+  保留弱红、断续红杆进入原有采样验证。减少采样坐标张量和合并循环内的重复分配。
+- LSD/Hough 实际裁剪到搜索区域及 16px 邻域，并将线段坐标还原到原画布。
+  边界向外对齐到 5px 网格，保持 LSD 默认 0.8 缩放的采样位置。
+  LAB/CLAHE 和颜色模糊保留完整画布上下文，原图尺度、管宽、校正有效区不变。
+  三路 LSD 和 Hough 均保留，支持贴边、缺边和弱色门框。
+- 三尺度高斯模糊使用连续的 LAB a 通道，逐次原位取最大值，减少通道复制和临时数组；
+  跟踪与重新搜索复用同一次 `update` 的颜色证据和预处理图，不跨帧缓存。
+- 四边模型发现一条边缺乏颜色支持就立即淘汰，避免继续采样其余三边；通过条件不变。
+
+开发机 OpenCV 5、3 线程、相同合成图，预热后交替运行优化前后各 7 次的耗时中位数：
+
+| 场景 | 优化前 | 优化后 |
+| --- | ---: | ---: |
+| 简单完整门搜索 | 39.36ms | 33.00ms |
+| 复杂线段全图搜索 | 532.42ms | 251.16ms |
+| 复杂线段 ROI 搜索（面积约 34.7%） | 263.70ms | 130.38ms |
+| 简单门跟踪后定期搜索 | 60.64ms | 35.69ms |
+
+复杂全图/ROI 场景的整图对比度计算次数分别从 86/42 降到 2；
+跟踪后搜索的颜色证据计算次数从 2 降到 1。以上不包括 YOLO、校正、增强、JPEG 和网络，
+也不代表 RDK 板端绝对耗时。板端复测重点比较 `search` 的 P95/最大值、
+`lines.fit_filter`、`lines.hough`、`lines.contrast_full_image` 和采集到发布延迟。
+
 不依赖 `momo_stage.json`、AUV 模式或任务表，也不写模式/阶段状态。
 输入尺寸从实际帧取得；尺寸变化时重建校正和跟踪状态。
 
