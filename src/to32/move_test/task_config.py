@@ -60,24 +60,32 @@ AUV_TASK2_TURN_DEG = 120.0       # Task2 转向：相对当前 yaw 值**右转**
 AUV_TASK2_TURN_NEG_DEG = -60.0   # Task2 补转向：相对当前 yaw 值**左转**角度(°，右为正，负=左)
 AUV_TASK2_DIVE_CM = 55.0         # Task2 定深目标：距池底高度(cm)
 
-# HitBall_v2（task/t_hit_ball_v2.py，2026-10-08 用户新流程：扫视找球 → 对准 → 冲撞）
+# HitBall_v2（task/t_hit_ball_v2.py，2026-10-08 用户新流程：找球 → 对准 → 冲撞）
+#   [2026-10-09] Step1 摇摆找球已**注释停用**（Task1 完成后球应已在前视视野）；
+#   Step2 改为**横移对准**（不动 yaw，sway 伺服，参数见下方 AUV_SWAY_ALIGN_*）。
 
 # Step1 摇摆找球：相对当前 yaw 沿 YAW_TRAJ 轨迹分小步来回摆，前视见球即退出摇摆。
 #   未挂 STAGE_TABLE（撞球 v2 落地中）；测试用 TEST_TABLE = HIT_BALL_TABLE 引本表。
 AUV_HIT_V2_CAM = 'front'                # 撞球用前视摄像头
 AUV_HIT_V2_WANT = 'red-ball'            # 撞红球（CANON red-ball→ball）
-AUV_HIT_V2_YAW_TRAJ = [5, 10, 15, 10, 5, -5, -10, -15, -10, -5]  # 相对当前 yaw 的摇摆轨迹(°，循环)
+AUV_HIT_V2_YAW_TRAJ = [5, 10, 15, 10, 5, -5, -10, -15, -10, -5]  # (停用)相对 yaw 摇摆轨迹 —— Step1 已注释，恢复时用
 AUV_HIT_V2_TURN_TOL_DEG = 3.0      # 单小步转向到位容差(°)
 AUV_HIT_V2_TURN_HOLD_N = 10        # 单小步到位保持拍数(20Hz≈0.5s)
 AUV_HIT_V2_HEIGHT_CM = 60.0        # 摇摆/对准期间保持的距池底高度(cm)
 
-# Step2 对准（悬停调 yaw：KF 滤 cx → 像素误差×deg/px → 递推目标角；误差≤tol 保持 N 帧完成）
-AUV_HIT_V2_FOV_DEG = 120.0       # 前视水平视场角(°)，角度换算分母：deg/px = FOV / 画面宽
-AUV_HIT_V2_ALIGN_PX_TOL = 20.0   # 对准容差：滤波后球心距画面中心像素误差 ≤ 此值(px)
-AUV_HIT_V2_ALIGN_HOLD_N = 20     # 对准保持帧数：误差带内连续 N 帧 → 锁定航向完成
+# Step2 对准（横移伺服，2026-10-09 改版：**不动 yaw**，KF 滤 cx → 像素误差 × 比例增益 → sway 横移；
+#   误差≤容差 连续保持 hold 帧 → 到位。原 yaw 递推参数 FOV_DEG/YAW_SIGN/ALIGN_* 停用保留）
+AUV_SWAY_ALIGN_KP = 1.0          # 横移对准比例增益(归一化 ex→sway)：sway=clamp(KP·ex/(0.5·画面宽),±AUV_SWAY_THRUST)
+                                 #   临时值待标定；方向反了调符号（任务系右为正）
+AUV_SWAY_ALIGN_PX_TOL = 20.0     # 横移对准到位容差(px)：滤波后目标心距画面中心 ≤ 此值
+AUV_SWAY_ALIGN_HOLD_N = 20       # 到位保持拍数(20Hz≈1s)：误差带内连续 N 拍 → 锁定完成
 AUV_HIT_V2_LOST_S = 3.0          # Step2 对准中丢球超时(s)：连续超时无球帧 → 切 Exit(停推+上浮)
                                  #   并终止整链（不再回 Step1 重摇）；调试期可改
-AUV_HIT_V2_YAW_SIGN = 1.0        # ★ dx>0 → 右转（yaw 增，右为正）→ 默认 +1；上车确认项
+# （停用保留）旧 yaw 递推对准参数：
+AUV_HIT_V2_FOV_DEG = 120.0       # (停用)前视水平视场角(°) —— Step2 已改横移，不再用于 yaw 换算
+AUV_HIT_V2_ALIGN_PX_TOL = 20.0   # (停用)原 yaw 对准容差 —— 由 AUV_SWAY_ALIGN_PX_TOL 承接
+AUV_HIT_V2_ALIGN_HOLD_N = 20     # (停用)原 yaw 对准保持 —— 由 AUV_SWAY_ALIGN_HOLD_N 承接
+AUV_HIT_V2_YAW_SIGN = 1.0        # (停用)原 dx>0→右转符号键 —— yaw 递推已废弃
 AUV_HIT_V2_KF_R_PX2 = 225.0      # KF 量测方差 (15px)²，TODO 实测回填
 AUV_HIT_V2_KF_Q_ACC = 800.0      # KF 过程噪声加速度谱密度
 AUV_HIT_V2_KF_GATE_NSIGMA = 3.0  # KF 新息门限
@@ -86,7 +94,7 @@ AUV_HIT_V2_KF_TRUST_AGE_S = 0.2  # trust 门禁：喂舵新鲜度(≈2 个写帧
 AUV_HIT_V2_KF_SIGMA_MAX = 60.0   # trust 门禁：滤波 σ 上限(px)，TODO 实测标定
 # Step3 冲撞（直接开环，最高速度前进；撞到球判据：ACCx 突降）
 AUV_HIT_V2_RUSH_SURGE = 1.0      # 冲撞推力档位：1.0 = 最高速度（-1~1 钳位）
-AUV_HIT_V2_RUSH_DUR_S = 10.0     # 超时兜底(s)：RUSH 期间没撞到东西 → 切 Exit（停推+上浮水面），可修改
+AUV_HIT_V2_RUSH_DUR_S = 30.0     # 超时兜底(s)：RUSH 期间没撞到东西 → 直接完成本阶段衔接下一任务（不上浮），可修改
 AUV_HIT_V2_RUSH_ACCX_DROP = 1.0  # ACCx 突降阈值(临时值,单位 m/s²)：acc_x < 基线−此值 → 判撞到球；
                                #   0.15(旧≈g 口径)在 m/s² 下属噪声级会误触发；1.0 起步，TODO 实车标定
 # Exit 上浮（t_function.exit_step，2026-10-09 新增）：停止运动 + 自动上浮至水面安全区

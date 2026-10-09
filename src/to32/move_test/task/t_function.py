@@ -4,9 +4,14 @@
 定位(Task.md §2 的运动原语,供任务阶段与 Stage 子类直接调用)：
     dive_step()    下潜定深到「距池底 target_height_cm」
     forward_step() 定时直行(恒 surge + 定深 + 锁航向,可选触壁语义)
-    sway_step()    定时横移(恒 sway + 定深 + 锁航向)   [2026-10-06 新增]
-    hover_step()   定时悬停(定深保持 + 锁航向 + 零推力)  [2026-10-06 新增]
+    sway_step()    定时横移(恒 sway + 定深 + 锁死航向)   [2026-10-06 新增]
+    hover_step()   定时悬停(定深保持 + 锁死航向 + 零推力)  [2026-10-06 新增]
     turn_step()    定向旋转到绝对航向(可选同时调深 —— Turn 兼职变深)
+    sway_align_step() 横移对准(锁死航向 + 按像素误差比例输出 sway,把目标摆到画面中心)
+                     [2026-10-09 新增,撞球 v2 Step2 改版口径:对准不动 yaw,用横移]
+    ★ yaw 锁死口径(2026-10-09 用户指令)：除显式指定转向的动作(turn_step /
+      yaw 递推伺服)外,其余所有原语一律锁死 yaw —— _yaw_hold 首拍锁存进入动作时的
+      航向,每拍固定下发(不随遥测刷新,底层持续纠偏)。
 
 调用契约(与 mission.Stage 对齐)：
     cmd = t_function.dive_step(ctx, st, now, dt, target_height_cm=60)
@@ -148,16 +153,22 @@ def _depth_out(st, target_height_cm):
 
 
 def _yaw_hold(st, ctx):
-    """「保持当前航向」：每拍用遥测刷新锁定角(跟随式,抗漂移)。
+    """「锁死当前航向」(2026-10-09 用户口径)：首拍锁存进入时的实际航向，之后固定下发。
+
+    非转向原语(dive/forward/sway/hover/exit)统一走这里 —— 除显式指定转向的动作
+    (turn_step / yaw 递推伺服)外，其余动作全部**锁死 yaw**：首拍读遥测锁存进入时刻的
+    航向角，后续每拍**固定下发该值**(不随遥测刷新) —— 底层按此目标持续纠偏，
+    水流/扰动把船推偏了会自己转回来，而不是放任漂移。
 
     返回 yaw 目标(**任务系 = 遥测原始数值系，不镜像**；下发侧由 mode_auv 镜像一次)；
-    无遥测时返回上次锁定值,从未有过则 None
-    (调用侧回落 0.0 并节流警告 —— 无遥测时航向保持不可靠,运行期须保证 $TEL 正常)。
+    无遥测时锁存不成功,返回上次锁定值；从未有过则 None
+    (调用侧回落 0.0 并节流警告 —— 无遥测时航向锁死不可靠,运行期须保证 $TEL 正常)。
     """
-    y = _tel_f(ctx, 'actual_yaw')
-    if y is not None:
-        st['yaw_ref'] = float(y)
-        st['yaw_ok'] = True
+    if 'yaw_ref' not in st:                  # ★ 锁死语义：只锁存一次(进入动作时的航向)
+        y = _tel_f(ctx, 'actual_yaw')
+        if y is not None:
+            st['yaw_ref'] = float(y)
+            st['yaw_ok'] = True
     return st.get('yaw_ref')
 
 
@@ -253,7 +264,8 @@ def dive_step(ctx, st, now, dt, target_height_cm,
               tol_cm=None, hold_n=None, stage='Dive'):
     """下潜定深到「距池底 target_height_cm」。
 
-    行为(Task.md §4.1 Dive)：surge/sway=0,depth_cm 闭环(固件内),yaw 保持当前航向。
+    行为(Task.md §4.1 Dive)：surge/sway=0,depth_cm 闭环(固件内),yaw 锁死当前航向
+    (进入时首拍锁存,固定下发 —— _yaw_hold)。
     完成(2026-10-08 修帧)：**kalman 融合的「离底净空」clearance**(ctx.depth → DepthIF,
     即融合自己算的高度计离底高度 m)连续 hold_n 拍落在 [目标高度±tol_cm] 内 ——
     判据与 target_height_cm 是**同一个物理量、同一个融合源**。
@@ -477,7 +489,7 @@ def sway_step(ctx, st, now, dt, duration_s, direction=1.0,
     """定时横移 duration_s 秒：sway 恒定推力 + 定深 + 锁当前航向。
 
     行为(与 Forward 对称)：定深目标可用 target_height_cm 显式给,缺省沿用上一拍；
-    yaw 跟随当前航向(与直行同款 _yaw_hold)；只发 sway 推力,surge=0。
+    yaw 锁死当前航向(与直行同款 _yaw_hold：首拍锁存,固定下发)；只发 sway 推力,surge=0。
     完成(2026-10-06 口径)：**只看输入的时间** —— elapsed >= duration_s 即完成。
 
     参数说明：
@@ -527,8 +539,8 @@ def hover_step(ctx, st, now, dt, duration_s,
                target_height_cm=None, stage='Hover'):
     """定时悬停 duration_s 秒：定深保持 + 锁当前航向 + surge/sway=0。
 
-    行为：depth_cm 闭环(固件内)、yaw 跟随当前航向(_yaw_hold)、零推力 ——
-    纯保持位姿等待,常用于「到位后稳定观察/交接」。定深目标可用
+    行为：depth_cm 闭环(固件内)、yaw 锁死当前航向(_yaw_hold：首拍锁存,固定下发)、
+    零推力 —— 纯保持位姿等待,常用于「到位后稳定观察/交接」。定深目标可用
     target_height_cm 显式给,缺省沿用上一拍(st['last_height_cm'])。
     完成(2026-10-06 口径)：**只看输入的时间** —— elapsed >= duration_s 即完成。
 
@@ -571,7 +583,7 @@ def exit_step(ctx, st, now, dt, surf_margin_cm=None, tol_cm=None, hold_n=None, s
 
     行为：下发的 depth_cm = 离水面 surf_margin_cm（默认 AUV_SURF_SAFE_CM=25，
     即防露头红线 —— 不贴水面，上浮到离水面 25cm 的安全位置即算到位）；
-    yaw 跟随当前航向(_yaw_hold)；surge/sway 恒 0（停止运动，不前进不横移）。
+    yaw 锁死当前航向(_yaw_hold：首拍锁存,固定下发)；surge/sway 恒 0（停止运动，不前进不横移）。
     完成(2026-10-09 口径)：**固件深度计遥测 actual_depth_cm** 连续 hold_n 拍
     ≤ (surf_margin_cm + tol_cm) 即完成 —— 与下发 depth_cm 同一固件口径(可直比)。
     无 actual_depth_cm 遥测 → 无法判到位，**永不完成**，持续下发上浮指令
@@ -627,3 +639,79 @@ def exit_step(ctx, st, now, dt, surf_margin_cm=None, tol_cm=None, hold_n=None, s
 
     return _cmd(stage, '上浮至水面(深度目标 %.0fcm)' % d_target,
                 yaw=yaw_ref, depth=d_target)
+
+
+# ------------------------------------------------------------------
+# 原语 7：横移对准（sway 伺服，2026-10-09 用户口径：对准不动 yaw，用横移；可复用）
+def sway_align_step(ctx, st, now, dt, ex_px, target_height_cm, yaw_ref,
+                    sway_kp=None, sway_max=None, px_tol=None, hold_n=None, stage='SwayAlign'):
+    """横移对准：保持航向(yaw 固定下发) + 按像素误差比例输出 sway，把目标摆到画面中心。
+
+    行为(2026-10-09 撞球 v2 Step2 改版口径)：yaw 不动(由调用方起步锁存,本原语每拍
+    固定下发 yaw_ref)；sway = clamp(sway_kp · ex_px / (0.5·画面宽), ±sway_max)：
+        目标在画面右半(ex_px>0) → sway 正(右移,任务系右为正) → 目标向左回中心；
+    比例控制：静止目标无稳态误差(ex→0 则 sway→0 停稳)，收敛后 |ex_px| ≤ px_tol
+    连续 hold_n 拍 → None(到位,由调用方切下一动作)。
+    ★ 无兜底(2026-10-06 用户口径)：ex_px=None(无有效误差/滤波不可信) → 不判到位,
+    持续下发(保持上拍 sway)；丢球等上层处置由调用方负责(如撞球 Step2 丢球超时 → Exit)。
+
+    参数说明：
+        ctx:               mission.Ctx —— 上下文(ctx.tel / ctx.say)
+        st:                dict —— 本阶段持久状态(函数自管键,见"st 键")
+        now:               float —— 当前时间戳(Mission.step 透传)
+        dt:                float —— 拍间隔秒数(Mission.step 透传)
+        ex_px:             float | None —— 滤波后目标心距画面中心的像素误差(px,右正)；
+                           None = 无有效误差(不判到位,保持上拍 sway 持续下发)
+        target_height_cm:  float | None —— 对准期间定深(距池底 cm)。None = 沿用上一拍
+        yaw_ref:           float | None —— 锁存航向(任务系,每拍固定下发不递推)。
+                           None = 沿用上拍(yaw 保持)
+        sway_kp:           float | None —— 比例增益(归一化 ex→sway)。None = AUV_SWAY_ALIGN_KP(缺省 1.0)
+        sway_max:          float | None —— sway 输出限幅。None = AUV_SWAY_THRUST(缺省 0.5)
+        px_tol:            float | None —— 到位容差(px)。None = AUV_SWAY_ALIGN_PX_TOL(缺省 20.0)
+        hold_n:            int | None —— 到位保持拍数。None = AUV_SWAY_ALIGN_HOLD_N(缺省 20,≈1s)
+        stage:             str —— 阶段名(日志/展示用,默认 'SwayAlign')
+
+    返回：cmd dict(mode_auv 据此组 0x09)；None = 本原语完成
+
+    st 键：ok_cnt / last_ex / last_sway / last_height_cm / _log_ts
+    """
+    st.setdefault('ok_cnt', 0)
+    if sway_kp is None:
+        sway_kp = float(getattr(TC, 'AUV_SWAY_ALIGN_KP', 1.0))
+    if sway_max is None:
+        sway_max = float(getattr(TC, 'AUV_SWAY_THRUST', 0.5))
+    if px_tol is None:
+        px_tol = float(getattr(TC, 'AUV_SWAY_ALIGN_PX_TOL', 20.0))
+    if hold_n is None:
+        hold_n = int(getattr(TC, 'AUV_SWAY_ALIGN_HOLD_N', 20))
+
+    if ex_px is None:                                  # 无有效误差 → 不判到位,保持上拍 sway
+        done = False
+        sway_out = st.get('last_sway', 0.0)
+        _say_throttled(ctx, st, now, '%s 无有效误差,不判到位(保持 sway=%.2f 持续下发)' % (stage, sway_out))
+    else:                                              # 有效误差 → 比例输出 + 到位判据
+        ex_px = float(ex_px)
+        st['last_ex'] = ex_px
+        w = float(getattr(TC, 'AUV_IMG_W', 1280.0))
+        sway_out = (sway_kp * ex_px / (0.5 * w)) if w > 0 else 0.0
+        sway_out = max(-sway_max, min(sway_max, sway_out))   # 限幅 ±sway_max
+        if abs(ex_px) <= px_tol:
+            st['ok_cnt'] += 1
+        else:
+            st['ok_cnt'] = 0
+        done = (st['ok_cnt'] >= hold_n)
+    st['last_sway'] = sway_out
+
+    d_target = _depth_out(st, target_height_cm)
+    yaw_out = yaw_ref if yaw_ref is not None else _yaw_hold(st, ctx)
+
+    if done:
+        ctx.say('%s 完成：误差 %.0fpx 保持 %d 拍,sway=%.2f'
+                % (stage, st['last_ex'], hold_n, sway_out))
+        return None
+
+    _say_throttled(ctx, st, now, '%s ex=%s ok=%d/%d sway=%.2f depth=%.0fcm'
+                   % (stage, ('%.0fpx' % st['last_ex']) if 'last_ex' in st else 'None',
+                      st['ok_cnt'], hold_n, sway_out, d_target))
+    return _cmd(stage, '横移对准 ex=%.0fpx sway=%.2f' % (st.get('last_ex', 0.0), sway_out),
+                yaw=yaw_out, depth=d_target, sway=sway_out)

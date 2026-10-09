@@ -10,8 +10,8 @@ read_altimeter.py — 多路持续读取 DYP-L08(-V3.0) 超声波高度计（Mod
 
 设计要点（每口完全独立）：
   - 每个通道 = 一条独立线程 + 独立串口句柄 + 独立统计，互不阻塞
-  - 某口未接设备：打印一次提示后降为 2s 低频探测，不影响其它通道；
-    接上高度计后自动恢复正常读取节奏
+  - 某口未接设备：打印提示 + 落盘 EMPTY，但读取节奏**锁定 --interval（默认 0.2s）**
+    不降频（2026-10-09 用户口径）；接上高度计后自动恢复正常状态
   - 某口打开失败（节点不存在）：仅该通道跳过，其余照常运行
   - 5 口中任意只有 1 个也能正常运行
 
@@ -49,9 +49,9 @@ FUNC_READ = 0x03               # Modbus 读保持寄存器功能码
 # CH348 物理口 -> 板端 tty 节点（A–H 顺序对应 USB0–7；本脚本只用到 A–E）
 PORT_OF = {ch: f'/dev/ttyCH9344USB{i}' for i, ch in enumerate('ABCDEFGH')}  # 通道名到串口节点的映射表，A 对应 USB0
 
-# 连续多少次无响应后判定该口"未接设备"，进入降频探测（2s），恢复后自动回到正常节奏
+# 连续多少次无响应后判定该口"未接设备"（落盘 EMPTY / UDP 上报）；
+# 读取节奏**锁定为 --interval（默认 0.2s），不降频**（2026-10-09 用户口径）
 NO_REPLY_SWITCH = 10  # 连续 10 次无响应才判定未接设备，避免偶发丢帧误判
-SLOW_PROBE_INTERVAL = 2.0  # 降频探测间隔(秒)，判定未接设备后按此节奏重试
 # v3.2.1: UDP 推送(PC 上位机"全部"页高度计显示区消费)
 ALT_PORT_DEFAULT = 8082  # UDP 推送目标端口，PC 上位机在 8082 监听
 PC_IP_DEFAULT = "192.168.127.100"   # 有线直连拓扑中上位机 PC 的 IP(与 vp5.0 telem_sender 一致)
@@ -166,8 +166,9 @@ def channel_loop(name: str, args, stop: threading.Event, st: ChanStat, udp=None)
 
     独立性保证：
       - 串口打开失败：打印提示后直接结束本线程（不影响其它线程）
-      - 连续 NO_REPLY_SWITCH 次无响应：判定未接设备，降为 SLOW_PROBE_INTERVAL
-        低频探测；一旦恢复（收到有效帧）立刻回到正常 interval 节奏
+      - 连续 NO_REPLY_SWITCH 次无响应：判定未接设备（落盘 EMPTY / UDP 上报），
+        但读取节奏**锁定为 --interval（默认 0.2s），不降频**（2026-10-09 用户口径）；
+        一旦恢复（收到有效帧）自动回到正常状态
     """
     dev = PORT_OF[name]  # 取出该通道对应的串口节点路径
     try:  # 打开串口可能失败（节点不存在或被占用）
@@ -182,7 +183,7 @@ def channel_loop(name: str, args, stop: threading.Event, st: ChanStat, udp=None)
 
     frame = build_read_frame(args.addr, args.reg)  # 预生成请求帧，循环内重复发送
     resp_wait = max(0.05, args.interval * 0.5)   # 读超时须大于从机响应时间
-    consec_fail = 0  # 连续失败计数，达到阈值即触发降频
+    consec_fail = 0  # 连续失败计数，达到阈值即判定该口未接设备（不降频）
     print(f'[*] [{name}] {dev} @ {args.baud} 8N1 就绪（addr=0x{args.addr:02X} '
           f'reg=0x{args.reg:04X}，请求 {binascii.hexlify(frame).decode()}）', flush=True)  # 打印就绪信息与请求帧十六进制
     try:  # 包裹主循环，保证退出时一定关串口
@@ -199,23 +200,23 @@ def channel_loop(name: str, args, stop: threading.Event, st: ChanStat, udp=None)
 
             raw = parse_response(resp, args.addr)  # 解析出毫米原始值，失败返回 None
             if raw is None:  # 本轮没有有效应答
-                consec_fail += 1  # 连续无应答计数，超阈值后自动降低该通道探测频率
+                consec_fail += 1  # 连续无应答计数，超阈值后判定该口未接设备（节奏不变）
                 st.note_fail()  # 记入失败统计
                 if consec_fail == NO_REPLY_SWITCH:  # 刚好达到阈值，判定动作只触发一次
-                    st.no_device = True  # 标记未接设备，后续按低频探测
+                    st.no_device = True  # 标记未接设备（状态上报用；节奏仍锁定 interval 不降频）
                     print(f'[!!] [{name}] 连续 {NO_REPLY_SWITCH} 次无响应，判定该口未接高度计；'
-                          f'降为 {SLOW_PROBE_INTERVAL}s 低频探测，接上设备后自动恢复', flush=True)  # 提示已降为低频探测
+                          f'读取节奏锁定 {args.interval}s 不降频，接上设备后自动恢复', flush=True)  # 提示未接设备但节奏不变
                     if udp:  # 开启 UDP 时才上报
                         udp.sendto(make_alt_frame(name, None, 'EMPTY'), args.pc_addr)  # 推 EMPTY 帧表示无设备
                     alt_shm_note(name, None, 'EMPTY')  # [AUV-MISSION 2026-09-26 改动 ③] 落盘 EMPTY
                 if consec_fail == 1:  # 仅首次失败打印，避免每轮刷屏
                     print(f'[!!] [{name}] 读取失败(no-reply): {binascii.hexlify(resp).decode()!r}', flush=True)  # 打印原始字节便于排查
             else:  # 本轮解析成功，拿到毫米读数
-                if consec_fail >= NO_REPLY_SWITCH:  # 说明此前正处于降频探测状态
-                    # 降频探测期间收到有效帧 -> 设备已接上，恢复正常节奏
-                    consec_fail = 0  # 清零连续失败，回到正常间隔
+                if consec_fail >= NO_REPLY_SWITCH:  # 说明此前处于"未接设备"状态
+                    # 未接设备期间收到有效帧 -> 设备已接上，清除未接标记
+                    consec_fail = 0  # 清零连续失败
                     st.no_device = False  # 清除未接设备标记
-                    print(f'[*] [{name}] 设备恢复，回到正常读取节奏', flush=True)  # 提示设备已重新接上
+                    print(f'[*] [{name}] 设备恢复', flush=True)  # 提示设备已重新接上
                 else:  # 本来就是正常状态
                     consec_fail = 0  # 清零连续失败计数
                 st.note_ok(raw)  # 记入有效统计
@@ -225,8 +226,8 @@ def channel_loop(name: str, args, stop: threading.Event, st: ChanStat, udp=None)
                     udp.sendto(make_alt_frame(name, raw, 'OK'), args.pc_addr)  # 推 OK 帧带上最新读数
                 alt_shm_note(name, raw, 'OK')  # [AUV-MISSION 2026-09-26 改动 ④] 落盘有效净空(mm)
 
-            # 调度：未接设备时慢探，正常时按 interval
-            sleep_s = SLOW_PROBE_INTERVAL if consec_fail >= NO_REPLY_SWITCH else args.interval  # 未接设备用 2s 慢探，否则用 --interval
+            # 调度：读取频率锁定为 --interval（默认 0.2s），无论是否未接设备都不降频
+            sleep_s = args.interval  # 恒定按 interval 轮询（2026-10-09 用户口径：锁定 0.2s）
             if sleep_s > 0:  # 间隔为 0 表示全速轮询
                 stop.wait(sleep_s)  # 可被停止事件提前唤醒的休眠
     finally:  # 正常退出或异常都要释放串口
