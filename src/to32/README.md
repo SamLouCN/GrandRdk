@@ -592,7 +592,6 @@ main.py --stm32 sim 冒烟 5s                     → 无 Traceback / ERR（退�
 
 ## 11. 相关路径
 
-- 板端项目：`/userdata/GrandRDK`（本目录）；备份：`/userdata/backup/`
 - 上位机：`D:\RC\ROV控制站_v3.3`（`pc_main2.py` / `protocol.py` / `README_zxq.md`）
 - 下位机固件：`XLB-V1.0-Servo/firmware/JXZK_XLB_lib`（`Src/JXZK_XLB_Protocol.c` 是协议权威）
 - 规范：`上位机对接说明_V2.md`（§4 命令 / §5 遥测 / §6 示例——**§6 深度示例有误**）

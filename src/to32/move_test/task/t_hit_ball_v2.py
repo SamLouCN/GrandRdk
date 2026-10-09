@@ -10,7 +10,9 @@
         悬停并调整 yaw：识别框 cx 经 KF1D（vservo）滤波后与画面中心比较，
         像素误差 × (FOV/画面宽) 换算 yaw 增量递推目标角；误差 ≤20px 连续保持
         20 帧 → 锁定航向 → Step3
-    Step3. Hit the target ball（未落地，用户后续给冲撞参数）
+    Step3. Hit the target ball（已落地 2026-10-09）：开环最高速前冲（surge 满档 +
+        锁死 Step2 对准航向 + 定深），撞到球（ACCx 突降，临时阈值 0.15 待标定）
+        即完成；RUSH_DUR_S(10s) 内没撞到 → 切 Exit：停推 + 自动上浮至水面安全区
 
 Step1/2 无兜底口径（2026-10-06 用户口径）：无 yaw 遥测 → wait_cmd 等待，
     绝不以 0 兜底；Step2 无球时保持航向悬停等待（判据失效不完成）。
@@ -50,18 +52,20 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
     # ---------------- Stage 契约（enter / step） ----------------
     def enter(self, now):                              # 阶段进入时 Mission 调用一次（初始化）
         self.idx = 0                                   # 内部子步骤序号：0=Step1 摇摆 / 1=Step2 对准
-        self.sts = [{}, {}]                            # 每个子步骤独立 st dict（Step3 落地时补第三个）
+        self.sts = [{}, {}, {}]                         # 每个子步骤独立 st dict（Step1/2/3）
         self._now = now                                # 缓存当前时间戳（供无参子步骤方法读取）
         self._dt = 0.0                                 # 缓存拍间隔（首拍 0，step() 里每拍刷新）
 
     def step(self, now, dt):                           # Stage 契约：每拍 Mission 调用，返回 cmd 或 None
         self._now = now                                # 刷新时间戳缓存
         self._dt = dt                                  # 刷新拍间隔缓存
-        while self.idx < 2:                            # 还有子步骤没跑完就继续（循环次数有界：≤子步骤数+1）
+        while self.idx < 3:                            # 还有子步骤没跑完就继续（循环次数有界：≤子步骤数+1）
             if self.idx == 0:                          # 当前子步骤是 Step1
                 cmd = self.step1_find_ball()           # 跑摇摆找球
-            else:                                      # 当前子步骤是 Step2
+            elif self.idx == 1:                        # 当前子步骤是 Step2
                 cmd = self.step2_turn_to_ball()        # 跑悬停对准
+            else:                                      # 当前子步骤是 Step3
+                cmd = self.step3_hit_ball()            # 跑开环冲撞
             if cmd is None:                            # 子步骤返回 None = 本子步骤完成
                 self.idx += 1                          # 切到下一个子步骤
                 continue                               # 同拍继续跑下一步（允许一拍内连续完成）
@@ -205,12 +209,72 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
     退出机制：
     机器撞到球，理论上会有一个冲击，使得ACCx出现一个突变，具体的阈值需要根据实际情况来确定。根据这个待定的阈值可以认为机器已经撞到球。
     '''
-    def step3_hit_ball(self):                         # Step3：开环最高速冲撞球（未落地）
+    def step3_hit_ball(self):                         # Step3：开环最高速冲撞球（ACCx 突降判撞球；超时切 Exit 上浮）
         self.log("Step3. Hit the target ball")        # 进入 Step3 打日志
-        # 1. 冲撞球，直接开环，以最高速度前进
-        return t_function._cmd(self.NAME, '冲撞中',  # 组冲撞控制帧：全速前进（surge=1.0）
-                               None, t_function._depth_out(self.sts[1], float(getattr(TC, 'AUV_HIT_V2_HEIGHT_CM', 60.0))),  # 沿用 Step2 定深
-                               surge=1.0, sway=0.0, yaw=None)  # 全速前进，横移/转向不动
+        # 1. 冲撞球，直接开环，以最高速度前进（surge 满档）
+        # 2. 退出机制：撞到球瞬间 ACCx 负向突变(突降) → 判已撞到球（阈值临时值待标定）；
+        #    若 RUSH_DUR_S(默认10s) 内一直没撞到 → 切 Exit：停止运动 + 自动上浮至水面
+        st = self.sts[2]                              # Step3 独立状态（mode/yaw_ref/t0/accx_buf/accx_base/accx_hit）
+        now, dt = self._now, self._dt                 # 本拍时间戳与拍间隔
+
+        # 0. 已进入 Exit 子状态（超时兜底触发过）：调上浮原语，到位即撞球阶段完成
+        if st.get('mode') == 'exit':                  # Exit 机制激活
+            cmd = t_function.exit_step(               # 调上浮退出原语（停推 + 上浮水面安全区）
+                self.ctx, st, now, dt,                # 参数：上下文 / 状态 / 时间 / 拍间隔
+                stage=self.NAME)                      # 阶段名（日志展示）
+            if cmd is None:                           # Exit 完成：已上浮到水面安全区
+                self.log('Step3 Exit 完成：已上浮至水面')  # 完成日志
+            return cmd                                # 未完成→继续上浮帧；完成→None 收尾本阶段
+
+        # 1. 起步：锁死冲撞航向（= Step2 对准结果）与冲撞起始时刻
+        if st.get('yaw_ref') is None:                 # 首拍锁存航向
+            y = self.get_yaw_now()                    # 读当前实际航向（Step2 完成时已对准球）
+            if y is None:                             # 无 yaw 遥测
+                return t_function.wait_cmd(self.NAME, 'Step3 无 yaw 遥测，等待(不以0兜底)')  # 本拍不下发，等遥测
+            st['yaw_ref'] = float(y)                  # 锁死冲撞航向（之后每拍固定下发，不跟随）
+            st['t0'] = now                            # 冲撞起始时刻（超时兜底计时起点）
+            self.log('Step3 锁死航向 %.1f°，开始全速冲撞' % st['yaw_ref'])  # 起步日志
+
+        # 2. 撞球判据：ACCx 突降（基线=前 N 拍均值锁定；当前 < 基线−阈值 连续 M 拍 → 撞到球）
+        ax = t_function._tel_f(self.ctx, 'acc_x')     # 读 x 轴加速度遥测（撞球瞬间的负向冲击峰）
+        hit = False                                   # 本拍"已撞到球"标记（默认否）
+        if ax is not None:                            # 有 acc_x 遥测才判（无遥测 → 纯靠超时兜底）
+            buf = st.setdefault('accx_buf', [])       # 基线缓冲（最近 N 拍）
+            buf.append(ax)                            # 收进缓冲
+            if len(buf) > 30:                         # 缓冲只留最近 30 拍
+                buf.pop(0)                            # 弹出最旧一帧
+            if st.get('accx_base') is None:           # 基线未锁存
+                bn = int(getattr(TC, 'AUV_TOUCH_ACC_BASE_N', 10))  # 基线窗口拍数（复用触壁键）
+                if len(buf) >= bn:                    # 攒够基线窗口
+                    st['accx_base'] = sum(buf[-bn:]) / bn  # 基线 = 窗口均值（锁定不再滑动）
+            drop = float(getattr(TC, 'AUV_HIT_V2_RUSH_ACCX_DROP', 0.15))  # 突降阈值(临时值,单位≈g)：acc_x<基线−此值 算命中
+            if st.get('accx_base') is not None:       # 基线就绪才判
+                if ax < (st['accx_base'] - drop):     # acc_x 相对基线突降（负向冲击峰）
+                    st['accx_hit'] = st.get('accx_hit', 0) + 1   # 命中计数 +1
+                else:                                 # 未突降
+                    st['accx_hit'] = 0                # 命中计数清零
+                hn = int(getattr(TC, 'AUV_TOUCH_ACC_HIT_N', 3))   # 连续命中拍数（复用触壁键）
+                hit = st['accx_hit'] >= hn            # 连续 M 拍命中 → 判已撞到球
+        if hit:                                       # 撞到球（ACCx 突降确认）
+            self.log('Step3 完成：ACCx 突降(%.1f vs 基线 %.1f)判已撞到球' % (ax, st['accx_base']))  # 完成日志
+            return None                               # 完成 Step3 = 撞球阶段完成（Mission 切下一阶段）
+
+        # 3. 超时兜底：RUSH_DUR_S(10s) 内没撞到 → 切 Exit（停止运动 + 自动上浮至水面）
+        elapsed = now - st['t0']                      # 冲撞已跑时长
+        if elapsed >= float(getattr(TC, 'AUV_HIT_V2_RUSH_DUR_S', 10.0)):  # 超时(时长可改)
+            self.log('Step3 超时 %.1fs 未撞到 → 进入 Exit（停推+上浮水面）' % elapsed)  # 兜底日志
+            st['mode'] = 'exit'                       # 激活 Exit 子状态（下拍起走 exit_step）
+            cmd = t_function.exit_step(               # 同拍切入：立即下发上浮帧
+                self.ctx, st, now, dt,                # 参数：上下文 / 状态 / 时间 / 拍间隔
+                stage=self.NAME)                      # 阶段名（日志展示）
+            if cmd is None:                           # Exit 首拍即完成（已在安全区）
+                self.log('Step3 Exit 完成：已上浮至水面')  # 完成日志
+            return cmd                                # 下发上浮帧（或 None 收尾本阶段）
+
+        # 4. 未撞到且未超时：下发本拍冲撞帧（全速前冲 + 定深 + 锁死航向）
+        return t_function._cmd(self.NAME, '冲撞中 t=%.1fs' % elapsed,  # 组冲撞控制帧
+                               st['yaw_ref'], t_function._depth_out(st, float(getattr(TC, 'AUV_HIT_V2_HEIGHT_CM', 60.0))),  # 锁死航向 + 定深(距池底 cm)
+                               surge=float(getattr(TC, 'AUV_HIT_V2_RUSH_SURGE', 1.0)))  # 满档前冲（sway 默认 0）
 
 
 # 阶段注册表：task_config.STAGE_TABLE 切换引用（一项 = 整个撞球任务；空表 = 开机即 DONE）

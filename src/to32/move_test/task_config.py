@@ -80,6 +80,13 @@ AUV_HIT_V2_KF_GATE_NSIGMA = 3.0  # KF 新息门限
 AUV_HIT_V2_KF_RESET_N = 5        # KF 连续拒收 N 帧 → 重置重捕
 AUV_HIT_V2_KF_TRUST_AGE_S = 0.2  # trust 门禁：喂舵新鲜度(≈2 个写帧周期)
 AUV_HIT_V2_KF_SIGMA_MAX = 60.0   # trust 门禁：滤波 σ 上限(px)，TODO 实测标定
+# Step3 冲撞（直接开环，最高速度前进；撞到球判据：ACCx 突降）
+AUV_HIT_V2_RUSH_SURGE = 1.0      # 冲撞推力档位：1.0 = 最高速度（-1~1 钳位）
+AUV_HIT_V2_RUSH_DUR_S = 10.0     # 超时兜底(s)：RUSH 期间没撞到东西 → 切 Exit（停推+上浮水面），可修改
+AUV_HIT_V2_RUSH_ACCX_DROP = 0.15 # ACCx 突降阈值(临时值,单位≈g)：acc_x < 基线−此值 → 判撞到球；TODO 实车标定
+# Exit 上浮（t_function.exit_step，2026-10-09 新增）：停止运动 + 自动上浮至水面安全区
+AUV_EXIT_TOL_CM = 10.0           # Exit 到位容差(cm)：actual_depth_cm ≤ (离水面余量+此值) 算到位
+AUV_EXIT_HOLD_N = 15             # Exit 带内保持拍数(20Hz≈0.75s)
 
 # SearchBall（task/t_search_ball.py，2026-10-06）：整体为一个阶段，转向 60° → 前进 2s → zigzag 扫描找球
 AUV_SEARCH_BALL_TURN_DEG = 60.0     # 先转向：相对当前 yaw 值**右转**角度(°，右为正)
@@ -166,8 +173,8 @@ except ImportError:
 from task.task_door.t_door import DOOR_TABLE
 
 # Task1 → SearchBall → HitBall → Task2 → Door → PickBall → Return。
-STAGE_TABLE = (TASK1_TABLE + SEARCH_BALL_TABLE + HIT_BALL_TABLE + TASK2_TABLE + DOOR_TABLE
-               + PICK_BALL_TABLE + RETURN_TABLE)
+STAGE_TABLE = (TASK1_TABLE + HIT_BALL_TABLE + TASK2_TABLE + DOOR_TABLE
+               + SEARCH_BALL_TABLE + PICK_BALL_TABLE + TASK4_TABLE + RETURN_TABLE)
 
 # 注：测试模式（test_mode/）的测试表在 test_mode/test_config.py 的 TEST_TABLE 配置，
 #     写法与本文件 STAGE_TABLE 相同（Stage 类列表表达式，可单阶段/多阶段任意拼），

@@ -562,3 +562,68 @@ def hover_step(ctx, st, now, dt, duration_s,
     _say_throttled(ctx, st, now, '%s t=%.1f/%.1fs depth=%.0fcm'
                    % (stage, elapsed, duration_s, d_target))
     return _cmd(stage, '悬停%.0fs' % duration_s, yaw=yaw_ref, depth=d_target)
+
+
+# ------------------------------------------------------------------ 
+# 原语 6：上浮退出（2026-10-09 新增：撞球超时兜底 / 异常收尾用）
+def exit_step(ctx, st, now, dt, surf_margin_cm=None, tol_cm=None, hold_n=None, stage='Exit'):
+    """上浮退出：停止运动(surge/sway=0) + 自动上浮至水面安全区 + 深度到位判完成。
+
+    行为：下发的 depth_cm = 离水面 surf_margin_cm（默认 AUV_SURF_SAFE_CM=25，
+    即防露头红线 —— 不贴水面，上浮到离水面 25cm 的安全位置即算到位）；
+    yaw 跟随当前航向(_yaw_hold)；surge/sway 恒 0（停止运动，不前进不横移）。
+    完成(2026-10-09 口径)：**固件深度计遥测 actual_depth_cm** 连续 hold_n 拍
+    ≤ (surf_margin_cm + tol_cm) 即完成 —— 与下发 depth_cm 同一固件口径(可直比)。
+    无 actual_depth_cm 遥测 → 无法判到位，**永不完成**，持续下发上浮指令
+    （安全语义：即使不判完成，船也在停推/上浮，不会失控；到位与否只影响任务状态机推进）。
+
+    参数说明：
+        ctx:               mission.Ctx —— 上下文(ctx.tel 遥测 / ctx.say 日志)
+        st:                dict —— 本阶段持久状态(函数自管键,见"st 键")
+        now:               float —— 当前时间戳(Mission.step 透传)
+        dt:                float —— 拍间隔秒数(Mission.step 透传)
+        surf_margin_cm:    float | None —— 上浮目标 = 离水面距离(cm)。
+                           None = AUV_SURF_SAFE_CM(缺省 25,防露头红线)
+        tol_cm:            float | None —— 到位容差(cm)。None = AUV_EXIT_TOL_CM(缺省 10)
+        hold_n:            int | None —— 带内保持拍数。None = AUV_EXIT_HOLD_N(缺省 15,≈0.75s)
+        stage:             str —— 阶段名(日志/展示用,默认 'Exit')
+
+    返回：cmd dict(mode_auv 据此组 0x09)；None = 本原语完成
+
+    st 键：t0 / ok_cnt / yaw_ref / yaw_ok / _log_ts
+    """
+    st.setdefault('t0', now)
+    st.setdefault('ok_cnt', 0)
+    if surf_margin_cm is None:
+        surf_margin_cm = float(getattr(TC, 'AUV_SURF_SAFE_CM', _SURF_SAFE_CM))
+    if tol_cm is None:
+        tol_cm = float(getattr(TC, 'AUV_EXIT_TOL_CM', 10.0))
+    if hold_n is None:
+        hold_n = int(getattr(TC, 'AUV_EXIT_HOLD_N', 15))
+
+    d_target = clamp_depth_cm(float(surf_margin_cm))   # 上浮目标固件深度 = 离水面余量（钳位防越界）
+    elapsed = now - st['t0']
+
+    # 完成判据：固件深度计遥测 actual_depth_cm（与下发 depth_cm 同口径）到水面安全带内
+    a_d = _tel_f(ctx, 'actual_depth_cm')
+    if a_d is not None:
+        in_band = a_d <= (float(surf_margin_cm) + tol_cm)
+        st['ok_cnt'] = st['ok_cnt'] + 1 if in_band else 0
+        _say_throttled(ctx, st, now,
+                       '%s 深度=%.1fcm 目标=%.0fcm ok=%d/%d t=%.1fs'
+                       % (stage, a_d, surf_margin_cm, st['ok_cnt'], hold_n, elapsed))
+    else:
+        st['ok_cnt'] = 0
+        _say_throttled(ctx, st, now, '%s 无 actual_depth_cm 遥测 → 不判到位(持续上浮)' % stage)
+    done = (st['ok_cnt'] >= hold_n)
+
+    yaw_ref = _yaw_hold(st, ctx)
+    if yaw_ref is None:
+        _say_throttled(ctx, st, now, '%s 无 yaw 遥测,航向保持不可靠(下发 0)' % stage)
+
+    if done:
+        ctx.say('%s 完成：已上浮至水面安全区(深度 %.0fcm)' % (stage, d_target))
+        return None
+
+    return _cmd(stage, '上浮至水面(深度目标 %.0fcm)' % d_target,
+                yaw=yaw_ref, depth=d_target)
