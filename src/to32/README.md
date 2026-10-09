@@ -22,6 +22,8 @@
 
 一句话：**上面说文本（`$`帧），下面说二进制（V2 帧），中间负责翻译、编排和安全。**
 
+> **2026-10-09 补充**：`mode_dispatcher._register_modes()` 已是**三态注册**（`TestMode`/`AuvMode`/`AuvModeStub`，见下第 58 行）；新增 `tel_shm_sink.py`（遥测落盘 `momo_telemetry.json`）；AUV 任务包 `move_test/` 的穿门已从 `task_pass_door` 重构为 `task/task_door/`（`t_door.py` `DoorTask`）。
+
 > **2026-10-07 v3.8**：PC 侧 PID 参数改走 **11B 二进制帧**（`CD 0A 01 CH KP_LE KI_LE KD_LE DC`，增益×100 / int16 小端 / ±327.68）——中位机先判二进制、严格校验后**原字节转发** STM32（默认仅放行 CH 0~3）；旧文本 `$PID` 仍丢弃；新增 `$TASKPID` 命名任务参数（仅 S100 处理，当前 gate，直接更新过门 GatePid 并 ACK 回 8081）。
 
 | 项 | 值 |
@@ -34,7 +36,7 @@
 | 下行/遥测端口 | UDP **8081**（收 PING、发 `$TEL`/PONG） |
 | 下位机串口 | `/dev/ttyCH9344USB5`（CH348 F 口），921600 |
 | 进程识别串 | `src/to32/main.py`（`status.sh` / `stop.sh` 用它匹配） |
-| 规模 | 17 个 .py（**2026-10-07 新增 `task_pid_wire.py` / `task_pid_controller.py`**），另有 `move_test/` 任务包 21 个 .py（2686 行）；无硬件回归脚本位于补丁包 `源码\GrandRdk-2.5\tests\`（**未拷入本项目/未入 git**）；行数为本地工作副本实测 |
+| 规模 | 18 个 .py（**2026-10-07 新增 `task_pid_wire.py` / `task_pid_controller.py`，2026-10-08 新增 `tel_shm_sink.py`**），另有 `move_test/` 任务包 26 个 .py（约 2700 行）；无硬件回归脚本位于补丁包 `源码\GrandRdk-2.5\tests\`（**未拷入本项目/未入 git**）；行数为本地工作副本实测 |
 
 ## 1. 文件功能速查
 
@@ -53,9 +55,9 @@
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `mode_base.py` | 92 | **模式基类** `ModeBase`，定义 10 个回调；新增模式只需继承它 |
-| `mode_dispatcher.py` | 641 | **编排核心**：模式注册/切换、`$CMD` 事件派发、安全三件套、tick 调度、`$TEL` 上行、5s 状态汇报；**2026-10-07 新增 PID 独立中继（`_on_pid_binary`/`_on_task_pid`，不切模式/不解急停/不保存）+ `task_pids` 注入** |
+| `mode_dispatcher.py` | 641 | **编排核心**：模式注册/切换、`$CMD` 事件派发、安全三件套、tick 调度、`$TEL` 上行、5s 状态汇报；**2026-10-07 新增 PID 独立中继（`_on_pid_binary`/`_on_task_pid`，不切模式/不解急停/不保存）+ `task_pids` 注入**；**2026-10-08 三态注册 + `on_stm32_telemetry` 调 `tel_shm_sink` 落盘** |
 | `mode_rov.py` | 198 | **ROV 遥控**：`$CMD` 杆位 → `0x09` 推力槽；heave→深度积分、yaw→航向积分；急停锁存期间抑制 `0x09` |
-| ~~`mode_auv.py`~~（已迁 `move_test/`） | — | **AUV 自主**：v2.5 重写起任务代码整体迁 `move_test/mode_auv.py`（123 行），**本目录不再有此文件**；`mode_dispatcher` 注册的是内联 `AuvModeStub` / 测试模式 `TestMode` |
+| ~~`mode_auv.py`~~（已迁 `move_test/`） | — | **AUV 自主**：v2.5 重写起任务代码整体迁 `move_test/mode_auv.py`，**本目录不再有此文件**；`mode_dispatcher` **2026-10-08 三态注册**：`test_mode/TEST_MODE_ENABLED=True`（当前默认）→ `TestMode` 接管 AUV 位跑 `TEST_TABLE`；`False` → 正式 `AuvMode`（动态加载 `move_test/mode_auv.py`，按 `STAGE_TABLE` 全序列跑并自动拉起深度卡尔曼）；`test_config` 异常/导入失败 → `AuvModeStub` 兜底宁停勿跑 |
 
 `ModeBase` 回调一览（`mode_base.py`）：
 
@@ -87,7 +89,13 @@
 | `task_pid_wire.py` | 81 | **`$TASKPID` 命名任务参数**编解码与 ACK 回帧（仅 S100 处理，不下发 STM32） | `build_task_pid`、`parse_task_pid`、`build_task_pid_ack`、`parse_task_pid_ack` |
 | `task_pid_controller.py` | 29 | **S100 真实任务 PID 对象**：`GatePid` 实例 + 过门任务工厂；`$TASKPID gate` 更新即时生效 | `TaskPidController.update(loop,p,i,d)`、`create_gate_mission(...)` |
 
-> `Dispatcher` 启动时构造 `TaskPidController` 并注入 `ctx.task_pids`；穿门阶段（`move_test/task/task_pass_door/t_pass_gate.py` 的 `PassGateAll`）经工厂共用同一被调参的 `GatePid`，参数更新**不启动任何任务**。
+> `Dispatcher` 启动时构造 `TaskPidController` 并注入 `ctx.task_pids`；穿门阶段（`move_test/task/task_door/t_door.py` 的 `DoorTask`，`NAME='PassGate'`，旧 `task_pass_door/t_pass_gate.py` 已清理）经工厂共用同一被调参的 `GatePid`，参数更新**不启动任何任务**。
+
+### 遥测落盘（2026-10-08 接回）
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `tel_shm_sink.py` | 81 | 下位机遥测落盘 `/dev/shm/momo_telemetry.json`（`depth_kalman` 等观测工程的遥测输入源）：写 **raw 协议值**（`depth_raw=cm×100`、姿态×100、加速度×100，与 `depth_config` 约定对齐）；`mode_dispatcher.on_stm32_telemetry` 每帧回调写一次，20Hz 节流、原子写（tmp + `os.replace`）、任何异常吞掉绝不影响主链路 |
 
 ### 图像回传（默认关闭，见第 7 节 WARNING）
 
@@ -270,6 +278,8 @@ python3 src/to32/main.py --no-video        # ★ 手动跑一定带上，理由�
 | 2026-10-01 | ★ **R8：测试代码迁出本目录** —— `selftest_modes.py` / `make_test_frame.py` / `test_v2_frames.py` → `hwless_tests/legacy_to32/`（补自足路径引导 + 源码守卫改绝对路径）；`port_probe.py` 作为运维排障工具**留原地**。本目录此后**不含任何测试脚本** |
 | 2026-10-01 | ⚠ **已知偏差**：`selftest_modes.py` 当前 66/68（"AUV 期间无 0x09" 2 例）。非 R8 引入，用迁移前原版在当前代码上复跑结果相同；根因是 AUV 模式已改为主动下发运动帧 |
 | 2026-10-07 | ★ **PID 中继 v3.8 落地**：`protocol.py` 新增 `parse_binary_pid`；`link_pc.py` 先判二进制再解码文本（并修复 `_stop` 覆盖）；`link_stm32.py` `send()` 整帧互斥写锁 + 短写检查、兜底轮询走同一 `send`；`mode_dispatcher.py` 独立 PID 中继（`_on_pid_binary`/`_on_task_pid`，不切模式/不解急停/不保存）+ `task_pids` 注入；新增 `task_pid_wire.py` / `task_pid_controller.py`；`config/to32_config.py` 新增 `PID_BINARY_PASSTHRU=True` / `PID_BINARY_MAX_CH=3` / `TASK_PID_ENABLED=True`；无硬件回归 30 项（16+14）**从补丁包 `源码\GrandRdk-2.5\tests\` 复跑全过**（脚本未拷入项目）。⚠ 未实机：STM32 通道接受/4~7 补偿环待联调；PC 侧需配套上位机 v3.8 |
+| 2026-10-08 | ★ **AUV 接回主链路 + 遥测落盘**：`mode_dispatcher._register_modes()` 改**三态注册**（`TEST_MODE_ENABLED=True`→`TestMode` 接管 AUV 位；`False`→正式 `AuvMode` 动态加载 `move_test/mode_auv.py`；配置异常→`AuvModeStub` 兜底）。新增 **`tel_shm_sink.py`**：遥测落盘 `momo_telemetry.json`（写 raw 协议值，20Hz 节流、原子写、异常吞掉）。`move_test/kalman_launcher.py` 恢复（深度自动托管） |
+| 2026-10-09 | 穿门重构：`move_test/task/task_pass_door/t_pass_gate.py`（`PassGateAll`）整体清理，改为 `task/task_door/t_door.py`（`DoorTask`，`NAME='PassGate'`，`DOOR_TABLE` 已入 `STAGE_TABLE`）；YOLO 模型按阶段热切换新增 `config/stage_model.py`（`mission._set_stage` 发布 `momo_stage.json` 驱动视觉换模型）；本文件同步 |
 
 ---
 

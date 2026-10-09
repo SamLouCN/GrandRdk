@@ -2,10 +2,10 @@
 
 RDK S100 板端工程 `/userdata/GrandRDK/src/` 的全部源码：**两路相机采集 + BPU 推理 → 共享内存 → Web/UDP 对外**，外加中位机（控制/遥测）、超声波高度计，以及 2026-10-01 迁入的两路卡尔曼（`kalman/`）。
 
-> **文档更新：2026-10-01**（两路卡尔曼按分类归位后重写；同日 R8 把测试代码全部迁出本目录）
-> 本目录规模：自写 **约 9870 行** = 顶层 10 个模块 3226 + `utils/flow_share.py` 144 + `to32/` 中位机 **4004**（*不含*已迁出的测试脚本，原 4881）+ **`kalman/` 两路卡尔曼 2256**；另有 vendored 库 `utils/py_utils/` **2299 行**（第三方，**别改**）。
-> **本目录不含任何测试代码**：原先散在 `to32/` 与 `kalman/depth_kalman/tests/` 的自检脚本已全部归口到 `hwless_tests/`（`legacy_to32/` + `legacy_depth_kalman/`，见 `hwless_tests/README_hwless_tests.md`）。各卡尔曼的 `run.sh --selftest/--mock` 仍可用，`TESTS` 变量已指向新落点。
-> 上级说明见 `/userdata/GrandRDK/README.md`（整工程：端口表、启停、排障、变更记录）；中位机详见 **`src/to32/README.md`**；两路卡尔曼各有一份自己的 `README.md`。
+> **文档更新：2026-10-09**（同步 v2.5 重写后的实际结构：`to32/` 中位机扁平层 + `to32/move_test/` 任务包、`stage_model` 按阶段热切换模型、`tel_shm_sink` 遥测落盘、卡尔曼由 AUV 托管恢复；原 2026-10-01 口径的 to32 文件行数与"任务代码在 to32/ 顶层"已失效）
+> 本目录规模：自写 **约 13k 行** = 顶层 10 个模块 3226 + `utils/flow_share.py` 144 + `to32/` 中位机 **约 2900**（`main/link_pc/link_stm32/mode_*/mode_dispatcher/protocol/tel_builder/tel_shm_sink/task_pid_*/video/port_probe/selftest_modes/make_test_frame/test_v2_frames`，*不含* `move_test/`）+ **`to32/move_test/` 任务包约 2700**（`task_config/obs/mission/kalman_launcher/mode_auv` + `task/` + `test_mode/`）+ **`kalman/` 两路卡尔曼 2283**；另有 vendored 库 `utils/py_utils/` **2299 行**（第三方，**别改**）。
+> **测试代码归属**：板端 `to32/` 保留 `selftest_modes.py`/`make_test_frame.py`/`test_v2_frames.py` 供自检；开发机镜像归口 `hwless_tests/`（见根 README）。
+> 上级说明见 `/userdata/GrandRDK/README.md`（整工程：端口表、启停、排障、变更记录）；中位机详见 **`src/to32/README.md`**；AUV 任务详见 **`src/to32/move_test/README.md`**；两路卡尔曼各有一份自己的 `README.md`。
 > 若本文档与代码注释冲突，**以代码注释为准**并顺手改回这里。
 
 ---
@@ -13,24 +13,25 @@ RDK S100 板端工程 `/userdata/GrandRDK/src/` 的全部源码：**两路相机
 ## 30 秒速览
 
 ```
-cam1 前视(USB 口 3-2) ─> front.py  ──┬─> momo_frame_front.bin  (JPEG)
+cam1 前视(USB 口 3-2) ─> front.py（StageDetector 按阶段热切换模型）──┬─> momo_frame_front.bin  (JPEG)
                                      ├─> momo_det_front.json    (检测框)
                                      └─> momo_stats_front.json  (fps/耗时)   ──> web_server.py :5000 ──> Nginx :80
 
-cam2 下视(USB 口 1-2) ─> bottom.py ──┬─> momo_frame_bottom.bin / det / stats ──> web_server.py
-                                     └─> momo_flow_bottom.bin   (NV12)      ──> flow_speed.py  :8000
+cam2 下视(USB 口 1-2) ─> bottom.py（同上）──┬─> momo_frame_bottom.bin / det / stats ──> web_server.py
+                                            └─> momo_flow_bottom.bin   (NV12，光流停用后不写)
 
 cam3 内窥镜(USB 口 1-1) ─> show_cam.py ──> :8084/stream（按需采集，空闲释放相机）
 
 CH348 A–E 超声波 ─> read_altimeter.py ──> UDP $ALT :8082  +  momo_alt.json
                                               │
-                                              └─> kalman/depth_kalman ──> momo_depth.json ──> to32/depth_if
+                                              └─> kalman/depth_kalman ──> momo_depth.json ──> to32/move_test/obs.py DepthIF
 
-momo_det_front.json ──> kalman/camera_kalman(viskf) ──> momo_viskf.json ──> to32/viskf_if
-                                                                                  └─> mission（PASS_GATE 闭环）
+★ YOLO 模型动态切换（2026-10-09）：
+   to32/move_test/mission._set_stage ──> /dev/shm/momo_stage.json ──> front/bottom 的
+   StageDetector.detect() 每帧读 → cfg 变化即热重载（ball/gate/pick 三套模型，见 config/stage_model.py）
 
-上位机 ──$CMD :8080──> to32/main.py ──UART──> STM32；遥测 ──$TEL :8081──> 上位机；AUV 状态 ──$AUV :8085──> 上位机
-   └─ mode=1 进 AUV ──> to32/kalman_launcher.py ──> 拉起上面两个卡尔曼（退出 AUV 时停掉自己起的）
+上位机 ──$CMD :8080──> to32/main.py ──UART──> STM32；遥测 ──$TEL :8081──> 上位机
+   └─ mode=1 进 AUV ──> to32/move_test/mode_auv.py ──> kalman_launcher.py（深度自动托管，2026-10-08 恢复）
 ```
 
 **三条铁律**
@@ -48,8 +49,9 @@ momo_det_front.json ──> kalman/camera_kalman(viskf) ──> momo_viskf.json 
 | **顶层** | 10 个 `.py` | 3226 | 采集 / 推理 / 共享内存 / Web / 光流 / 高度计，见第二节 |
 | `utils/` | `flow_share.py` | 144 | 自写，帧共享桥（给光流用） |
 | `utils/py_utils/` | 7 个 `.py` | 2299 | **vendored 第三方库（别改）** |
-| `to32/` | 20 个 `.py` + 4 个 `.md` | 4881 | 中位机：上位机/下位机双链路 + 模式层 + AUV 任务，见第四节 |
-| **`kalman/`** | 2 个子工程 | **2495** | ★ 2026-10-01 迁入：深度卡尔曼 + 图像（视觉）卡尔曼，见第五节 |
+| `to32/` | 16 个 `.py` + 4 个 `.md` | 约 2900 | 中位机：上位机/下位机双链路 + 模式层 + PID 中继 + 遥测落盘，见第四节 |
+| **`to32/move_test/`** | 核心 6 模块 + `task/` + `test_mode/` | 约 2700 | ★ AUV 任务包：任务参数 / 观测 / Mission / 卡尔曼托管 / 穿门等，见第四节 |
+| **`kalman/`** | 2 个子工程 | **2283** | ★ 2026-10-01 迁入：深度卡尔曼 + 图像（视觉）卡尔曼，见第五节 |
 
 ---
 
@@ -60,9 +62,9 @@ momo_det_front.json ──> kalman/camera_kalman(viskf) ──> momo_viskf.json 
 | 项 | 内容 |
 |---|---|
 | 相机 | `cam1` = USB 物理口 **3-2**（`config/camera_ports.py` 按物理口绑定，不写死节点号） |
-| 职责 | 采集 → YOLO 找 `door` + `red-ball`（2026-09-26 加球，撞球阶段要靠前视找球）→ 叠字 → 写共享内存 |
+| 职责 | 采集 → YOLO 检测（**2026-10-09 起经 `stage_model.StageDetector` 按阶段热切换模型**：基线 `door_3` 找 `door`；撞球/捡球阶段切到 `test_nashe`/`bottom`）→ 叠字 → 写共享内存；`PassGate` 阶段走穿门视觉跟踪管线（`move_test/task/task_door/front_pipeline`） |
 | 写 | `momo_frame_front.bin`(JPEG)、`momo_det_front.json`、`momo_stats_front.json` |
-| 架构 | **producer 线程采集 → `queue` → N 个 worker 并行推理**（`N_WORKERS`，见 `quick_config.py`） |
+| 架构 | **producer 线程采集 → `queue` → N 个 worker 并行推理**（`N_WORKERS`，见 `quick_config.py`；每个 worker 持有一个 `StageDetector`） |
 | 调度 | `run.sh` 用 `taskset` 绑 **CPU 0-2** |
 | 参数 | `--device` / `--index` / `--no-show` / `--workers N` / `--frames N`（跑 N 帧就退，调试用）/ `--timing` `--no-timing` / `--log` `--no-log` |
 
@@ -73,8 +75,8 @@ momo_det_front.json ──> kalman/camera_kalman(viskf) ──> momo_viskf.json 
 | 项 | 内容 |
 |---|---|
 | 相机 | `cam2` = USB 物理口 **1-2** |
-| 职责 | 采集 → YOLO 找 `red-ball` → 写共享内存；**额外写一帧 NV12 供光流测速** |
-| 写 | `momo_frame_bottom.bin` / `momo_det_bottom.json` / `momo_stats_bottom.json` / **`momo_flow_bottom.bin`(NV12)** |
+| 职责 | 采集 → YOLO 检测（同上 `StageDetector`；基线找 `door`）→ 写共享内存；**额外写一帧 NV12 供光流测速**（光流停用后默认不写） |
+| 写 | `momo_frame_bottom.bin` / `momo_det_bottom.json` / `momo_stats_bottom.json` / **`momo_flow_bottom.bin`(NV12，停用)** |
 | 调度 | `taskset` 绑 **CPU 3-5** |
 | 参数 | 同 `front.py` |
 
@@ -86,7 +88,7 @@ momo_det_front.json ──> kalman/camera_kalman(viskf) ──> momo_viskf.json 
 
 | 节 | 内容 |
 |---|---|
-| ① YOLO 检测器 | `YoloDetector` / `YoloDetect`，适配 **两种后端**：`hbm_runtime`（板端 BPU）与 `ultralytics`（开发机）。上层用法：`detector = YoloDetector(CFG['FRONT_YOLO']); detector.detect(frame, nv12=...)` |
+| ① YOLO 检测器 | `YoloDetector` / `YoloDetect`，适配 **两种后端**：`hbm_runtime`（板端 BPU）与 `ultralytics`（开发机）。上层用法：`detector = YoloDetector(CFG['FRONT_YOLO']); detector.detect(frame, nv12=...)`。★ **2026-10-09 起 front/bottom 用 `config/stage_model.py` 的 `StageDetector` 包装**（每帧读 `momo_stage.json`，按 AUV 阶段热切换模型配置，`is_current()` 丢过时结果） |
 | ② 水下图像预处理 | 颜色校正 + 高斯去噪 + CLAHE，**三个独立开关** |
 
 > 依赖 `config/main_config.DEFAULT_CONFIG` 与 `utils/py_utils/{preprocess,postprocess}`。
@@ -179,34 +181,45 @@ momo_det_front.json ──> kalman/camera_kalman(viskf) ──> momo_viskf.json 
 
 ---
 
-## 四、`to32/` —— 中位机（4881 行，2026-09-21 迁入）
+## 四、`to32/` —— 中位机（约 2900 行，2026-09-21 迁入）+ `to32/move_test/` AUV 任务包（约 2700 行）
 
-**扁平结构，不要拆子目录**（`selftest_modes.py` 会读同目录源码做守卫）。完整说明见 **`src/to32/README.md`**（线程模型、协议表、排障）。
+**`to32/` 扁平结构，不要拆子目录**（`selftest_modes.py` 会读同目录源码做守卫）；AUV 任务代码单独在 `move_test/` 子目录（2026-10-06 v2.5 重写迁入，**2026-10-08 接回主链路**）。完整说明见 **`src/to32/README.md`**（线程模型、协议表、排障）与 **`src/to32/move_test/README.md`**（任务状态机、STAGE_TABLE、穿门）。
+
+**`to32/` 文件表**：
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `main.py` | 288 | 入口：装配双链路 + 模式层并常驻 |
-| `link_pc.py` | 114 | 上位机链路：UDP :8080 收 `$CMD`/`$PID`/`$VID`/`PING`，:8081 发 `$TEL` |
+| `link_pc.py` | 114 | 上位机链路：UDP :8080 收 `$CMD`/`$PID`/`$VID`/`PING`，:8081 发 `$TEL`；**2026-10-07 起先判 11B 二进制 PID 走独立中继** |
 | `link_stm32.py` | 296 | 下位机链路：串口（CH348 F 口 `ttyCH9344USB5`）发 `0x09` 控制帧、收 `0x0C` 48 字节遥测帧 |
 | `protocol.py` / `tel_builder.py` | 84 / 76 | V2 协议组帧校验 / 拼 `$TEL` |
 | `mode_base.py` | 90 | `ModeBase` 抽象基类，10 个回调 |
+| `mode_idle.py` | 99 | ★（2026-10-04）**IDLE 待命模式**：上电默认进入，不发 0x04/0x09/0x0C，只回全 0 占位 `$TEL` |
 | `mode_rov.py` | 192 | ROV 手动模式：四轴直通；空闲静默 = 四轴全 0 才判回中 |
-| `mode_auv.py` | 178 | ★ AUV 自主模式：20 Hz 驱动 `mission.step()`；`on_enter/on_exit` 托管**两路**卡尔曼与状态上报 |
-| `mode_dispatcher.py` | 461 | 调度核心：模式切换与记忆、看门狗、急停锁存、抑制危险帧 |
-| `mission.py` | 805 | ★ AUV 任务状态机，17 阶段（撞球→过门→捡球→触壁→上浮），`_st_<阶段名小写>` 由 `getattr` 分发 |
-| `vision_if.py` / `depth_if.py` | 181 / 112 | ★ AUV 的视觉接口（`e_x`/可见性/`trust`）与深度接口（`D`/`v_z`/`clearance`/`sigma`） |
-| `viskf_if.py` | 129 | ★（2026-10-01 新增）读 `momo_viskf.json`，给过门阶段供滤波后的 `e_x` / `s_n` |
-| `kalman_launcher.py` | 350 | ★（2026-10-01 新增，取代并删除 `depth_launcher.py`）**两路**卡尔曼进程托管：幂等 `ensure_started()` + 只停自己起的 `stop()`；`DepthKalmanLauncher` + `ViskfLauncher` 各管一路，**互不影响** |
-| `auv_report.py` | 271 | ★（2026-09-30 新增）独立线程 5 Hz 推 `$AUV` → 上位机 :8085，非阻塞，失败 3 次永久放弃 |
-| `video.py` | 303 | 中位机自带图像回传，**2026-09-21 已停用**（`VIDEO_PATHS={}`、`VIDEO_ENABLED_AT_START=False`） |
-| `port_probe.py` | 74 | 串口探测（CH348 A~H 通道确认）：往各口发 ASCII 标记，看 PC 助手收到哪个；**运维排障工具，非测试代码** |
+| `mode_dispatcher.py` | 641 | 调度核心：模式切换与记忆、看门狗、急停锁存、抑制危险帧；**2026-10-08 三态注册**（`TestMode`/`AuvMode`/`AuvModeStub`）；PID 二进制中继 + `$TASKPID` + **`tel_shm_sink` 遥测落盘回调** |
+| `task_pid_wire.py` / `task_pid_controller.py` | 81 / 29 | ★（2026-10-07）`$TASKPID` 命名任务参数编解码与 ACK；S100 真实 `GatePid` 对象 |
+| `tel_shm_sink.py` | 81 | ★（2026-10-08 接回）下位机遥测落盘 `/dev/shm/momo_telemetry.json`（写 raw 协议值，与 depth_kalman 约定对齐；20Hz 节流、原子写、异常吞掉） |
+| `video.py` | 303 | 中位机自带图像回传，**2026-09-21 已停用** |
+| `port_probe.py` | 74 | 串口探测（CH348 A~H 通道确认）；**运维排障工具，非测试代码** |
+| `selftest_modes.py` / `make_test_frame.py` / `test_v2_frames.py` | 537 / 197 / 196 | 模式层离线自检 / V2 测试帧构造 / 帧解析测试（**板端保留**；开发机镜像归口 `hwless_tests/legacy_to32/`） |
 | `*.md`（4 个） | — | `README.md`、`README_中位机.md`、`ROV_指令与V2协议对应关系.md`、`上位机通讯协议.md` |
 
-> **2026-10-01（R8）**：本目录**不再有任何测试/自检脚本**。原 `selftest_modes.py` /
-> `make_test_frame.py` / `test_v2_frames.py`（及 `kalman/depth_kalman/tests/`）已全工程归口
-> 到 `hwless_tests/legacy_to32/`、`hwless_tests/legacy_depth_kalman/`。
-> 因此上一行"扁平结构不要拆子目录"的说法**已不适用于测试脚本**（源码目录仍建议扁平，
-> 但源码守卫已改为绝对路径指向本目录，见 `hwless_tests/README_hwless_tests.md` §九）。
+**`to32/move_test/` 任务包**（★ 2026-10-06 v2.5 全新重写；v2.2 的 `mission/mode_auv/vision_if/depth_if/viskf_if/auv_report` 6 文件已删，换成下述模块）：
+
+| 文件 | 职责 |
+|---|---|
+| `task_config.py` | **任务参数唯一入口** + `STAGE_TABLE`（**全序列**：Task1→撞球→Task2→穿门 `DOOR_TABLE`→SearchBall→捡球→Task4→Return）；含卡尔曼托管开关 `AUV_KALMAN_AUTOSTART=True`/`AUV_VISKF_AUTOSTART=False`、`AUV_POOL_DEPTH_CM=106`（2026-10-08 实测） |
+| `obs.py` | `VisionIF`（读 `momo_det_*.json`）+ `DepthIF`（读 `momo_depth.json`）；`CANON` 标签别名归一化（door→gate、red-ball→ball、yellow-ball→ball_y） |
+| `mission.py` | `Stage` 基类 + `Mission` 编排器；**每阶段 `_set_stage` 发布 `/dev/shm/momo_stage.json` 驱动视觉热切换**；STOP 哨兵；支持 `task_pids` 注入 |
+| `kalman_launcher.py` | ★（2026-10-08 恢复）`DepthKalmanLauncher`/`ViskfLauncher` 两路托管：幂等 `ensure_started()` + 只停自己起的 `stop()` |
+| `mode_auv.py` | AUV 模式壳：`on_enter/on_exit` 托管卡尔曼（深度自动拉起） |
+| `Task.md` | 2026 巡游任务阶段划分（定深口径公式 `depth_cm=实测水深−目标高度−机体高度20cm`） |
+| `task/` | 任务脚本：`t_task1/t_task2/t_search_ball/t_task4/t_return` + 撞球 `task_hit_ball/t_hit_ball.py`（v1）+ `t_hit_ball_v2.py`（v2，未挂表）+ 捡球 `t_pick_ring.py` + **穿门 `task/task_door/`**（`t_door.py` `DoorTask` `NAME='PassGate'`，`DOOR_TABLE`；旧 `task_pass_door/t_pass_gate.py` 2026-10-09 已清理） |
+| `test_mode/` | `test_config.py`（**`TEST_MODE_ENABLED=True` 当前默认**，`TEST_TABLE=TASK2_TABLE+RETURN_TABLE`）+ `test_runner.py`（`TestMode` 接管 AUV 位） |
+
+> **测试脚本归属（2026-10-04 澄清，板端/开发机口径不同）**：开发机镜像中 `selftest_modes` /
+> `make_test_frame` / `test_v2_frames` 已归口 `hwless_tests/legacy_to32/`；**板端（运行环境）没有
+> `hwless_tests/`，这几个脚本仍留在 `src/to32/`** 供板上自检。
 
 ---
 
@@ -237,15 +250,15 @@ export PYTHONPATH="/userdata/GrandRDK/config:/userdata/GrandRDK/src/kalman/depth
 | `depth_kalman/` | 1370 | `momo_alt.json`、`momo_telemetry.json` | `momo_depth.json` | 深度卡尔曼：EKF 融合深度计 + 两路朝下高度计 + 加速度，50 Hz |
 | `camera_kalman/` | 886 | `momo_det_front.json` | `momo_viskf.json` | 图像卡尔曼（viskf）：**不是 EKF**，3 个并联的 2 维 CV KF（`e_x`/`el`/`s_n`），纯 stdlib，50 Hz 循环 / 20 Hz 输出 |
 
-> **2026-10-01（R8）**：各自的 `tests/` 已**整体迁出包目录**（源码不引用它们），统一落在
-> `hwless_tests/legacy_depth_kalman/`（4 个文件）；生产机上整个 `hwless_tests/` 可删，不影响运行。
-> ⚠ `camera_kalman` 的 `tests/test_viskf.py` **从未存在**（`./run.sh --selftest` 会报缺文件），
-> 是既有缺口，与本次迁移无关。
+> **2026-10-08 起恢复 AUV 托管**（v2.5 重写期被删，现由 `to32/move_test/kalman_launcher.py` 承接）：
+> `AUV_KALMAN_AUTOSTART=True` → 进 AUV 自动拉起深度卡尔曼；`AUV_VISKF_AUTOSTART=False` → viskf 默认不拉起（需要时置 True）。
+> 测试代码仍在 `hwless_tests/legacy_depth_kalman/`（4 个文件）；生产机上整个 `hwless_tests/` 可删，不影响运行。
+> ⚠ `camera_kalman` 的 `tests/test_viskf.py` **从未存在**（`./run.sh --selftest` 会报缺文件），是既有缺口。
 
-### 5.1 生命周期 —— 挂在 AUV 模式上，没有独立启停脚本
+### 5.1 生命周期 —— 挂在 AUV 模式上（2026-10-08 恢复）
 
 ```
-上位机 "$CMD mode=1"
+上位机 "$CMD mode=1"（TEST_MODE_ENABLED=False 时）
    → mode_auv.on_enter → kalman_launcher 各路 ensure_started()   （幂等：已在跑就复用）
 上位机切回 ROV / 退出
    → mode_auv.on_exit  → 各路 stop()                             （只停自己起的那个）
@@ -286,7 +299,7 @@ python3 /userdata/GrandRDK/hwless_tests/run_legacy.py
 | `SHM_STATS_FRONT` | `momo_stats_front.json` | `front.py` | `web_server.py` |
 | `SHM_FRAME_BOTTOM` / `SHM_DET_BOTTOM` / `SHM_STATS_BOTTOM` | 同名 `_bottom` | `bottom.py` | `web_server.py` |
 | `SHM_FLOW_BOTTOM` | `momo_flow_bottom.bin`(NV12) | `bottom.py` | `flow_speed.py` |
-| `SHM_TELEM` | `momo_telemetry.json` | — | 汇总两路的统一遥测 JSON |
+| `SHM_TELEM` | `momo_telemetry.json` | **`to32/tel_shm_sink.py`（2026-10-08 接回）** | 汇总两路的统一遥测 JSON（深度卡尔曼等观测工程的输入源） |
 | （外部） | `momo_alt.json` | `read_altimeter.py` | **`kalman/depth_kalman`** |
 | （外部） | `momo_depth.json` | `kalman/depth_kalman` | **`to32/depth_if.py`** |
 | （外部） | `momo_viskf.json` | `kalman/camera_kalman` | **`to32/viskf_if.py`** |
@@ -301,13 +314,13 @@ python3 /userdata/GrandRDK/hwless_tests/run_legacy.py
 |---|---|---|
 | `front.py` | `taskset` CPU **0-2** | 共享内存 |
 | `bottom.py` | `taskset` CPU **3-5** | 共享内存 + 光流帧 |
-| `flow_speed.py` | `nice 19` | `:8000` |
-| `show_cam.py` | `nice 5` | `:8084` |
-| `web_server.py` | `nice 10` | `:5000` |
+| `flow_speed.py` | `nice 19` | :8000（**已停用**） |
+| `show_cam.py` | `nice 5` | :8084 |
+| `web_server.py` | `nice 10` | :5000 |
 | `read_altimeter.py` | `nice 5` | UDP `:8082` + `momo_alt.json` |
-| `to32/main.py` | `nice 5` | UDP 8080/8081/**8085** + 串口 F 口 |
-| `kalman/depth_kalman/main.py` | 由 AUV 模式拉起 | `momo_depth.json` |
-| `kalman/camera_kalman/viskf.py` | 由 AUV 模式拉起 | `momo_viskf.json` |
+| `to32/main.py` | `nice 5` | UDP 8080/8081 + 串口 F 口（**`$AUV` :8085 已删**） |
+| `kalman/depth_kalman/main.py` | 由 AUV 模式拉起（`AUV_KALMAN_AUTOSTART=True`） | `momo_depth.json` |
+| `kalman/camera_kalman/viskf.py` | 由 AUV 模式拉起（**当前 `AUV_VISKF_AUTOSTART=False` 不拉起**） | `momo_viskf.json` |
 
 **日常启停走工程根脚本**（`run.sh` / `status.sh` / `logs.sh` / `stop.sh`），不要手搓。
 两路卡尔曼**不进 `run.sh`** —— 那套 wait/kill 逻辑会放大故障；它们由 AUV 模式托管（见 §5.1）。
@@ -370,3 +383,8 @@ cd /userdata/GrandRDK/src/kalman/camera_kalman && ./run.sh --daemon   # 停：./
 | 2026-09-26 | `front.py` 目标加 `red-ball`（撞球阶段靠前视找球）；`mission.py` 17 阶段状态机定稿 |
 | 2026-09-30 | `to32/auv_report.py` 新增：5 Hz 推 `$AUV` → 上位机 :8085 |
 | 2026-10-01 | ★ **两路卡尔曼迁入 `kalman/` 并按分类拆开**：配置进 `config/`（`depth_config.py` / `viskf_config.py`），源码平铺在 `src/kalman/<名字>/`。`to32/depth_launcher.py`(221) 被 `kalman_launcher.py`(350) 取代并删除 —— 一路托管变**两路**；新增 `to32/viskf_if.py`(129)；`mission.py` 715→805（过门闭环接 viskf）；`mode_auv.py` 168→178。本目录自写 7893 → **10746 行** |
+| 2026-10-04 | **AUV 运动逻辑整体移入 `src/to32/move_test/`（主链路解耦）**：v2.2 的 `mission/mode_auv/vision_if/depth_if/viskf_if/auv_report/kalman_launcher` 7 文件搬入 `move_test/`；`mode_dispatcher` 改注册内联 `AuvModeStub`（不发 0x09）；光流整体停用（`FLOW_ENABLE`/`ENABLE_FLOW_SHARE_BOTTOM` False） |
+| 2026-10-06 | ★ **`move_test/` 全新重写为 v2.5 骨架**：v2.2 7 文件全删，换成 `task_config/obs/mission/mode_auv` 4 模块 + `Task.md`；新增 `task/`、`test_mode/` 目录；`TEST_MODE_ENABLED=True` 测试模式接管 AUV 位 |
+| 2026-10-07 | **PID 中继 v3.8 落地**：`to32/` 新增 `task_pid_wire.py`/`task_pid_controller.py`；`link_pc`/`link_stm32`/`protocol`/`mode_dispatcher` 联动 `$TASKPID` 与 11B 二进制 PID 中继 |
+| 2026-10-08 | ★ **AUV 接回主链路 + 卡尔曼托管恢复 + 模型回退**：`mode_dispatcher` 三态注册（TestMode/AuvMode/AuvModeStub）；`move_test/kalman_launcher.py` 恢复（`AUV_KALMAN_AUTOSTART=True` 深度自动拉起、`AUV_VISKF_AUTOSTART=False`）；新增 `to32/tel_shm_sink.py` 遥测落盘 `momo_telemetry.json`；`quick_config.py` 回退单模型（`YOLO_MODEL_FRONT/BOTTOM=door_3`、目标只 `door`）；`task_config.py` 全序列 STAGE_TABLE、`AUV_POOL_DEPTH_CM=106` 实测 |
+| 2026-10-09 | ★ **YOLO 模型按阶段动态切换**（新增 `config/stage_model.py`：`MODELS` 三套 + `STAGE_MODELS` 映射 + `StageDetector` 热重载）；front/bottom 改用 `StageDetector`；穿门重构为 `task/task_door/`（`t_door.py` `DoorTask`，`DOOR_TABLE` 入 STAGE_TABLE，旧 `task_pass_door` 清理）；`mission._set_stage` 发布 `momo_stage.json`；撞球 v2（`t_hit_ball_v2.py`）落地未挂表；`TEST_TABLE=Task2+Return`。本文件同步 v2.5 结构 |

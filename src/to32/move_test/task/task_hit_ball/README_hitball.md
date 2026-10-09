@@ -3,15 +3,18 @@
 状态：**已落地**（2026-10-07 v3.1） · 方案源：`strike_ball_plan.md`（本目录，唯一方案源）
 一句话：前视已见球 → KF+PID 跟随球心（只闭 yaw）→ 近场盲冲 → 撞后确认；失败后退找球重试，共 3 轮，轮尽上浮兜底。
 
+> **v1 / v2 关系（2026-10-09）**：本文件描述 **v1**（`t_hit_ball.py`，五相位轮次重试，当前 `STAGE_TABLE` 的 `HIT_BALL_TABLE` 引用它）。
+> 撞球 **v2**（`task/t_hit_ball_v2.py`，`HitBallAll` `NAME='HitBall_v2'`：Sway 扫视找球 → 转向对准 → 冲撞 → Exit 上浮）已落地但**暂未挂表**，切换时改 `task_config.py` 的 `HIT_BALL_TABLE` 引用即可。
+
 ---
 
 ## 1. 在整个任务序列里的位置
 
 ```
-Task1(下潜+直行) → SearchBall(下视zigzag找球) → 【HitBall 撞球】 → Task2(转向+直行) → PassGate(过门) → Return(回出发点)
+Task1(下潜+直行) → 【HitBall 撞球】(v1 挂表) → Task2(转向+直行) → PassGate(穿门, task_door) → SearchBall(下视zigzag找球) → Return(回出发点)
 ```
 
-STAGE_TABLE 实测 6 段（板端等价路径导入验证，2026-10-07）。HitBall 必须最先完成（规则红线：撞球前不得做过门/抓取）。
+STAGE_TABLE 实测 8 段（板端等价路径导入验证，2026-10-09：Task1→HitBall→Task2→Door→SearchBall→Return）。HitBall 必须最先完成（规则红线：撞球前不得做过门/抓取）。
 
 ## 2. 模块划分（模块化编程，三层）
 
@@ -109,7 +112,7 @@ front.py → /dev/shm/momo_det_front.json(~10Hz)
 4. **R/Q/SIGMA_MAX 回填**：录一段检测 JSON 算 cx 抖动方差回填 R；σ 上限照实测放宽/收紧
 5. **RAM_W_RATIO=0.45 标定**：球在"该冲"的距离上量框宽像素，算占比改阈值
 6. **SearchBall→HitBall 交棒衔接**：下视报"找到球"后前视是否真看得见（视场角差）
-7. `AUV_POOL_DEPTH_CM` 按 实测水深（~120）更新，影响工作高度换算与上浮目标
+7. `AUV_POOL_DEPTH_CM` 按 实测水深更新（**2026-10-08 现场实测 `AUV_POOL_DEPTH_CM=106`**，影响工作高度换算与上浮目标）
 
 ## 7. 已知边界（接受项）
 

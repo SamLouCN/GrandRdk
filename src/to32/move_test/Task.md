@@ -60,7 +60,7 @@ DIVE(60cm) → FWD(x1) → STRIKE_BALL → TURN(55cm,θ1) → FWD(x2) → GATE_1
 > ```
 >
 > 例：水深 130cm、撞球工作高度 60cm → depth_cm = 130 − 60 − 20 = **50**。
-> 实测水深进 task_config（池深实测后填写），机体高度 20cm 为固定常数。
+> 实测水深进 task_config（**2026-10-08 现场实测：`AUV_POOL_DEPTH_CM=106`，即净水深约 1.06m/1.2m 档**），机体高度 20cm 为固定常数。
 > ⚠ 2026-10-08：融合实测 H≈1.068m（momo_depth.json），配置仍 130cm ⇒ 目标整体偏深 ~23cm（离底 60cm 实际 ~37cm）。下发用固件深度计帧（减机体高度），判据用融合净空 —— 两者帧不同，别混比。
 
 #### Dive（下潜定深）→ `t_function.dive_step`
@@ -96,6 +96,10 @@ DIVE(60cm) → FWD(x1) → STRIKE_BALL → TURN(55cm,θ1) → FWD(x2) → GATE_1
 - **流程**：找门 → 对中（ex→0）→ 调深至本门 target_depth → 直行穿门。
 - **完成**：门 bbox 占宽先超阈值后收缩/消失（已穿出）+ 定时。
 - **兜底**：丢门 → 定时直行硬穿；判据失效 → 门宽阈值 + 定时。
+- **落地（2026-10-09）**：`task/task_door/t_door.py` `DoorTask(Stage)` `NAME='PassGate'`，状态机
+  ACQUIRE→YOLO_ALIGN→APPROACH_50→CV_ALIGN→APPROACH_80→CV_FINAL→BLIND→ACQUIRE，无门走
+  SEARCH_TURN/SEARCH_OBSERVE→RETURN_HEADING→EXIT；`DOOR_TABLE` 已入 `STAGE_TABLE`（顺序在 Task2 之后）；
+  视觉伺服在 `front.py` 的 `PassGate` 分支（`task_door/front_pipeline`）。
 - **红线**：按行进方向穿，反穿不得分；同门多次穿只计一次 → 不回头。
 
 #### Grab（抓取）

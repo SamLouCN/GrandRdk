@@ -4,13 +4,14 @@
 
 > **定位：独立模块。** 不接入 `GrandRDK/run.sh`、不改 `To32`、**不开任何串口**、
 > 不写别人产出的共享内存。只做两件事：读约定的落点文件 → 算 → 写自己的输出。
-> 数据落点还没做（P0 未通），所以**现在它读不到任何真实数据**，只能用合成数据验证。
+> **2026-10-08 起两个输入落点已接通**：遥测 `momo_telemetry.json`（`to32/tel_shm_sink.py` 落盘）、
+> 高度计 `momo_alt.json`（`read_altimeter.py` 落盘）——但高度计 A–E 路现场仍 no-reply，实际常缺高度观测。
 >
 > **📁 2026-10-01 归位**：已按宿主工程 GrandRDK 的分类拆开 ——
 > 配置进 `/userdata/GrandRDK/config/depth_config.py`，源码平铺在
 > `/userdata/GrandRDK/src/kalman/depth_kalman/`（详见 §2）。
-> 生命周期由 `src/to32/kalman_launcher.py` 的 `DepthKalmanLauncher` 托管
-> （上位机切 AUV 模式自动带起，退出自动停自己起的那个）。
+> 生命周期由 `src/to32/move_test/kalman_launcher.py` 的 `DepthKalmanLauncher` 托管
+> （上位机切 AUV 模式自动带起，退出自动停自己起的那个；**2026-10-08 恢复**，`AUV_KALMAN_AUTOSTART=True`）。
 >
 > **🧪 2026-10-01（R8）测试归口**：本模块的 `tests/` 已迁到
 > `/userdata/GrandRDK/hwless_tests/legacy_depth_kalman/`（全工程测试代码只留 `hwless_tests/` 一处）。
@@ -25,7 +26,7 @@
 | 项 | 结论 |
 |---|---|
 | 现在能跑吗 | ✅ 能。`./run.sh --selftest` 全绿；`./run.sh --mock` 端到端通 |
-| 有真实数据吗 | ❌ 没有。F 口遥测 0 帧、A–E 高度计全部 no-reply（见方案文档 §1） |
+| 有真实数据吗 | ⚠️ 部分。F 口遥测 **2026-10-04 实测已通**（0x0C 150 帧、`yaw` 有真值，2026-10-08 起落 `momo_telemetry.json`）；A–E 高度计仍全部 no-reply（见方案文档 §1） |
 | 融合有用吗 | ✅ 有用，但**价值在抗漂移，不在降噪**：深度计漂 8 cm 时误差从 4.5 cm 降到 1 mm（**8.8x**）；纯降噪只有 1.1~1.6x |
 | 最大风险 | 🔴 加速度单位未标定；`H_M` / `ALT_MOUNT` / 深度计零点全是占位值 |
 
@@ -88,7 +89,7 @@ python3 -m pytest -p no:anyio hwless_tests/legacy_depth_kalman/ -q              
 ```
 /userdata/GrandRDK/                            ← 宿主工程根
 ├── config/
-│   ├── auv_config.py          AUV 任务的唯一调参入口
+│   ├── auv_config.py          旧 AUV 参数（2026-10-06 起任务参数迁 `src/to32/move_test/task_config.py`）
 │   └── depth_config.py        ★ 本模块的全部可调参数（从包里搬上来的）
 └── src/kalman/depth_kalman/                   ← 本目录
     ├── README.md              ← 本文件
@@ -128,7 +129,7 @@ export PYTHONPATH="/userdata/GrandRDK/config:/userdata/GrandRDK/src/kalman/depth
 
 ## 3. 数据接口
 
-### 3.1 输入 A：`momo_telemetry.json`（**该落点还不存在，需 To32 侧新增**）
+### 3.1 输入 A：`momo_telemetry.json`（**2026-10-08 已接通**：`to32/tel_shm_sink.py` 每帧落盘，raw 协议值）
 
 ```json
 { "ts": 1790133164.5,
@@ -141,7 +142,7 @@ export PYTHONPATH="/userdata/GrandRDK/config:/userdata/GrandRDK/src/kalman/depth
 字段解析是**宽容**的：`depth_raw` / `depth_m` 都认，`acc_*` 与 `acc:{x,y,z}` 都认，
 缺字段就退化成"本次不更新"，文件被写坏也只是本次跳过。
 
-### 3.2 输入 B：`momo_alt.json`（**该落点还不存在，需 read_altimeter 侧新增**）
+### 3.2 输入 B：`momo_alt.json`（**已接通**：`read_altimeter.py` 默认落盘；现场 A–E 路 no-reply 时无有效通道）
 
 ```json
 { "ts": 1790133164.5,

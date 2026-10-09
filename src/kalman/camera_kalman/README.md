@@ -41,7 +41,8 @@ Q = q · [[dt³/3, dt²/2], [dt²/2, dt]]          连续白噪声加速度模�
 
 > **当前状态**：滤波器可独立运行，输出 `/dev/shm/momo_viskf.json`。
 > 已在真机视频上做过离线评测并按结论优化过一轮（`D:/RC/Test_any/README_测试报告.md`）。
-> **控制侧（中位机 mode_auv）尚未部署**，所以这个 JSON 现在还没有消费者 —— 先跑起来录数据。
+> **2026-10-09 起穿门主闭环已移到 `front.py` 前端管线**（`task/task_door/front_pipeline` 直接消费
+> `momo_det_front.json`），viskf 目前**仍无消费者** —— 先跑起来录数据，接回时沿用 §8 两条口径。
 
 ---
 
@@ -90,9 +91,8 @@ tail -f logs/viskf.log
 | 读 | `/dev/shm/momo_telemetry.json` | 中位机 To32 `shm_sink` | **自动降级**：当机体水平跑，`flags.att_degraded=True`（不报错、不阻塞） |
 | 写 | `/dev/shm/momo_viskf.json` | 本进程 | 原子写（tmp + `os.replace`），读端不会读到半个文件 |
 
-**姿态源现在大概率是缺的** —— `momo_telemetry.json` 要靠 To32 的 `shm_sink`（GrandRDK 侧改动）
-落盘，那个还没部署。缺姿态时 e_x / s_n 两条通道完全正常（它们不依赖姿态），只有 `el`
-（俯仰补偿后的水平系仰角）会退化成"按机体水平算"。
+**姿态源（2026-10-08 已接通）**：`momo_telemetry.json` 由 `to32/tel_shm_sink.py` 落盘（每帧写、20Hz 节流）。
+缺姿态时 e_x / s_n 两条通道完全正常（它们不依赖姿态），只有 `el`（俯仰补偿后的水平系仰角）会退化成"按机体水平算"。
 
 ## 4. 输出字段（`momo_viskf.json`）
 
@@ -160,7 +160,7 @@ tail -f logs/viskf.log
 |---|---|
 | `track=0` 且一直 `lost` | `momo_det_front.json` 的 mtime 是否在刷新（`front.py` 在跑吗）；`--status` 会报年龄 |
 | `e_x` 一直是 0 | 门上没有 `door` 类别的框，或分数低于 `VISKF_MIN_SCORE` |
-| `flags.att_degraded` 恒真 | `momo_telemetry.json` 不存在 = 中位机 `shm_sink` 未部署（**当前预期状态**） |
+| `flags.att_degraded` 恒真 | 遥测无数据（`momo_telemetry.json` 没有在刷新 = 下位机没回 `0x0C`，落盘链路 2026-10-08 已通） |
 | 提前 `clip` 然后 `lost` | 正常：门贴满视野 → bbox 被裁 → 检测丢。靠滑行 + 盲走穿门 |
 | `trust=0` 但 `track=1` | 正常，这就是 `coasting` 窗口：`age` 超 0.2s 或 `sig_x` 超 1.0。控制侧此时**不能用这个数** |
 | `n_clip_lr` 涨得比 `n_clip_tb` 快 | 说明门是**左右**出画（少见，真机数据里只占 10%）。若是这样，框宽 Δw 才真的不可信 |
@@ -175,8 +175,8 @@ tail -f logs/viskf.log
 | 层 | 内容 |
 |---|---|
 | 数据 | 共享内存约定文件名（§3）：读 `momo_det_front.json`（+ 可选 `momo_telemetry.json`），写 `momo_viskf.json` |
-| 生命周期 | 由 `GrandRDK/src/to32/kalman_launcher.py` 的 `ViskfLauncher` 托管：上位机切 AUV 模式（`mode_auv.on_enter`）自动拉起，退出时（`on_exit`）停掉自己起的那个。配置在 `GrandRDK/config/auv_config.py` 的 `AUV_VISKF_*` 段 |
-| 消费 | `GrandRDK/src/to32/viskf_if.py` 读 `momo_viskf.json`；`mission.py` 的 `PASS_GATE`（过门）阶段用它做 yaw + surge 伺服 |
+| 生命周期 | 由 `GrandRDK/src/to32/move_test/kalman_launcher.py` 的 `ViskfLauncher` 托管：上位机切 AUV 模式（`mode_auv.on_enter`）自动拉起，退出时（`on_exit`）停掉自己起的那个。配置在 `GrandRDK/src/to32/move_test/task_config.py` 的 `AUV_VISKF_*` 段；**当前 `AUV_VISKF_AUTOSTART=False`（默认不拉起，需要时置 True）** |
+| 消费 | ~~`GrandRDK/src/to32/viskf_if.py`~~（已删）。穿门主闭环 **2026-10-09 起在 `front.py` 内**（`task/task_door/front_pipeline` 直接消费 `momo_det_front.json`）；viskf 若要接回，沿用下方两条硬约定 |
 
 ⚠ 消费侧的两条硬约定（改本工程前必读）：
 ① `e_x` 归一化口径**恒定**为 `(cx−x0−dx0)/门框宽`，贴边也不许换成按画面宽；
