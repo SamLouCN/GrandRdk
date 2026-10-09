@@ -143,8 +143,8 @@ class YoloDetectConfig:  # YOLO 模型初始化参数集合
     anchor_sizes: list = field(default_factory=lambda: [80, 40, 20])  # 各检测头对应的 anchor 尺寸
 
 
-class YoloDetect:  # 基于 HB_HBMRuntime 的 YOLO DFL 检测封装
-    """基于 HB_HBMRuntime 的 YOLO DFL 检测封装。"""
+class YoloDetect:  # 基于 HB_HBMRuntime 的 YOLO 检测封装
+    """基于 HB_HBMRuntime，兼容 DFL 分布与直接 LTRB 距离输出。"""
 
     def __init__(self, config: YoloDetectConfig, timer=None):  # 加载模型并读取输入输出元信息
         self.timer = timer or NULL_TIMER  # 未传计时器则用空实现
@@ -241,7 +241,7 @@ class YoloDetect:  # 基于 HB_HBMRuntime 的 YOLO DFL 检测封装
             scores, ids, valid_indices = post_utils.filter_classification(  # 按阈值筛出有效候选
                 model_outputs[cls_key], conf_thres_raw)  # 传入分类输出与 logit 阈值
 
-            dbboxes = post_utils.decode_boxes(  # DFL 解码出候选框坐标
+            dbboxes = post_utils.decode_boxes(  # 按回归通道数选择 DFL 或直接 LTRB 解码
                 model_outputs[box_key], valid_indices,  # 回归输出与有效下标
                 anchor_size, stride, self.weights_static)  # anchor、步长与积分权重
 

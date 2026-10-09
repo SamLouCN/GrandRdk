@@ -8,7 +8,7 @@ ROOT="$(pwd)"                                                   # 当前绝对�
 CONFIG_DIR="$ROOT/config"                                       # 配置文件目录: 读 main_config.py 用
 
 echo "========== 进程 =========="                                # 标题: 列出每个 Python 进程是否在跑
-for name in front.py bottom.py web_server.py read_altimeter.py flow_speed.py show_cam.py; do  # 7 个主进程名(都是 src/<name>.py)
+for name in front.py to32/task_door_sim/run.py bottom.py web_server.py read_altimeter.py flow_speed.py show_cam.py; do  # 主进程路径（相对于 src/）
     pids=$(pgrep -f "src/$name" 2>/dev/null | tr '\n' ' ')      # 用 pgrep -f 按 cmdline 匹配; 多 PID 用换行转空格拼接
     if [ -n "$pids" ]; then                                     # 找到了: 进程在跑
         printf "  %-20s [ON ] pid=%s\n" "$name" "$pids"        # 打印 ON, 把 pid 列出(空格分隔多 pid)

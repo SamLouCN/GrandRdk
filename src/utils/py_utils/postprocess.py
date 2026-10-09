@@ -413,17 +413,16 @@ def decode_boxes(boxes_output: np.ndarray,
                  grid_size: int,
                  stride: int,
                  weights_static: np.ndarray) -> np.ndarray:
-    """Decode bounding boxes from distributional predictions.
+    """Decode LTRB distances or distributional predictions to bounding boxes.
 
-    This function decodes bounding box coordinates from distribution-based
-    regression outputs (e.g., 16-bin discrete distributions per side).
-    It applies softmax to each distribution, computes the expected offsets,
-    and converts them into bounding boxes in `(x1, y1, x2, y2)` format.
+    Four-channel outputs already contain distances in feature-grid units.
+    Distributional outputs first pass through softmax and integration.
+    Both are converted to `(x1, y1, x2, y2)` in model-input pixels.
 
     Args:
-        boxes_output: Bounding box output tensor with shape `(N, 4 * 16)`,
-            representing discrete distributions for left, top, right, and
-            bottom offsets.
+        boxes_output: Bounding box output tensor with shape `(N, 4)` for
+            direct left/top/right/bottom distances, or `(N, 4 * reg)` for
+            discrete distributions of those distances.
         valid_indices: Indices of valid predictions to be decoded.
         grid_size: Feature map grid size (e.g., width or height of the grid).
         stride: Downsampling factor used to map grid coordinates to the
@@ -435,16 +434,25 @@ def decode_boxes(boxes_output: np.ndarray,
         A NumPy array of shape `(M, 4)` containing decoded bounding boxes in
         `(x1, y1, x2, y2)` format, where `M = len(valid_indices)`.
     """
+    channels = boxes_output.shape[-1]
+    if channels != 4 and channels != 4 * weights_static.shape[-1]:
+        raise ValueError(
+            f"Unsupported box output shape {boxes_output.shape}: expected 4 LTRB "
+            f"channels or {4 * weights_static.shape[-1]} DFL channels")
     if valid_indices.size == 0:
         return np.empty((0, 4), dtype=np.float32)
     bboxes = boxes_output.reshape(-1, boxes_output.shape[-1])
-    bboxes_float32 = bboxes[valid_indices]
-    # 手写数值稳定 softmax, 替代 scipy.special.softmax 避免其固定开销
-    x = bboxes_float32.reshape(-1, 4, 16)
-    x_max = x.max(axis=2, keepdims=True)
-    e = np.exp(x - x_max)
-    probs = e / e.sum(axis=2, keepdims=True)
-    ltrb = np.sum(probs * weights_static, axis=2)
+    bboxes_float32 = bboxes[valid_indices].astype(np.float32, copy=False)
+    if channels == 4:
+        # 无 DFL 的门模型直接输出距离，不能再做 softmax/积分。
+        ltrb = bboxes_float32
+    else:
+        # 手写数值稳定 softmax, 替代 scipy.special.softmax 避免其固定开销
+        x = bboxes_float32.reshape(-1, 4, weights_static.shape[-1])
+        x_max = x.max(axis=2, keepdims=True)
+        e = np.exp(x - x_max)
+        probs = e / e.sum(axis=2, keepdims=True)
+        ltrb = np.sum(probs * weights_static, axis=2)
     # anchor 中心直接由 valid_indices 计算, 避免 gen_anchor 每次重建完整网格
     col = (valid_indices % grid_size).astype(np.float32) + 0.5
     row = (valid_indices // grid_size).astype(np.float32) + 0.5

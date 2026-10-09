@@ -4,9 +4,11 @@
 # ============================================================
 set -u                                       # 启用未定义变量检查; 拼错变量名立刻报错退出
 cd "$(dirname "$0")" || exit 1               # 切到脚本所在目录(GrandRDK 根); 失败就退出 1
+ROOT="$(pwd)"                                # 与 run.sh 一致，用于清理项目内 pidfile
 
 echo "[stop.sh] 停止检测与 Web 进程..."      # 给用户一个明确的进度提示
 pkill -f "src/front.py"         2>/dev/null  # 向前视检测进程发 SIGTERM (匹配 cmdline 含 src/front.py)
+pkill -f "src/to32/task_door_sim/run.py" 2>/dev/null # 门视觉测试前视进程
 pkill -f "src/bottom.py"        2>/dev/null  # 向下视检测进程发 SIGTERM
 pkill -f "src/web_server.py"    2>/dev/null  # 向 FastAPI :5000 Web 进程发 SIGTERM
 pkill -f "src/read_altimeter.py" 2>/dev/null # 向高度计进程发 SIGTERM
@@ -23,7 +25,7 @@ sleep 0.5                                    # 给上面的进程留出 SIGTERM 
 # uvicorn 的优雅关闭会等 StreamingResponse 生成器结束而长期不退出(端口已释放、
 # 进程挂着)。这里在宽限期后对仍存活的进程补一刀 SIGKILL(纯读共享内存, 无状态, 安全)。
 sleep 1.5                                    # 宽限期: 让 SIGTERM 优先走优雅路径
-for pat in "src/front.py" "src/bottom.py" "src/web_server.py" \
+for pat in "src/front.py" "src/to32/task_door_sim/run.py" "src/bottom.py" "src/web_server.py" \
            "src/read_altimeter.py" "src/flow_speed.py" "src/show_cam.py" "src/to32/main.py" \
            "kalman/depth_kalman/main.py"; do  # 遍历所有应被停掉的模式
     if pgrep -f "$pat" >/dev/null 2>&1; then  # 还活着: 需要 SIGKILL 兜底

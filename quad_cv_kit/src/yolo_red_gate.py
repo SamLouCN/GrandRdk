@@ -109,8 +109,9 @@ class YoloRedGateTracker:
             boxes.append(dict(detection, bbox=box, boundary_sides=sides, clipped=bool(sides)))
         return sorted(boxes, key=lambda d: (box_area(d['bbox']), d['score']), reverse=True)
 
-    def update(self, frame):
-        boxes = self._boxes(frame)
+    def update(self, frame, *, yolo_frame=None, cv_frame=None):
+        """Keep clean color evidence while optionally supplying enhanced inputs."""
+        boxes = self._boxes(frame if yolo_frame is None else yolo_frame)
         proposal = boxes[0] if boxes else None
         reason = 'largest-yolo-area' if proposal else 'yolo-gap'
         old = self.target
@@ -144,9 +145,10 @@ class YoloRedGateTracker:
         if self.target is not None:
             region = search_region(self.target['bbox'], (frame.shape[1], frame.shape[0]),
                                    self.target['clipped'], self.roi_padding)
-        cv_frame = enhance_cv_contrast(frame, self.cv_contrast, self.valid_mask,
-                                       self.cv_clahe_clip, self.cv_clahe_blend,
-                                       self.cv_sharpen, self.cv_saturation)
+        if cv_frame is None:
+            cv_frame = enhance_cv_contrast(frame, self.cv_contrast, self.valid_mask,
+                                           self.cv_clahe_clip, self.cv_clahe_blend,
+                                           self.cv_sharpen, self.cv_saturation)
         self.last_cv_frame = cv_frame
         selected, lines = self.cv.update(cv_frame, region,
                                          self.target['bbox'] if self.target else None,

@@ -15,6 +15,9 @@
 #
 # 用法:
 #   ./run.sh                     # 真实相机 + 全部启动
+#   ./run.sh --door-sim          # task_door_sim/run.py 调用 front.py：增强 -> YOLO/CV -> 共享帧 -> :5000/cam1
+#   ./run.sh --door-sim --to32-args "--mode rov"   # ROV 启动，同时运行门视觉测试
+#   ./run.sh --door-sim --door-sim-args "--contrast 1.3 --sharpen 0.8"   # 测试参数透传
 # #   ./run.sh --frames 100        # 每个检测进程跑 100 帧
 #   ./run.sh --no-web            # 只跑检测, 不起 Web/Nginx
 #   ./run.sh --setup-only        # 只做初始化 (依赖检查 + Nginx 配置)
@@ -63,6 +66,9 @@ TO32_ESTOP=0 # 1=保留中位机自动急停与锁存
 TO32_DIR="$SRC_DIR/to32" # 中位机目录，可用 --to32-dir 覆盖
 NO_FLOW=0 # 1=不启动光流测速
 NO_SHOWCAM=0 # 1=不启动第三路相机推流
+DOOR_SIM=0 # 1=经 task_door_sim/run.py 启动 front.py，注入门视觉算法
+DOOR_SIM_ARGS=() # 门视觉测试专用参数，普通检测参数仍传给 front/bottom
+DOOR_SIM_ARGS_STR="" # --door-sim-args 原始字符串
 DETECT_ARGS=() # 透传给 front/bottom 的参数数组
 ALT_ARGS=() # 高度计参数数组
 ALT_ARGS_STR="" # --alt-args 原始字符串，稍后按空白切分
@@ -79,6 +85,13 @@ while [ $# -gt 0 ]; do # 还有参数就继续解析
         --no-web)    NO_WEB=1; shift ;;
         --no-nginx)  NO_NGINX=1; shift ;;
         --setup-only) SETUP_ONLY=1; shift ;;
+        --door-sim)       DOOR_SIM=1; shift ;;
+        --door-sim-args)
+            if [ $# -lt 2 ]; then
+                echo "[run.sh] [X] --door-sim-args 需要参数字符串" >&2
+                exit 1
+            fi
+            DOOR_SIM_ARGS_STR="$2"; shift 2 ;;
         --no-altimeter)   NO_ALTIMETER=1; shift ;;
         --alt-channels)   ALT_ARGS+=("--channels" "$2"); shift 2 ;;
         --alt-channels=*) ALT_ARGS+=("--channels" "${1#*=}"); shift ;;
@@ -103,6 +116,28 @@ while [ $# -gt 0 ]; do # 还有参数就继续解析
             ;;
     esac # 参数分支处理结束
 done # 参数全部解析完毕
+
+if [ -n "$DOOR_SIM_ARGS_STR" ]; then
+    if [ "$DOOR_SIM" != "1" ]; then
+        echo "[run.sh] [X] --door-sim-args 需配合 --door-sim" >&2
+        exit 1
+    fi
+    read -r -a _DOOR_SIM_EXTRA <<< "$DOOR_SIM_ARGS_STR"
+    DOOR_SIM_ARGS+=(${_DOOR_SIM_EXTRA[@]+"${_DOOR_SIM_EXTRA[@]}"})
+    # 自定义共享目录同时作用于视觉与 web_server，避免读写不同目录。
+    for ((i=0; i<${#DOOR_SIM_ARGS[@]}; i++)); do
+        case "${DOOR_SIM_ARGS[i]}" in
+            --shm-dir)
+                if [ $((i+1)) -ge ${#DOOR_SIM_ARGS[@]} ]; then
+                    echo "[run.sh] [X] --shm-dir 需要目录" >&2
+                    exit 1
+                fi
+                export GRDK_SHM_DIR="${DOOR_SIM_ARGS[i+1]}"
+                ;;
+            --shm-dir=*) export GRDK_SHM_DIR="${DOOR_SIM_ARGS[i]#*=}" ;;
+        esac
+    done
+fi
 
 # --alt-args 原始透传: 按空白切分成独立参数
 if [ -n "$ALT_ARGS_STR" ]; then # 只有传了 --alt-args 才切分
@@ -149,8 +184,16 @@ print(getattr(m, '$1', ''))                     # 只输出目标值一行
 # ============================================================
 info "项目根: $ROOT" # 打印项目根路径
 
+FRONT_SCRIPT="$SRC_DIR/front.py"
+FRONT_LOG="$LOG_DIR/front.log"
+FRONT_ARGS=(${DETECT_ARGS[@]+"${DETECT_ARGS[@]}"})
+if [ "$DOOR_SIM" = "1" ]; then
+    FRONT_SCRIPT="$SRC_DIR/to32/task_door_sim/run.py"
+    FRONT_ARGS=(${DOOR_SIM_ARGS[@]+"${DOOR_SIM_ARGS[@]}"} ${DETECT_ARGS[@]+"${DETECT_ARGS[@]}"})
+fi
+
 # 检查关键文件
-for f in "$CONFIG_DIR/main_config.py" "$SRC_DIR/front.py" "$SRC_DIR/bottom.py"; do # 逐个检查启动必需文件
+for f in "$CONFIG_DIR/main_config.py" "$SRC_DIR/front.py" "$FRONT_SCRIPT" "$SRC_DIR/bottom.py"; do
     if [ ! -f "$f" ]; then # 文件不存在
         err "缺少文件: $f" # 报错提示
         exit 1 # 缺关键文件直接中止
@@ -194,6 +237,7 @@ fi # setup-only 分支结束
 # ============================================================
 info "清理旧进程..." # 提示开始清理
 pkill -f "src/front.py"        2>/dev/null # 杀掉上一轮前视进程，没匹配到也不报错
+pkill -f "src/to32/task_door_sim/run.py" 2>/dev/null # 切换测试/普通前视时释放相机与共享写端
 pkill -f "src/bottom.py"       2>/dev/null # 杀掉上一轮下视进程
 pkill -f "src/web_server.py"   2>/dev/null # 杀掉上一轮 Web 服务
 pkill -f "src/read_altimeter.py" 2>/dev/null # 杀掉上一轮高度计进程
@@ -210,13 +254,17 @@ rm -f /dev/shm/momo_*.bin /dev/shm/momo_*.json 2>/dev/null # 删除旧共享内�
 # ============================================================
 # 3. 启动检测进程
 # ============================================================
-info "启动 front.py (CPU 0-2)" # 提示启动前视
-taskset -c 0-2 python3 "$SRC_DIR/front.py" "${DETECT_ARGS[@]}" \
-    > "$LOG_DIR/front.log" 2>&1 & # 前视日志重定向并放入后台
+if [ "$DOOR_SIM" = "1" ]; then
+    info "启动 task_door_sim/run.py -> front.py (CPU 0-2；采集/共享帧由 front.py 管理；日志 $FRONT_LOG)"
+else
+    info "启动 front.py (CPU 0-2)"
+fi
+taskset -c 0-2 python3 "$FRONT_SCRIPT" ${FRONT_ARGS[@]+"${FRONT_ARGS[@]}"} \
+    > "$FRONT_LOG" 2>&1 & # 前视日志重定向并放入后台
 PID_FRONT=$! # 记录前视进程 PID
 
 info "启动 bottom.py (CPU 3-5)" # 提示启动下视
-taskset -c 3-5 python3 "$SRC_DIR/bottom.py" "${DETECT_ARGS[@]}" \
+taskset -c 3-5 python3 "$SRC_DIR/bottom.py" ${DETECT_ARGS[@]+"${DETECT_ARGS[@]}"} \
     > "$LOG_DIR/bottom.log" 2>&1 & # 下视日志重定向并放入后台
 PID_BOTTOM=$! # 记录下视进程 PID
 
@@ -224,8 +272,8 @@ sleep 2 # 等检测进程初始化并建好共享内存
 
 # 检测进程是否活着
 if ! kill -0 $PID_FRONT 2>/dev/null; then # kill -0 只探活，进程没了说明启动失败
-    err "front.py 启动失败, 查看 $LOG_DIR/front.log" # 报错并指路日志
-    tail -n 20 "$LOG_DIR/front.log" # 打印日志尾部便于定位
+    err "$FRONT_SCRIPT 启动失败, 查看 $FRONT_LOG" # 报错并指路日志
+    tail -n 20 "$FRONT_LOG" # 打印日志尾部便于定位
     exit 1 # 前视是主链路，失败直接中止
 fi # 前视探活结束
 if ! kill -0 $PID_BOTTOM 2>/dev/null; then # 下视探活
@@ -451,6 +499,7 @@ echo "" # 输出空行做视觉分隔
 info "============================================" # 打印分隔线
 info " 启动完成" # 提示启动完成
 info " 前视 pid : $PID_FRONT" # 打印前视 PID
+[ "$DOOR_SIM" = "1" ] && info " 前视流程 : task_door_sim/run.py -> front.py -> 共享帧 -> :5000/cam1"
 info " 下视 pid : $PID_BOTTOM" # 打印下视 PID
 [ -n "$PID_ALT" ]    && info " Alt  pid : $PID_ALT" # 高度计启动成功才打印该行
 [ -n "$PID_TO32" ]   && info " Mid  pid : $PID_TO32" # 中位机启动成功才打印该行

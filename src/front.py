@@ -19,9 +19,11 @@ front.py — 前视任务入口（真实相机 + YOLO 检测输出）
 import argparse  
 import os   
 import queue  
+import signal
 import sys  
 import threading  
 import time  
+import traceback
 
 # ---- 路径注入: config/ + src/ + src/utils/ ----
 _HERE = os.path.dirname(os.path.abspath(__file__))  # 当前文件所在目录 src/ 的绝对路径，避免受运行目录影响
@@ -311,14 +313,21 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
                 time.sleep(LOOP_SLEEP)  # 主动让出 CPU，控制采集节奏
     finally:  # 无论正常结束还是异常都执行
         for _ in range(n_workers):  # 给每个 worker 各放一个结束哨兵
-            q.put(None)  # None 是 worker 的退出信号
+            while not stop.is_set():
+                try:
+                    q.put(None, timeout=.1)  # 停止时不阻塞在已无人消费的满队列。
+                    break
+                except queue.Full:
+                    continue
 
 
 def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检测 worker：推理并把帧与结果写进共享内存
-           frame_w, det_w):  # 共享内存写端：帧二进制与检测结果 JSON
+           frame_w, det_w, door_sim_processor=None, door_sim_model_path=None):
     """检测 worker：检测 -> 写帧/检测结果到共享内存。"""
-    detector = StageDetector(YOLO_CFG, YoloDetector, shm_dir=MC.SHM_DIR) if YOLO_ENABLED else None
+    detector = (StageDetector(YOLO_CFG, YoloDetector, shm_dir=MC.SHM_DIR)
+                if YOLO_ENABLED and door_sim_processor is None else None)
     idx = 0  # 本 worker 的检测序号，用于终端输出计数
+    next_vision_error_log = 0.0
     while not stop.is_set():  # 停止事件未置位就持续取帧
         try:  # 取队列可能超时
             item = q.get(timeout=0.5)  # 半秒超时，保证能及时响应停止事件
@@ -329,7 +338,30 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
         fid, frame, nv12, captured_at = item  # 同帧图像及采集时间
         status = 'no_yolo' if detector is None else 'done'  # 未启用 YOLO 时日志状态标记为 no_yolo
         door_published = False
-        if detector is not None and detector.current_stage() == 'PassGate':
+        door_sim_observation = None
+        if door_sim_processor is not None:
+            if frame is None and nv12 is not None:
+                frame = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+            if frame is None:
+                continue
+            t0 = time.perf_counter()
+            try:
+                frame, dets, door_sim_observation = door_sim_processor.process(frame)
+                status = 'done'
+            except Exception as exc:
+                # 算法故障仍发布当前相机画面，避免 cam1 因反复丢帧停在旧图。
+                now = time.monotonic()
+                if now >= next_vision_error_log:
+                    print('[front][DoorSim] 视觉处理失败: %r; model=%s'
+                          % (exc, door_sim_model_path), file=sys.stderr, flush=True)
+                    traceback.print_exc()
+                    next_vision_error_log = now + 5.0
+                dets = []
+                status = 'vision_error'
+                door_sim_observation = dict(valid=False, has_target=False, reason=str(exc))
+            if enable_timing:
+                stats.add('detect', time.perf_counter()-t0)
+        elif detector is not None and detector.current_stage() == 'PassGate':
             if frame is None and nv12 is not None:
                 frame = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
             try:
@@ -365,7 +397,8 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
         if frame is None and nv12 is not None:  # 只有 NV12 时需要自己转成 BGR
             frame = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)  # NV12 转 BGR，供显示和 JPEG 编码使用
         if frame is not None:  # 有可视帧才做后续写共享内存与显示
-            vis = draw_detections(frame, dets) if dets else frame  # 有检测目标就画框，否则直接用原图
+            vis = (frame if door_sim_processor is not None else
+                   draw_detections(frame, dets) if dets else frame)
 
             # ---- 写帧到共享内存 ----
             if frame_w is not None and not door_published:  # 门流程已发布带 YOLO/CV 标注的校正图
@@ -374,6 +407,8 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                     [cv2.IMWRITE_JPEG_QUALITY, MC.WEB_MJPEG_QUALITY])  # 压缩质量取全局配置，平衡带宽与画面清晰度
                 if ok:  # 编码成功才有数据可写
                     try:  
+                        if door_sim_processor is not None:
+                            frame_w.width, frame_w.height = frame.shape[1], frame.shape[0]
                         frame_w.write(buf.tobytes())  # 把 JPEG 字节写入共享内存 /dev/shm
                     except Exception:  # 写失败不影响主流程
                         pass  # 忽略异常，继续处理下一帧
@@ -383,7 +418,7 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                 continue  # JPEG 编码期间也可能发生阶段切换。
             if det_w is not None and not door_published:  # 门流程已发布同帧几何
                 try:  # 写失败不中断
-                    det_w.write({  # 写入本帧检测结果
+                    payload = {  # 写入本帧检测结果
                         'frame': fid,  # 帧号，供消费端对齐画面
                         'ts': time.time(),  # 时间戳，供消费端判断数据是否过期
                         'capture_ts': captured_at,
@@ -391,7 +426,11 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                         'dets': dets,  # 检测目标列表
                         'stage': detector.stage if detector is not None else 'IDLE',
                         'model_path': detector.cfg['model_path'] if detector is not None else None,
-                    })
+                    }
+                    if door_sim_processor is not None:
+                        payload.update(stage='DoorSim', model_path=door_sim_model_path,
+                                       door_sim=door_sim_observation)
+                    det_w.write(payload)
                 except Exception:  # 写 JSON 异常一概忽略
                     pass  # 跳过本帧，下一帧再试
 
@@ -433,7 +472,7 @@ def display_loop(disp_q, stop):  # 显示线程：独立跑 imshow，避免阻�
             pass  # 忽略即可
 
 
-def main():  # 程序入口：组装参数、起线程、收尾
+def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_source=None):
     ap = argparse.ArgumentParser(description='front 任务（真实相机 + YOLO）')  # 命令行解析器
     ap.add_argument('--device', type=str, default=None)  # 指定相机设备路径，缺省取配置文件
     ap.add_argument('--index', type=int, default=None)  # 指定相机索引号，与 --device 二选一
@@ -444,7 +483,9 @@ def main():  # 程序入口：组装参数、起线程、收尾
     ap.add_argument('--no-timing', action='store_true')  # 强制关闭耗时统计
     ap.add_argument('--log', action='store_true')  # 强制开启逐帧日志
     ap.add_argument('--no-log', action='store_true')  # 强制关闭逐帧日志
-    args = ap.parse_args()  # 解析命令行参数
+    args = ap.parse_args(argv)  # 解析命令行参数
+    if door_sim_processor is not None:
+        args.workers = 1  # 一个跟踪器按采集顺序处理，共享帧也只有一个写入者。
 
     enable_timing = TIMING  # 默认取配置文件里的统计开关
     if args.timing:  # 命令行显式要求开启
@@ -495,7 +536,13 @@ def main():  # 程序入口：组装参数、起线程、收尾
 
     device = args.device if args.device is not None else CAM.get('device')  # 命令行 --device 优先，否则用配置的设备路径
     index = args.index if args.index is not None else CAM.get('index')  # 命令行 --index 优先，否则用配置的索引号
-    cap = open_camera(device, index)  # 打开相机，内部优先尝试硬解
+    if video_source is None:
+        cap = open_camera(device, index)  # 相机沿用 front 的 JPU / OpenCV 采集链路。
+    else:
+        cap = cv2.VideoCapture(video_source)
+        if not cap.isOpened():
+            cap.release()
+            cap = None
     if cap is None:  # 相机打开失败
         print(f'[{TASK}] 真实相机打开失败: device={device} index={index}，进程退出', flush=True)  # 打印失败详情，便于现场排查设备号
         frame_w.close(); det_w.close(); stats_w.close()  # 退出前先释放已创建的共享内存写端
@@ -519,12 +566,16 @@ def main():  # 程序入口：组装参数、起线程、收尾
         threads.append(threading.Thread(  # 追加一个 worker 线程
             target=worker,  # 线程入口为 worker
             args=(i, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 第 i 个 worker 的全部入参
-                  frame_w, det_w),  # 共享内存写端：帧与检测结果
+                  frame_w, det_w, door_sim_processor, door_sim_model_path),
             daemon=True))  # 守护线程属性
     if show:  # 需要显示才起显示线程
         threads.append(threading.Thread(  # 追加显示线程
             target=display_loop, args=(disp_q, stop), daemon=True))  # 显示线程只需要显示队列和停止事件
 
+    old_handlers = {}
+    if door_sim_processor is not None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            old_handlers[sig] = signal.signal(sig, lambda *_: stop.set())
     for th in threads:  # 遍历所有线程
         th.start()  # 统一启动
     try:  # join 期间可被 Ctrl+C 打断
@@ -533,6 +584,9 @@ def main():  # 程序入口：组装参数、起线程、收尾
     except KeyboardInterrupt:  # 捕获 Ctrl+C
         stop.set()  # 置停止事件，让各线程自行退出循环
     finally:  # 不论正常还是异常都清理资源
+        stop.set()
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
         if cap is not None:  # 相机对象存在才释放
             cap.release()  # 释放相机设备，否则下次可能打不开
         if log_writer is not None:  # 日志对象存在才关闭

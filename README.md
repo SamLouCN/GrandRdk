@@ -464,6 +464,9 @@ momo_det_front.json ──> src/kalman/camera_kalman/（图像卡尔曼 viskf �
 
 ```bash
 ./run.sh                      # 真实相机，全部启动（光流除外——已停用）
+./run.sh --door-sim            # task_door_sim/run.py -> front.py 写处理后的共享帧 -> :5000/cam1（日志 logs/front.log）
+./run.sh --door-sim --to32-args "--mode rov"  # ROV 启动，同时立即运行门视觉测试
+./run.sh --door-sim --door-sim-args "--contrast 1.3 --sharpen 0.8"  # 门视觉测试参数透传
 ./run.sh --frames 100         # 每路只跑 100 帧（透传给检测进程）
 ./run.sh --no-web             # 只跑检测，不起 Web / Nginx
 ./run.sh --no-flow            # （兼容保留）光流已整体停用，此参数无实际效果
@@ -583,4 +586,3 @@ momo_det_front.json ──> src/kalman/camera_kalman/（图像卡尔曼 viskf �
 | 2026-10-07 | 本 README 更新：《PID 调参链路》新节；功能状态表 / 模式表 / 文件地图 / 进程表 / 排障 / 已知问题同步 2026-10-07 口径；`src/to32/`、`move_test/`、`task_pass_door/` 的 README 同步更新 |
 | 2026-10-08 | ★ **AUV 接回主链路 + 卡尔曼托管恢复 + 模型回退**：`mode_dispatcher._register_modes()` 改**三态注册**（`TEST_MODE_ENABLED=True`→`TestMode` 接管 AUV 位跑 `TEST_TABLE`；`False`→正式 `AuvMode` 动态加载；配置异常→`AuvModeStub` 兜底宁停勿跑）。恢复 `move_test/kalman_launcher.py`（`mode_auv.on_enter/on_exit` 托管，`AUV_KALMAN_AUTOSTART=True` 自动拉起深度卡尔曼、`AUV_VISKF_AUTOSTART=False` 默认不拉起 viskf）。新增 `to32/tel_shm_sink.py`：下位机遥测落盘 `momo_telemetry.json`（depth_kalman 等观测工程遥测输入源，`on_stm32_telemetry` 每帧写、20Hz 节流、原子写）。**模型回退单模型**：`quick_config.py` 改 `YOLO_MODEL_FRONT/BOTTOM`（均 `door_3_640x640.hbm`）、`FRONT_TARGETS/BOTTOM_TARGETS=['door']`、`FRONT_CLASS_NAMES/BOTTOM_CLASS_NAMES=['door']`；`task_config.py` 全序列 STAGE_TABLE（Task1→撞球→Task2→SearchBall→捡球→Task4→Return）、`AUV_POOL_DEPTH_CM=106`（实测）、撞球 v2 参数 `AUV_HIT_V2_*`、STOP 哨兵；旧 6 段序列与 `AUVMODE_ENABLED` 键清理。`AuvMode` 已注册（文档口径同步） |
 | 2026-10-09 | ★ **YOLO 模型按阶段动态切换（`config/stage_model.py`）**：新增 `MODELS` 三套配置（ball=test_nashe/gate=door_3/pick=bottom.hbm）+ `STAGE_MODELS` 阶段映射 + `StageDetector`（front/bottom worker 每帧读 `/dev/shm/momo_stage.json`，模型配置变化即热重载、`is_current()` 丢弃推理期间切走的结果、加载失败 1s 重试）；`mission._set_stage` 每阶段原子发布 stage。**穿门重构为 `task/task_door/`**（`t_door.py` `DoorTask(Stage)` `NAME='PassGate'`，状态机 ACQUIRE→YOLO_ALIGN→APPROACH_50→CV_ALIGN→APPROACH_80→CV_FINAL→BLIND→ACQUIRE，无门走 SEARCH→RETURN_HEADING→EXIT；`DOOR_TABLE` 已入 `STAGE_TABLE`；旧 `task_pass_door`（t_pass_gate.py）整体清理）。`front.py` PassGate 分支接穿门视觉跟踪管线（`task_door/front_pipeline`）；撞球 v2（`t_hit_ball_v2.py`，摇摆寻球→对准→冲撞→Exit 上浮）落地但暂未挂 STAGE_TABLE；`test_config.py` `TEST_TABLE = TASK2_TABLE + RETURN_TABLE`（不再是 5 任务整表）。各 README 同步更新 |
-
