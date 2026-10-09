@@ -34,7 +34,7 @@ import numpy as np  # 数值数组，供图像处理与帧共享使用
 import main_config as MC  # 全局配置模块，提供共享内存名与画质参数
 from main_config import DEFAULT_CONFIG as CFG  # 默认配置字典
 from function import YoloDetector, format_detection, draw_detections  # 检测器、结果格式化与绘制
-from stage_model import StageDetector
+from stage_model import StageDetector, read_stage, BOTTOM_ACTIVE_STAGES  # 检测器 + 阶段读取 + 下视启用阶段集（相机门控）
 from shm_writer import ShmFrameWriter, ShmJsonWriter  # 共享内存帧写端与 JSON 写端
 
 
@@ -202,10 +202,15 @@ def open_camera(device, index):  # 打开下视相机，优先 JPU 硬解，失�
 
 def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采集线程：读帧入队并周期写统计
              log_writer, stats_w, prefer_nv12=False, want_bgr=True,  # 日志/统计写端与数据格式偏好
-             flow_share_w=None):  # 光流共享写端，未开启时为 None
+             flow_share_w=None, device=None, index=None):  # 光流共享写端 + 相机门控所需的设备参数
     """采集线程：读帧 -> 入队；周期性写 stats；若 flow_share_w 存在则同时写光流共享帧。
 
     只读真实相机; 不再支持虚拟帧(2026-09-21 移除 --virtual/make_frame)。
+
+    相机按赛段门控（2026-10-09）：cap 的所有权在本线程内——仅当
+    stage ∈ BOTTOM_ACTIVE_STAGES 时才打开/保持相机采集；其余阶段 release
+    相机并以低频轮询 stage，进程本身常驻不退出（run.sh 的 wait $PID_BOTTOM
+    依赖进程存活，整体退出会触发 run.sh 收尾全链路）。
     """
     fid = 0  # 帧序号，随每帧递增
     t_win = time.perf_counter()  # 当前统计窗口的起始时刻
@@ -216,6 +221,30 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
         while not stop.is_set():  # 未收到停止信号就持续采集
             if max_frames and fid >= max_frames:  # 达到指定帧数即结束，0 表示不限
                 break  # 跳出采集循环
+
+            # ---- 按赛段门控下视相机（2026-10-09）----
+            # 仅 BOTTOM_ACTIVE_STAGES 内打开/保持采集；其余阶段 release 相机，
+            # 低频轮询 stage，进程常驻。有限帧模式(--frames N, 测试验证用)跳过门控，
+            # 保持"启动即开相机"的原行为，避免挂住等待 stage。
+            stage = read_stage(MC.SHM_DIR)  # 读当前发布的阶段（文件缺失=IDLE）
+            need_bottom = (stage in BOTTOM_ACTIVE_STAGES) or (max_frames > 0)  # 本阶段是否需要下视
+            if need_bottom and cap is None:  # 需要下视但相机未开
+                cap = open_camera(device, index)  # 重开相机（V4L2/JPU）
+                if cap is None:  # 打开失败
+                    print(f'[警告] [{TASK}] 下视相机重开失败(阶段 {stage})，1s 后重试', flush=True)  # 明显告警，便于排查找球失败
+                    time.sleep(1.0)  # 退避 1 秒，避免疯狂重试
+                    continue  # 下一轮再试
+                print(f'[*] [{TASK}] 下视相机已开启(阶段 {stage})', flush=True)  # 记录开启时刻
+                # 重开成功后按新相机类型重新决定 NV12 通道（硬解相机才走 NV12）
+                src_is_hw = hasattr(cap, 'grab_raw_nv12') and hasattr(cap, 'read_both')  # 判断是否硬解相机
+                prefer_nv12 = bool(src_is_hw and PRE_MODE in ('auto', 'nv12'))  # 硬解且模式允许才走 NV12
+            elif not need_bottom and cap is not None:  # 不需要下视但相机还开着
+                print(f'[*] [{TASK}] 下视相机已关闭(阶段 {stage})', flush=True)  # 记录关闭时刻
+                cap.release()  # 释放 V4L2 设备
+                cap = None  # 标记已释放，下次需要时重开
+            if cap is None:  # 相机处于关闭态
+                time.sleep(0.2)  # 低频轮询 stage（省 CPU，开关延迟 ≤0.2s）
+                continue  # 不采集不入队，等待启用阶段到来
             t0 = time.perf_counter()  # 记录本次采集开始时刻
             nv12 = None  # 默认未取得 NV12 原始帧
             if prefer_nv12:  # 硬解相机走 NV12 通道，省一次转换
@@ -312,6 +341,11 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
             if LOOP_SLEEP > 0:  # 配置了额外休眠才限流
                 time.sleep(LOOP_SLEEP)  # 降低采集速率，给下游留出时间
     finally:  # 无论正常结束还是异常退出都要执行
+        if cap is not None:  # 退出时相机可能还开着
+            try:  # 释放失败不能影响收尾
+                cap.release()  # 释放 V4L2 设备（cap 所有权在本线程）
+            except Exception:  # 个别相机实现 release 抛异常
+                pass  # 忽略，继续收尾
         for _ in range(n_workers):  # 每个 worker 发一个毒丸
             q.put(None)  # None 作为结束信号
 
@@ -495,11 +529,21 @@ def main():  # 下视任务主入口
 
     device = args.device if args.device is not None else CAM.get('device')  # 命令行优先，否则用配置设备
     index = args.index if args.index is not None else CAM.get('index')  # 命令行优先，否则用配置索引
-    cap = open_camera(device, index)  # 打开相机
-    if cap is None:  # 打开失败
-        print(f'[{TASK}] 真实相机打开失败: device={device} index={index}，进程退出', flush=True)  # 打印失败细节
-        frame_w.close(); det_w.close(); stats_w.close()  # 释放已创建的共享内存后退出
-        return 1  # 非正常退出
+
+    # ---- 下视相机按赛段门控（2026-10-09）----
+    # 初始只读当前 stage：在 BOTTOM_ACTIVE_STAGES 内（或有限帧测试模式）才立刻开相机；
+    # 否则延迟到第一个启用阶段再开。open_camera 的所有权移交 producer 线程，
+    # 此处 cap 仅作为"当前相机"句柄传给采集线程管理（关闭/重开都在采集循环内进行）。
+    cur_stage = read_stage(MC.SHM_DIR)  # 读当前发布的阶段
+    if cur_stage in BOTTOM_ACTIVE_STAGES or args.frames > 0:  # 当前需要下视或有限帧测试
+        cap = open_camera(device, index)  # 立即打开相机
+        if cap is None:  # 打开失败
+            print(f'[{TASK}] 真实相机打开失败: device={device} index={index}，进程退出', flush=True)  # 打印失败细节
+            frame_w.close(); det_w.close(); stats_w.close()  # 释放已创建的共享内存后退出
+            return 1  # 非正常退出
+    else:  # 当前阶段不需要下视
+        cap = None  # 暂不开相机，由 producer 在启用阶段到达时再开
+        print(f'[*] [{TASK}] 当前阶段 {cur_stage} 不需要下视，相机延迟到启用阶段再开', flush=True)  # 提示门控生效
 
     src_is_hw = cap is not None and hasattr(cap, 'grab_raw_nv12') and hasattr(cap, 'read_both')  # 判断是否硬解相机
     prefer_nv12 = bool(src_is_hw and PRE_MODE in ('auto', 'nv12'))  # 硬解且模式允许才走 NV12 通道
@@ -513,7 +557,7 @@ def main():  # 下视任务主入口
         target=producer,  # 线程入口函数
         args=(cap, q, args.frames, stop, args.workers,  # 相机、队列、限帧、停止信号与 worker 数
               stats, enable_timing, log_writer, stats_w,  # 统计对象、开关与写端
-              prefer_nv12, want_bgr, flow_share_w),  # 数据格式偏好与光流写端
+              prefer_nv12, want_bgr, flow_share_w, device, index),  # 数据格式偏好、光流写端与相机门控设备参数
         daemon=True)]  # 设为守护线程，主进程退出即结束
     for i in range(args.workers):  # 按数量启动检测线程
         threads.append(threading.Thread(  # 创建 worker 线程
@@ -533,8 +577,8 @@ def main():  # 下视任务主入口
     except KeyboardInterrupt:  # 用户按下 Ctrl+C
         stop.set()  # 置停止信号，让各线程自行退出
     finally:  # 收尾释放资源
-        if cap is not None:  # 相机存在则释放
-            cap.release()  # 关闭相机
+        # 相机释放由 producer 线程的 finally 负责（cap 所有权在采集线程，此处不再重复 release，
+        # 避免与硬解相机的 release 重复调用）
         if log_writer is not None:  # 日志存在则关闭
             log_writer.close()  # 关闭日志文件
         frame_w.close()  # 关闭帧共享内存
