@@ -49,6 +49,10 @@ class _StopCmd(object):
                 'depth': 0.0, 'surge': 0.0, 'sway': 0.0, 'stop': 1}
 
 
+STOP = object()   # 阶段返回哨兵：完成本阶段并终止整链（后续阶段不再执行）；
+                  # 区别于 None（正常完成 → 继续下一阶段）。2026-10-09 撞球 Exit 上浮后使用。
+
+
 class Mission(object):
     """任务状态机：按 STAGE_TABLE 顺序跑各阶段
 
@@ -118,6 +122,12 @@ class Mission(object):
                 self._stop_sent = True           # 收尾帧随本拍返回，不再重发
                 self._set_stage('DONE')
                 return _StopCmd.make('ABORT')
+            if cmd is STOP:                      # 阶段主动请求终止整链（如撞球 Exit 上浮后不再跑后续任务）
+                self.ctx.say('阶段 %s 请求终止整链 —— 停推收尾' % self.stage)
+                self.done = True
+                self._stop_sent = True           # 收尾帧随本拍返回，不再重发
+                self._set_stage('DONE')
+                return _StopCmd.make('STOP')
             if cmd is None:                      # 本阶段完成 → 同拍切下一阶段
                 self.ctx.say('阶段 %s 完成' % self.stage)
                 self.current = None

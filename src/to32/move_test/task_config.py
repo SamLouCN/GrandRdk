@@ -61,6 +61,7 @@ AUV_TASK2_TURN_NEG_DEG = -60.0   # Task2 补转向：相对当前 yaw 值**左�
 AUV_TASK2_DIVE_CM = 55.0         # Task2 定深目标：距池底高度(cm)
 
 # HitBall_v2（task/t_hit_ball_v2.py，2026-10-08 用户新流程：扫视找球 → 对准 → 冲撞）
+
 # Step1 摇摆找球：相对当前 yaw 沿 YAW_TRAJ 轨迹分小步来回摆，前视见球即退出摇摆。
 #   未挂 STAGE_TABLE（撞球 v2 落地中）；测试用 TEST_TABLE = HIT_BALL_TABLE 引本表。
 AUV_HIT_V2_CAM = 'front'                # 撞球用前视摄像头
@@ -69,10 +70,13 @@ AUV_HIT_V2_YAW_TRAJ = [5, 10, 15, 10, 5, -5, -10, -15, -10, -5]  # 相对当前 
 AUV_HIT_V2_TURN_TOL_DEG = 3.0      # 单小步转向到位容差(°)
 AUV_HIT_V2_TURN_HOLD_N = 10        # 单小步到位保持拍数(20Hz≈0.5s)
 AUV_HIT_V2_HEIGHT_CM = 60.0        # 摇摆/对准期间保持的距池底高度(cm)
+
 # Step2 对准（悬停调 yaw：KF 滤 cx → 像素误差×deg/px → 递推目标角；误差≤tol 保持 N 帧完成）
 AUV_HIT_V2_FOV_DEG = 120.0       # 前视水平视场角(°)，角度换算分母：deg/px = FOV / 画面宽
 AUV_HIT_V2_ALIGN_PX_TOL = 20.0   # 对准容差：滤波后球心距画面中心像素误差 ≤ 此值(px)
 AUV_HIT_V2_ALIGN_HOLD_N = 20     # 对准保持帧数：误差带内连续 N 帧 → 锁定航向完成
+AUV_HIT_V2_LOST_S = 3.0          # Step2 对准中丢球超时(s)：连续超时无球帧 → 切 Exit(停推+上浮)
+                                 #   并终止整链（不再回 Step1 重摇）；调试期可改
 AUV_HIT_V2_YAW_SIGN = 1.0        # ★ dx>0 → 右转（yaw 增，右为正）→ 默认 +1；上车确认项
 AUV_HIT_V2_KF_R_PX2 = 225.0      # KF 量测方差 (15px)²，TODO 实测回填
 AUV_HIT_V2_KF_Q_ACC = 800.0      # KF 过程噪声加速度谱密度
@@ -83,9 +87,10 @@ AUV_HIT_V2_KF_SIGMA_MAX = 60.0   # trust 门禁：滤波 σ 上限(px)，TODO �
 # Step3 冲撞（直接开环，最高速度前进；撞到球判据：ACCx 突降）
 AUV_HIT_V2_RUSH_SURGE = 1.0      # 冲撞推力档位：1.0 = 最高速度（-1~1 钳位）
 AUV_HIT_V2_RUSH_DUR_S = 10.0     # 超时兜底(s)：RUSH 期间没撞到东西 → 切 Exit（停推+上浮水面），可修改
-AUV_HIT_V2_RUSH_ACCX_DROP = 0.15 # ACCx 突降阈值(临时值,单位≈g)：acc_x < 基线−此值 → 判撞到球；TODO 实车标定
+AUV_HIT_V2_RUSH_ACCX_DROP = 1.0  # ACCx 突降阈值(临时值,单位 m/s²)：acc_x < 基线−此值 → 判撞到球；
+                               #   0.15(旧≈g 口径)在 m/s² 下属噪声级会误触发；1.0 起步，TODO 实车标定
 # Exit 上浮（t_function.exit_step，2026-10-09 新增）：停止运动 + 自动上浮至水面安全区
-AUV_EXIT_TOL_CM = 10.0           # Exit 到位容差(cm)：actual_depth_cm ≤ (离水面余量+此值) 算到位
+AUV_EXIT_TOL_CM = 5              # Exit 到位容差(cm)：actual_depth_cm ≤ (离水面余量+此值) 算到位
 AUV_EXIT_HOLD_N = 15             # Exit 带内保持拍数(20Hz≈0.75s)
 
 # SearchBall（task/t_search_ball.py，2026-10-06）：整体为一个阶段，转向 60° → 前进 2s → zigzag 扫描找球

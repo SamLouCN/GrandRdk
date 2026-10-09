@@ -14,8 +14,10 @@
         锁死 Step2 对准航向 + 定深），撞到球（ACCx 突降，临时阈值 0.15 待标定）
         即完成；RUSH_DUR_S(10s) 内没撞到 → 切 Exit：停推 + 自动上浮至水面安全区
 
-Step1/2 无兜底口径（2026-10-06 用户口径）：无 yaw 遥测 → wait_cmd 等待，
-    绝不以 0 兜底；Step2 无球时保持航向悬停等待（判据失效不完成）。
+无兜底口径（2026-10-06 用户口径）：无 yaw 遥测 → wait_cmd 等待，
+    绝不以 0 兜底。2026-10-09 用户新增：
+    - Step2 对准中丢球超时(AUV_HIT_V2_LOST_S) → 切 Exit(停推+上浮)，不再死等；
+    - Exit 上浮到位 → 返回 STOP 终止整链（后续任务不进行；撞到球正常完成仍返回 None 继续）。
 """
 import os
 import sys
@@ -28,7 +30,7 @@ for _p in (_HERE, _PARENT):
         sys.path.insert(0, _p)
 
 import task_config as TC                               # 任务参数（AUV_HIT_V2_* 全部从这里 getattr 读取）
-from mission import Stage                              # 阶段基类：enter/step 契约 + ctx 注入
+from mission import Stage, STOP                        # 阶段基类 + 终止整链哨兵（Exit 上浮到位后返回）
 import t_function                                      # 运动原语库：turn_step/wait_cmd/_cmd/_depth_out/_tel_f
 from task.task_hit_ball import vservo                  # 视觉伺服公共层：KF1D（滤 cx）/ wrap_deg（角度回绕）
 
@@ -175,15 +177,40 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
             st['yaw_ref'] = float(y)                  # 起始目标航向 = 当前实际航向（后续每拍递推）
             st['ok_cnt'] = 0                          # 容差带内连续计数（从 0 开始累计）
             st['last_ex'] = 0.0                       # 最近一次像素误差（日志与完成判据用）
+            st['last_seen'] = now                     # 最近一次见球时刻（丢球超时计时起点）
             self.log('Step2 起步：yaw0=%.1f°，deg/px=%.4f' % (y, deg_per_px))  # 起步日志（含换算系数）
+
+        # 已切 Exit（丢球超时触发过）：继续上浮，不再回到对准（球回来也不回头）
+        if self.sts[2].get('mode') == 'exit':        # Exit 机制激活（在 Step3 的 st 上）
+            cmd = t_function.exit_step(               # 调上浮退出原语（停推 + 上浮水面安全区）
+                self.ctx, self.sts[2], now, dt,      # 参数：上下文 / 状态 / 时间 / 拍间隔
+                stage=self.NAME)                      # 阶段名（日志展示）
+            if cmd is None:                           # Exit 完成：已上浮到水面安全区
+                self.log('Step2 Exit 完成：已上浮至水面 → 终止整链')  # 完成日志
+                return STOP                           # 终止整链（后续任务不进行）
+            return cmd                                # 未完成 → 继续上浮
 
         # 2. 每拍：吃球帧 → KF 滤波 cx → trust 门禁 → 像素误差 → yaw 增量递推
         obs = self.ctx.vision.poll(cam, want, now)    # 查前视检测：有球返回帧 dict，无球返回 None
         if obs is None:                               # 本拍无球帧
             st['kf'].predict(now)                     # KF 状态滚到 now（纯预测滑行，保持滤波连续性）
-            self.log('Step2 无球：保持航向 %.1f° 悬停等待（无兜底，不完成）' % st['yaw_ref'])  # 无球日志
+            lost = now - st['last_seen']              # 距最近一次见球时长(s)
+            lost_s = float(getattr(TC, 'AUV_HIT_V2_LOST_S', 3.0))  # 丢球超时阈值(可改)：超时无球 → 上浮退出
+            if lost > lost_s:                         # 丢球超时 → 切 Exit（停推+上浮，终止整链）
+                self.log('Step2 丢球超时 %.1fs → 切 Exit（停推+上浮水面）' % lost)  # 丢球超时日志
+                self.sts[2]['mode'] = 'exit'          # 激活 Exit 子状态（下拍起走上浮路径）
+                cmd = t_function.exit_step(           # 同拍切入：立即下发上浮帧
+                    self.ctx, self.sts[2], now, dt,  # 参数：上下文 / 状态 / 时间 / 拍间隔
+                    stage=self.NAME)                  # 阶段名（日志展示）
+                if cmd is None:                       # Exit 首拍即完成（已在安全区）
+                    self.log('Step2 Exit 完成：已上浮至水面 → 终止整链')  # 完成日志
+                    return STOP                       # 终止整链（后续任务不进行）
+                return cmd                            # 未完成 → 继续上浮
+            self.log('Step2 无球：保持航向 %.1f° 悬停等待(丢球 %.1fs/%s)'  # 无球日志（含超时倒计时）
+                     % (st['yaw_ref'], lost, lost_s))
             return t_function._cmd(self.NAME, '对准中(无球)',  # 组悬停控制帧：锁定 yaw_ref
                                    st['yaw_ref'], t_function._depth_out(st, height))  # 定深沿用/目标高度
+        st['last_seen'] = now                         # 本拍见球 → 刷新丢球计时起点
         in_band = False                               # 本拍"在容差带内"标记（默认 False，防误计数）
         if st['kf'].update(obs['cx'], now, clip=bool(obs.get('clip'))):  # KF 吃一帧球心 cx（贴边框→方差×4）
             if st['kf'].trust_ok(now, float(getattr(TC, 'AUV_HIT_V2_KF_SIGMA_MAX', 60.0))):  # trust 门禁：新鲜 & σ 达标才喂舵
@@ -217,14 +244,15 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
         st = self.sts[2]                              # Step3 独立状态（mode/yaw_ref/t0/accx_buf/accx_base/accx_hit）
         now, dt = self._now, self._dt                 # 本拍时间戳与拍间隔
 
-        # 0. 已进入 Exit 子状态（超时兜底触发过）：调上浮原语，到位即撞球阶段完成
+        # 0. 已进入 Exit 子状态（超时兜底触发过）：调上浮原语，到位即终止整链
         if st.get('mode') == 'exit':                  # Exit 机制激活
             cmd = t_function.exit_step(               # 调上浮退出原语（停推 + 上浮水面安全区）
                 self.ctx, st, now, dt,                # 参数：上下文 / 状态 / 时间 / 拍间隔
                 stage=self.NAME)                      # 阶段名（日志展示）
             if cmd is None:                           # Exit 完成：已上浮到水面安全区
-                self.log('Step3 Exit 完成：已上浮至水面')  # 完成日志
-            return cmd                                # 未完成→继续上浮帧；完成→None 收尾本阶段
+                self.log('Step3 Exit 完成：已上浮至水面 → 终止整链')  # 完成日志
+                return STOP                           # 终止整链（后续任务不进行）
+            return cmd                                # 未完成 → 继续上浮
 
         # 1. 起步：锁死冲撞航向（= Step2 对准结果）与冲撞起始时刻
         if st.get('yaw_ref') is None:                 # 首拍锁存航向
@@ -247,7 +275,7 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
                 bn = int(getattr(TC, 'AUV_TOUCH_ACC_BASE_N', 10))  # 基线窗口拍数（复用触壁键）
                 if len(buf) >= bn:                    # 攒够基线窗口
                     st['accx_base'] = sum(buf[-bn:]) / bn  # 基线 = 窗口均值（锁定不再滑动）
-            drop = float(getattr(TC, 'AUV_HIT_V2_RUSH_ACCX_DROP', 0.15))  # 突降阈值(临时值,单位≈g)：acc_x<基线−此值 算命中
+            drop = float(getattr(TC, 'AUV_HIT_V2_RUSH_ACCX_DROP', 1.0))  # 突降阈值(临时值,单位 m/s²)：acc_x<基线−此值 算命中
             if st.get('accx_base') is not None:       # 基线就绪才判
                 if ax < (st['accx_base'] - drop):     # acc_x 相对基线突降（负向冲击峰）
                     st['accx_hit'] = st.get('accx_hit', 0) + 1   # 命中计数 +1
@@ -256,7 +284,7 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
                 hn = int(getattr(TC, 'AUV_TOUCH_ACC_HIT_N', 3))   # 连续命中拍数（复用触壁键）
                 hit = st['accx_hit'] >= hn            # 连续 M 拍命中 → 判已撞到球
         if hit:                                       # 撞到球（ACCx 突降确认）
-            self.log('Step3 完成：ACCx 突降(%.1f vs 基线 %.1f)判已撞到球' % (ax, st['accx_base']))  # 完成日志
+            self.log('Step3 完成：ACCx 突降(%.2f vs 基线 %.2f m/s²)判已撞到球' % (ax, st['accx_base']))  # 完成日志
             return None                               # 完成 Step3 = 撞球阶段完成（Mission 切下一阶段）
 
         # 3. 超时兜底：RUSH_DUR_S(10s) 内没撞到 → 切 Exit（停止运动 + 自动上浮至水面）
@@ -268,8 +296,9 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
                 self.ctx, st, now, dt,                # 参数：上下文 / 状态 / 时间 / 拍间隔
                 stage=self.NAME)                      # 阶段名（日志展示）
             if cmd is None:                           # Exit 首拍即完成（已在安全区）
-                self.log('Step3 Exit 完成：已上浮至水面')  # 完成日志
-            return cmd                                # 下发上浮帧（或 None 收尾本阶段）
+                self.log('Step3 Exit 完成：已上浮至水面 → 终止整链')  # 完成日志
+                return STOP                           # 终止整链（后续任务不进行）
+            return cmd                                # 未完成 → 继续上浮
 
         # 4. 未撞到且未超时：下发本拍冲撞帧（全速前冲 + 定深 + 锁死航向）
         return t_function._cmd(self.NAME, '冲撞中 t=%.1fs' % elapsed,  # 组冲撞控制帧
