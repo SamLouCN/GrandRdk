@@ -46,6 +46,10 @@ STAGE_MODELS = {
     'PickBall': 'pick',
 }
 
+# 下视相机启用阶段集：仅这些阶段 bottom.py 才打开相机采集，
+# 其余阶段 V4L2 release、进程常驻（由采集线程按 stage 门控，见 src/bottom.py producer）。
+BOTTOM_ACTIVE_STAGES = {'SearchBall', 'PickBall'}
+
 
 def stage_path(shm_dir=None):
     return os.path.join(os.environ.get('GRDK_SHM_DIR') or shm_dir or '/dev/shm',
@@ -63,6 +67,23 @@ def publish_stage(stage, shm_dir=None):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def read_stage(shm_dir=None):
+    """读当前发布的阶段名；文件缺失视为 IDLE，解析失败返回 None。
+
+    与 StageDetector._stage() 同源（都读 momo_stage.json），供不持有检测器的
+    调用方（如 bottom.py 采集线程做相机门控）轻量读取，不触发模型加载。
+    """
+    path = stage_path(shm_dir)
+    try:
+        with open(path, encoding='utf-8') as f:
+            stage = json.load(f)['stage']
+        return stage if isinstance(stage, str) else None
+    except FileNotFoundError:
+        return 'IDLE'
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def model_config(stage, base_cfg):

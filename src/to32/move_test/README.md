@@ -55,9 +55,17 @@ v2.2 旧版全套在 `D:\RC\S100\综合\GrandRDKv2.2` 里随时可查。
 - **基线（IDLE/DONE）**：`quick_config.py` 的 `YOLO_MODEL_FRONT`/`YOLO_MODEL_BOTTOM` 均 `models/door_3_640x640.hbm`，只识别 `door`（CANON → `gate`，穿门用）；
 - **AUV 任务运行时**：`config/stage_model.py` 的 `StageDetector` 按 `/dev/shm/momo_stage.json` 热切换——
   - `ball`（`test_nashe_640x640_nv12.hbm`，door/red-ball/yellow-ball，筛 red-ball → `ball`）：Task1 / SearchBall / HitBall / HitBall_v2；
-  - `gate`（`door_3_640x640.hbm`，door → `gate`）：Task2 / PassGate；
+  - `gate`（`door_4_nashe_1280x1280_nv12.hbm`，door → `gate`）：Task2 / PassGate；
   - `pick`（`bottom.hbm`，ring/red-ball/yellow-ball，筛 red-ball → `ball`）：PickBall；
 - 任务侧 canonical 名 `'ball'/'gate'/'ball_y'` 不受模型影响；换模型只需同步 `stage_model.MODELS` 类别表与 `obs.CANON`（不必再动 quick_config 的 target/class_names，基线仍用它们）。
+
+### 下视相机按赛段门控（2026-10-09 新增）
+
+- `config/stage_model.py` 新增 `BOTTOM_ACTIVE_STAGES = {'SearchBall', 'PickBall'}`：仅这些阶段 `src/bottom.py` 才打开下视相机采集，其余阶段 V4L2 release；
+- 实现：`bottom.py` 的 `producer` 采集线程循环顶部读 `momo_stage.json`（`stage_model.read_stage()`）→ stage 入集且相机未开则 `open_camera()` 重开（失败 1s 重试 + 告警）；出集则 `cap.release()` 置 None；关闭态 0.2s 低频轮询（省 CPU）。**进程常驻不退出**（`run.sh` 的 `wait $PID_BOTTOM` 依赖进程存活，整体退出会触发 run.sh 收尾全链路）；
+- `main()` 初始按当前 stage 决定是否立刻开相机（非启用阶段延迟到第一个启用阶段再开）；`--frames N` 有限帧测试模式跳过门控，保持"启动即开相机"原行为；
+- 相机所有权移交 `producer` 线程（关闭/重开都在采集循环内），`main` 的 finally 不再重复 release；重开后按新相机类型重算 NV12 通道；
+- 副作用：关闭期间 `momo_frame_bottom.bin` / `momo_det_bottom.json` 停更 → `/cam2` 画面冻结、`obs.poll('bottom',...)` 因 mtime 超期自动返回 None（不会误判有球）；开相机约 0.3~1s 延迟，SearchBall 前 2s 转向/前进不用下视，天然覆盖。
 
 ## PID 中继联动（2026-10-07 v3.8 新增）
 
