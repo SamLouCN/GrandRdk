@@ -368,7 +368,7 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
             vis = draw_detections(frame, dets) if dets else frame  # 有检测目标就画框，否则直接用原图
 
             # ---- 写帧到共享内存 ----
-            if frame_w is not None and not door_published:  # 门流程已发布干净校正图
+            if frame_w is not None and not door_published:  # 门流程已发布带 YOLO/CV 标注的校正图
                 ok, buf = cv2.imencode(  # 编码为 JPEG，比原始 BGR 小得多
                     '.jpg', frame,
                     [cv2.IMWRITE_JPEG_QUALITY, MC.WEB_MJPEG_QUALITY])  # 压缩质量取全局配置，平衡带宽与画面清晰度

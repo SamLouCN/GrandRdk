@@ -37,6 +37,11 @@ class DoorConfig:
     vision_stale_s: float = .5
     observe_frames: int = 5
 
+    # 回传数据面板：小字号、紧凑行距，仅覆盖左下角文字区域。
+    overlay_font_scale: float = .42
+    overlay_line_height_px: int = 18
+    overlay_background_alpha: float = .55
+
     # TODO: 相机 -> 机器人，机器人坐标采用 X右/Y下/Z前。
     camera_to_robot_rotation: tuple = ((1., 0., 0.), (0., 1., 0.), (0., 0., 1.))
     camera_position_robot_m: tuple = (0., 0., 0.)
@@ -100,6 +105,10 @@ class DoorConfig:
             raise ValueError('尺寸、计数、速度、距离和超时必须为正有限值')
         if not 0 < self.filter_alpha <= 1 or not 0 < self.min_depth_cm < self.max_depth_cm:
             raise ValueError('滤波系数或深度限值无效')
+        if (not math.isfinite(self.overlay_font_scale) or self.overlay_font_scale <= 0
+                or not math.isfinite(self.overlay_line_height_px) or self.overlay_line_height_px <= 0
+                or not 0 <= self.overlay_background_alpha <= 1):
+            raise ValueError('回传字号、行距或背景透明度无效')
         for k in ('approach_surge', 'blind_surge', 'exit_surge', 'sway_thrust'):
             if not 0 < getattr(self, k) <= 1:
                 raise ValueError(k + ' 必须在 (0,1]')

@@ -6,6 +6,7 @@ import time
 
 from .perception import DoorFrameProcessor
 from .config import CONFIG
+from .overlay import draw_door_overlay
 
 
 class DoorFrontPipeline:
@@ -36,7 +37,8 @@ class DoorFrontPipeline:
             if not detector.ready:
                 observation = dict(valid=False, has_target=False, reason='model-not-ready', reset_token=token)
             if frame_writer is not None:
-                ok, encoded = cv2.imencode('.jpg', fixed, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                display = draw_door_overlay(fixed, dets, observation)
+                ok, encoded = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if ok:
                     frame_writer.write(encoded.tobytes())
             if det_writer is not None:
