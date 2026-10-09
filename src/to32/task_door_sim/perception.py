@@ -1,5 +1,6 @@
 """干净校正图保留颜色证据；增强图同时进入 YOLO 和 OpenCV。"""
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -24,11 +25,15 @@ class DoorDetectorAdapter:
     def __init__(self, detector, min_score):
         self.detector = detector
         self.min_score = min_score
+        self.last_detect_ms = 0.0
 
     def detect_boxes(self, frame):
         result = []
         # 图像已校正、增强，必须重新转模型输入，不能复用采集时的 NV12。
-        for det in self.detector.detect(frame, nv12=None):
+        started = time.perf_counter()
+        detections = self.detector.detect(frame, nv12=None)
+        self.last_detect_ms = (time.perf_counter()-started)*1000
+        for det in detections:
             if (str(det.get('label', '')).lower() in ('door', 'gate', 'doorway')
                     and float(det.get('score', 0)) >= self.min_score):
                 result.append(dict(det, class_id=0))
@@ -68,12 +73,16 @@ class DoorSimFrameProcessor:
         if self.size != (width, height):
             self._prepare(width, height)
         cfg = self.cfg
+        started = time.perf_counter()
         fixed = (self.corrector.undistort(frame, cfg.correction_plane_distance_m)
                  if self.corrector else frame.copy())
+        corrected_at = time.perf_counter()
         enhanced = enhance_cv_contrast(fixed, cfg.contrast_gain, self.valid_mask,
                                        cfg.clahe_clip, cfg.clahe_blend,
                                        cfg.sharpen_amount, cfg.saturation_gain)
+        enhanced_at = time.perf_counter()
         candidate, _ = self.tracker.update(fixed, yolo_frame=enhanced, cv_frame=enhanced)
+        tracked_at = time.perf_counter()
         status = self.tracker.last_status
         geometry = original_geometry(fixed, candidate)
         detections = [dict(det, selected=det['bbox'] == status['target_bbox'])
@@ -91,5 +100,10 @@ class DoorSimFrameProcessor:
                            img_w=width, img_h=height, geometry=geometry, yolo=status,
                            guidance=guidance,
                            input='enhanced', contrast_gain=cfg.contrast_gain,
-                           sharpen_amount=cfg.sharpen_amount)
+                           sharpen_amount=cfg.sharpen_amount,
+                           timing_ms=dict(correction=round((corrected_at-started)*1000, 2),
+                                          enhancement=round((enhanced_at-corrected_at)*1000, 2),
+                                          yolo=round(self.detector.last_detect_ms, 2),
+                                          cv=round((tracked_at-enhanced_at)*1000-self.detector.last_detect_ms, 2),
+                                          overlay=round((time.perf_counter()-tracked_at)*1000, 2)))
         return display, detections, observation

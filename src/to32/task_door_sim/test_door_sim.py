@@ -101,7 +101,7 @@ class DoorSimTests(unittest.TestCase):
                 self.assertEqual(seq, 1)
                 self.assertEqual(cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR).shape,
                                  result[0].shape)
-                ok, expected = cv2.imencode('.jpg', result[0], [cv2.IMWRITE_JPEG_QUALITY, 100])
+                ok, expected = cv2.imencode('.jpg', result[0], [cv2.IMWRITE_JPEG_QUALITY, self.cfg.jpeg_quality])
                 self.assertTrue(ok)
                 self.assertEqual(jpeg, expected.tobytes())
                 data = ShmJsonReader(det_path).read()

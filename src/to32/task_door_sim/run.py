@@ -23,10 +23,15 @@ def main(argv=None):
     parser.add_argument('--no-correction', action='store_true')
     parser.add_argument('--contrast', type=float, default=CONFIG.contrast_gain)
     parser.add_argument('--sharpen', type=float, default=CONFIG.sharpen_amount)
+    parser.add_argument('--cv-every', type=int, default=CONFIG.cv_every_frames,
+                        help='CV 完整搜索间隔；其余帧按当前图像跟踪，默认 3')
+    parser.add_argument('--jpeg-quality', type=int, default=CONFIG.jpeg_quality,
+                        help='共享 JPEG 质量，默认 85')
     # front.py 的 --frames/--device/--index/--timing/--log 等原样传给它。
     args, front_args = parser.parse_known_args(argv)
     cfg = replace(CONFIG, correction_enabled=not args.no_correction,
-                  contrast_gain=args.contrast, sharpen_amount=args.sharpen).validate()
+                  contrast_gain=args.contrast, sharpen_amount=args.sharpen,
+                  cv_every_frames=args.cv_every, jpeg_quality=args.jpeg_quality).validate()
     if args.shm_dir:
         shm_dir = Path(args.shm_dir).resolve()
         shm_dir.mkdir(parents=True, exist_ok=True)

@@ -99,7 +99,7 @@ FLOW_CALIB_NOMINAL_FPS   = 50.0  # 仅上一项为 True 时生效的名义帧率
 # ======================                                                        # 注释: 分隔线
 WEB_HOST = '0.0.0.0'  # 必须是 0.0.0.0，上位机从网卡访问；改回 127.0.0.1 会连不上
 WEB_PORT = 5000  # FastAPI Web 服务监听端口
-WEB_MJPEG_QUALITY = 100  # MJPEG 推流 JPEG 画质，越高越占带宽与编码耗时
+WEB_MJPEG_QUALITY = 85  # MJPEG 推流 JPEG 画质，平衡标注清晰度、带宽与编码耗时
 WEB_TELEM_HZ = 10  # 遥测推送频率(预留)，当前实际走 WebSocket
 
 # ======================                                                          # 注释: 分组标题 - Web 后端

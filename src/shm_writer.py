@@ -6,6 +6,7 @@ import mmap  # 导入 mmap 标准库: 文件内存映射, 写 /dev/shm 零拷贝
 import os  # 导入 os 标准库: 路径拼接、文件存在性判断、文件描述符操作
 import struct  # 导入 struct 标准库: 把帧头的几个整数打包成定长二进制
 import sys  # 导入 sys 标准库: 修改模块搜索路径, 让本文件能 import main_config
+import threading
 import time  # 导入 time 标准库: 取当前时间戳写进帧头
 
 _HERE = os.path.dirname(os.path.abspath(__file__))  # 本文件所在目录 (src/)
@@ -32,18 +33,22 @@ class ShmFrameWriter:  # 类: 把最新一帧 JPEG 写进共享内存 (定长容
         self._fd = os.open(path, os.O_RDWR)  # 以读写方式打开文件, 拿到文件描述符供 mmap 使用
         self._mm = mmap.mmap(self._fd, self.total)  # 把整个文件映射进内存: 之后写内存即写共享内存
         self._seq = 0  # 帧序号计数器, 每写一帧 +1 (消费端靠它判断"是不是新帧")
+        self._lock = threading.Lock()
 
     def write(self, jpeg):  # 写入一帧 JPEG 字节流
         """写入一帧 JPEG。"""
         if not jpeg or len(jpeg) > self.max_jpeg:  # 空数据或超过容量上限时:
             return  # 直接返回不写 (宁可丢这一帧, 也不能越界写坏映射区)
-        self._seq += 1  # 帧序号 +1, 标识本帧
-        hdr = struct.pack(MC.HDR_FMT, MC.HDR_MAGIC, self._seq,  # 按配置的二进制格式打包帧头, 本行先写: 魔数 + 帧序号
-                          len(jpeg), self.width * self.height,  # 本行继续补两个字段: 本帧字节数 + 总像素数
-                          int(time.time() * 1e6))  # 本行补最后一个字段: 微秒级时间戳 (1e6 把秒换成微秒)
-        self._mm[:MC.HDR_SIZE] = hdr  # 把帧头写到映射区最前面的 HDR_SIZE 个字节
-        self._mm[MC.HDR_SIZE:MC.HDR_SIZE + len(jpeg)] = jpeg  # 把 JPEG 数据紧跟着帧头写进去 (长度按实际字节数)
-        self._mm.flush()  # 把内存映射的改动刷到文件, 让其它进程能立刻读到新帧
+        with self._lock:
+            self._seq += 1
+            fields = (MC.HDR_MAGIC, self._seq, 0, self.width * self.height,
+                      int(time.time() * 1e6))
+            # length=0 标记正在覆盖；先写完整 JPEG，再发布有效帧头。
+            self._mm[:MC.HDR_SIZE] = struct.pack(MC.HDR_FMT, *fields)
+            self._mm[MC.HDR_SIZE:MC.HDR_SIZE + len(jpeg)] = jpeg
+            self._mm[:MC.HDR_SIZE] = struct.pack(MC.HDR_FMT, fields[0], fields[1], len(jpeg),
+                                                fields[3], fields[4])
+            # MAP_SHARED 的修改跨进程直接可见；实时帧不需要逐帧同步落盘。
 
     def close(self):  # 释放资源 (进程退出时调用, 可重复调用)
         try:  # 兜住"已经关过"导致的异常
@@ -75,7 +80,7 @@ class ShmJsonWriter:  # 类: 把一个 JSON 对象写进共享内存 (定长容�
         self._mm.write(data)  # 写入 JSON 数据
         if pad > 0:  # 若还有剩余空间:
             self._mm.write(b' ' * pad)  # 用空格填满 (保持定长, 消费端按固定长度读不会读到上一帧残留)
-        self._mm.flush()  # 刷到文件, 让读端立刻可见
+        # MAP_SHARED 已使更新跨进程可见，不在实时路径同步落盘。
 
     def close(self):  # 释放资源 (幂等)
         try:  # 兜住重复关闭

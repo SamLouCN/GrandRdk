@@ -16,12 +16,12 @@ class DoorSimConfig:
     clahe_clip: float = 0.
     clahe_blend: float = 0.
     saturation_gain: float = 1.
-    cv_every_frames: int = 1
+    cv_every_frames: int = 3  # 间隔帧仍按当前图像跟踪/验证；跟踪失败立即重新搜索。
     hold_seconds: float = .2
     roi_padding: float = .08
     min_score: float = .5
     vision_stale_s: float = .5
-    jpeg_quality: int = 100
+    jpeg_quality: int = 85
 
     def validate(self):
         limits = {'contrast_gain': (1, 1.5), 'sharpen_amount': (0, 2),

@@ -112,7 +112,7 @@ def mjpeg_generator(reader):
     last_send_ts = time.time()  # 上次发出数据的时间，用于心跳判断
     while True:
         try:
-            seq, jpeg = reader.read_latest()  # 取最新帧及其序号
+            seq, jpeg = reader.read_latest(after_seq=last_seq)  # 未更新时不复制整张 JPEG。
         except Exception:
             seq, jpeg = -1, None  # 读失败按无帧处理，不中断流
 

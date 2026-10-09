@@ -45,19 +45,23 @@ class ShmFrameReader:
         except Exception:  # 权限不足 / 长度为 0 等
             self._fd = self._mm = None  # 失败即置空，下轮再试
 
-    def read_latest(self):  # 取最新一帧；任何失败都返回 (-1, None)
-        """返回 (seq, jpeg_bytes) 或 (-1, None)。"""
+    def read_latest(self, after_seq=None):  # 取最新一帧；任何失败都返回 (-1, None)
+        """返回 (seq, jpeg_bytes)；未更新返回 (seq, None)，无有效帧返回 (-1, None)。"""
         self._ensure()  # 先确保映射就绪
         if self._mm is None:  # 没映射成功（写端未启动）
             return -1, None  # seq=-1 表示当前无帧
         try:  # 可能读到"写一半"的帧，必须整段兜住
-            magic, seq, length, wh, ts_us = struct.unpack(
-                MC.HDR_FMT, self._mm[:MC.HDR_SIZE])  # 续行：按帧头格式解出 magic/序号/长度/宽高/时间戳
+            header = self._mm[:MC.HDR_SIZE]
+            magic, seq, length, wh, ts_us = struct.unpack(MC.HDR_FMT, header)
             if magic != MC.HDR_MAGIC or length == 0:  # 魔术字不对或长度 0：帧头未写完
                 return -1, None  # 判为无帧
             if length > self._size - MC.HDR_SIZE:  # 长度越界：可能是正在写的不一致态
                 return -1, None  # 不冒险读，判为无帧
+            if seq == after_seq:
+                return seq, None  # 100Hz 轮询时，旧帧只读帧头，不反复复制 JPEG。
             jpeg = bytes(self._mm[MC.HDR_SIZE:MC.HDR_SIZE + length])  # 深拷贝 JPEG 字节，避免返回会被写端改动的视图
+            if self._mm[:MC.HDR_SIZE] != header:
+                return -1, None  # 复制期间写端换帧，下一次取最新完整帧。
             return seq, jpeg  # 返回帧序号与 JPEG 数据
         except Exception:  # 解包失败/切片越界等
             return -1, None  # 统一无帧，读端永不崩

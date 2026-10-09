@@ -8,6 +8,8 @@
 增强图叠加黄色 YOLO 框、绿色 CV 边及校正坐标下的视觉回正提示 → JPEG 共享帧。
 YOLO 和 CV 使用同一张增强图，干净校正图保留为 CV 颜色/白角验证依据。
 CLAHE 和额外饱和度增强默认关闭，参数集中在 `config.py`。
+CV 完整搜索默认每 3 个处理帧运行一次，间隔帧使用当前图像跟踪并验证边线；
+跟踪失败立即重新搜索。YOLO 仍逐处理帧运行，JPEG 默认质量为 85。
 姿态与像素等效位移仅供显示，不发送控制指令。
 
 输出与现有前视回传兼容：
@@ -22,6 +24,10 @@ CLAHE 和额外饱和度增强默认关闭，参数集中在 `config.py`。
 多个调用共用一个串行跟踪器。`run.py` 仅负责配置模型和图像算法，再调用 `front.main()`；
 相机采集（含 JPU 硬解）、队列、JPEG/JSON/统计共享写入全部由 `front.py` 管理。
 测试前视使用单个检测 worker，保证跟踪与共享写入顺序。
+实时相机只保留最新一张待处理帧，CV 变慢时覆盖旧帧，不让 12 帧队列积压画面；
+录像仍按顺序处理。`door_sim.timing_ms` 分列校正、增强、YOLO、CV、绘制耗时，
+`door_sim.stream` 记录 JPEG 大小、编码、共享写入及采集到发布的延迟。
+启用时间统计时每 2 秒打印一条 DoorSim 处理统计；原简化 fps 仍是采集帧率。
 不依赖 `momo_stage.json`、AUV 模式或任务表，也不写模式/阶段状态。
 输入尺寸从实际帧取得；尺寸变化时重建校正和跟踪状态。
 
@@ -33,6 +39,8 @@ CLAHE 和额外饱和度增强默认关闭，参数集中在 `config.py`。
 ./run.sh --door-sim --to32-args "--mode rov"
 # 可选：增强参数透传
 ./run.sh --door-sim --door-sim-args "--contrast 1.3 --sharpen 0.8"
+# 调整 CV 搜索频率与推流压缩：
+./run.sh --door-sim --door-sim-args "--cv-every 3 --jpeg-quality 85"
 ```
 
 加 `--door-sim` 后，启动链路为 `task_door_sim/run.py → front.main()`，

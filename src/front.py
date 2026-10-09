@@ -219,8 +219,23 @@ def open_camera(device, index):  # 打开相机：优先 JPU 硬解，不可用�
     return cap  # 返回可用的相机对象
 
 
+def put_latest_frame(q, item):
+    """实时相机覆盖待处理旧帧，避免检测变慢后画面积压。"""
+    dropped = None
+    while True:
+        try:
+            q.put_nowait(item)
+            return dropped
+        except queue.Full:
+            try:
+                dropped = q.get_nowait()
+                q.task_done()
+            except queue.Empty:
+                continue
+
+
 def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采集线程：读帧入队，并周期性写共享内存统计
-             log_writer, stats_w, prefer_nv12=False, want_bgr=True):  # prefer_nv12 走硬解原始帧，want_bgr 表示需要 BGR 输出
+             log_writer, stats_w, prefer_nv12=False, want_bgr=True, latest_only=False):
     """采集线程：读帧 -> 入队；周期性写统计到共享内存。
 
     只读真实相机; 不再支持虚拟帧(2026-09-21 移除 --virtual/make_frame)。
@@ -272,7 +287,13 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
             if enable_timing:  # 只在开启统计时才计时
                 stats.add('capture', t1 - t0)  # 记录本次采集耗时
             try:  # 入队可能超时
-                q.put((fid, frame, nv12, time.time()), timeout=1.0)  # 采集时间用于拒绝积压旧帧
+                item = (fid, frame, nv12, time.time())
+                if latest_only:
+                    dropped = put_latest_frame(q, item)
+                    if dropped is not None and log_writer is not None:
+                        log_writer.write(dropped[0], [], status='dropped')
+                else:
+                    q.put(item, timeout=1.0)  # 录像按顺序处理；实时相机覆盖待处理旧帧。
             except queue.Full:  # 队列已满，本帧丢弃
                 if log_writer is not None:  # 开了日志才记
                     log_writer.write(fid, [], status='dropped')  # 记录丢帧，用于分析背压情况
@@ -328,6 +349,7 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                 if YOLO_ENABLED and door_sim_processor is None else None)
     idx = 0  # 本 worker 的检测序号，用于终端输出计数
     next_vision_error_log = 0.0
+    next_stream_log = 0.0
     while not stop.is_set():  # 停止事件未置位就持续取帧
         try:  # 取队列可能超时
             item = q.get(timeout=0.5)  # 半秒超时，保证能及时响应停止事件
@@ -402,14 +424,34 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
 
             # ---- 写帧到共享内存 ----
             if frame_w is not None and not door_published:  # 门流程已发布带 YOLO/CV 标注的校正图
+                encode_start = time.perf_counter()
+                jpeg_quality = (door_sim_processor.cfg.jpeg_quality
+                                if door_sim_processor is not None and hasattr(door_sim_processor, 'cfg')
+                                else MC.WEB_MJPEG_QUALITY)
                 ok, buf = cv2.imencode(  # 编码为 JPEG，比原始 BGR 小得多
-                    '.jpg', frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, MC.WEB_MJPEG_QUALITY])  # 压缩质量取全局配置，平衡带宽与画面清晰度
+                    '.jpg', vis,
+                    [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+                encode_ms = (time.perf_counter()-encode_start)*1000
                 if ok:  # 编码成功才有数据可写
                     try:  
+                        write_start = time.perf_counter()
                         if door_sim_processor is not None:
                             frame_w.width, frame_w.height = frame.shape[1], frame.shape[0]
                         frame_w.write(buf.tobytes())  # 把 JPEG 字节写入共享内存 /dev/shm
+                        if door_sim_observation is not None:
+                            stream = dict(jpeg_bytes=int(buf.size), jpeg_quality=int(jpeg_quality),
+                                          encode_ms=round(encode_ms, 2),
+                                          shm_write_ms=round((time.perf_counter()-write_start)*1000, 2),
+                                          capture_to_publish_ms=round((time.time()-captured_at)*1000, 2))
+                            door_sim_observation['stream'] = stream
+                            if enable_timing and time.monotonic() >= next_stream_log:
+                                timing = door_sim_observation.get('timing_ms', {})
+                                print('[front][DoorSim] YOLO=%.1fms CV=%.1fms JPEG=%.1fms '
+                                      '共享写=%.1fms 帧=%.1fKB 采集到发布=%.1fms'
+                                      % (timing.get('yolo', 0), timing.get('cv', 0), encode_ms,
+                                         stream['shm_write_ms'], buf.size/1024,
+                                         stream['capture_to_publish_ms']), flush=True)
+                                next_stream_log = time.monotonic()+2.0
                     except Exception:  # 写失败不影响主流程
                         pass  # 忽略异常，继续处理下一帧
 
@@ -552,7 +594,8 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
     prefer_nv12 = bool(src_is_hw and PRE_MODE in ('auto', 'nv12'))  # 只有硬解且预处理模式允许时才走 NV12 直通
     want_bgr = True   # 需要写共享内存，必须能拿到 BGR
 
-    q = queue.Queue(maxsize=Q_SIZE)  # 采集到检测的队列，容量受限形成背压
+    latest_only = door_sim_processor is not None and video_source is None
+    q = queue.Queue(maxsize=1 if latest_only else Q_SIZE)
     disp_q = queue.Queue(maxsize=2)  # 显示队列很小，最差情况丢旧帧保实时性
     stop = threading.Event()  # 全局停止事件，所有线程靠它统一收尾
 
@@ -560,7 +603,7 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
         target=producer,  # 线程入口为 producer
         args=(cap, q, args.frames, stop, args.workers,  # 传入相机、队列、帧上限、停止事件与统计对象
               stats, enable_timing, log_writer, stats_w,  # 继续传统计、日志与共享内存写端
-              prefer_nv12, want_bgr),  # 是否走 NV12 直通、是否需要 BGR
+              prefer_nv12, want_bgr, latest_only),
         daemon=True)]  # 设为守护线程，主进程退出即刻回收
     for i in range(args.workers):  # 按配置数量启动多个检测 worker
         threads.append(threading.Thread(  # 追加一个 worker 线程
