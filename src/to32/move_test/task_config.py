@@ -143,7 +143,9 @@ AUV_TOUCH_ACC_HIT_N = 3          # 连续命中拍数 → 判触壁（20Hz 下 �
 #   ★ 无 Step2 超时：60s→HOLD_FAULT 已按 2026-10-11 要求移除，无门帧持续横移找门、永不超时。
 #   模型由 stage_model 按 Stage.NAME 热切换（PassDoorV2 已注册 → gate）。
 AUV_PASS_DOOR_V2_STAGE = 'PassDoorV2'      # 本任务阶段名（决定 YOLO 模型映射，勿与正式序列 PassGate 混淆）
-AUV_PASS_DOOR_V2_GATES = [                 # 四门参数：turn=相对当前航向（右正左负），height=定深距池底(cm)
+AUV_PASS_DOOR_V2_TURN_DEG = 60.0           # ★ 单门流程 Step1 转向角（相对当前航向，右为正）—— 测第几门就改这里
+AUV_PASS_DOOR_V2_HEIGHT_CM = 45.0          # ★ 单门流程 Step1 定深目标（距池底 cm）—— 低门 45 / 高门 65
+AUV_PASS_DOOR_V2_GATES = [                 # 四门参数表（**当前单门流程未使用**，4 门循环版遗留；改上面两个键即可）
     {'turn': +60.0, 'height': 45.0},       # 门1：右转60°，定深45cm（低门）
     {'turn': -90.0, 'height': 65.0},       # 门2：左转90°，定深65cm（高门）
     {'turn': +60.0, 'height': 45.0},       # 门3：右转60°，定深45cm（低门）
@@ -151,21 +153,30 @@ AUV_PASS_DOOR_V2_GATES = [                 # 四门参数：turn=相对当前航
 ]
 AUV_PASS_DOOR_V2_CAM = 'front'             # 前视相机（YOLO 检测 door → canonical gate）
 AUV_PASS_DOOR_V2_WANT = 'gate'             # 检测目标 canonical 名
-AUV_PASS_DOOR_V2_SWAY_DIR = 1.0            # 缺省横移方向（+1 右 / -1 左）：仅用于"从未见过门"时的起步找门方向，
+AUV_PASS_DOOR_V2_SWAY_DIR = 1.0            # （Step2 简化版未使用）缺省横移方向（+1 右 / -1 左）：
                                            #   之后一律由视觉误差决定方向（见下面 SWAY_KP/HYST）
 AUV_PASS_DOOR_V2_SWAY_THRUST = 0.3         # 横移推力档（**对齐时的限幅上限**，也是无框找门的幅度，-1~1）
 AUV_PASS_DOOR_V2_SWAY_KP = 1.0             # ★ 对中比例增益：sway = clamp(KP·ex/(0.5·画面宽), ±SWAY_THRUST)
                                            #   ex = 框中心 x − 画面中心 x（框偏右为正 → 右移）
 AUV_PASS_DOOR_V2_SWAY_MIN_THRUST = 0.15    # 输出幅度保底（避免比例输出过小推不动）
-AUV_PASS_DOOR_V2_SWAY_HYST_PX = 24.0       # ★ 换向滞回带(px)：误差未越过 (容差+滞回) 到另一侧时不换向
+AUV_PASS_DOOR_V2_SWAY_HYST_PX = 24.0       # （Step2 简化版未使用）换向滞回带(px)：
                                            #   → 保证"朝一个方向持续横移到对中"，不在中心附近来回抖
-AUV_PASS_DOOR_V2_ALIGN_EARLY = True        # ★ 看到门就允许对中（2026-10-10）：
+AUV_PASS_DOOR_V2_ALIGN_EARLY = True        # （单门流程未使用）看到门就允许对中：
                                            #   默认 True = sub=0 转向到位后，**只要已识别到门就立刻进入
                                            #   sub=1 横移对中**，不必等定深到位（定深目标仍每拍下发，下潜不中断）。
                                            #   动机：定深判据依赖融合深度（depth_kalman/池深标定），判据不可用时
                                            #   按"无兜底"口径永不完成 → 门就在正前方也永远轮不到对准。
                                            #   False = 恢复"先定深到位再对中"的老顺序。
-AUV_PASS_DOOR_V2_LOST_S = 0.5              # 丢帧窗口(s)：见过门后短暂无有效目标帧(≤此值)保持上一帧 sway 输出，
+
+# ---- step0：切前视模型（整任务只做一次，只等不运动）----
+AUV_PASS_DOOR_V2_MODEL = 'door_6'          # ★ step0 要切到的前视模型名（**子串**匹配 det JSON 的 model_path）
+AUV_PASS_DOOR_V2_MODEL_STAGE = 'PassDoorV2'  # step0 发布/重申的 stage 名（stage_model.STAGE_MODELS 的键）。
+                                           #   默认 = 本阶段名；★ 若板端 stage_model 没把 PassDoorV2 指到
+                                           #   door_6，改成本地已知映射到 door_6 的 stage 名（如 'PassGate'）
+AUV_PASS_DOOR_V2_MODEL_READY_N = 3          # 就绪判据：model_path 匹配 + 检测帧新鲜，**连续 N 拍**
+AUV_PASS_DOOR_V2_MODEL_WAIT_S = 0.0         # 等待上限秒：0 = 无限等（默认，守"宁停勿猜"口径）；
+                                           #   >0 = 超时打 WARN 并放行进 step1
+AUV_PASS_DOOR_V2_LOST_S = 0.5              # （Step2 简化版未使用）丢帧窗口(s)：见过门后短暂无有效目标帧(≤此值)保持上一帧 sway 输出，
                                            #   用下一有效帧修复；超过此值视为真丢门 → 固定方向横移找门（ok_cnt 清零）
 AUV_PASS_DOOR_V2_PX_TOL = 20.0             # 对准容差(px)：门中心 x 距画面中心 ≤ 此值（口径=AUV_IMG_W 的检测空间）
 AUV_PASS_DOOR_V2_HOLD_N = 10               # 对准稳定帧数（带内连续 N 个新检测帧）
