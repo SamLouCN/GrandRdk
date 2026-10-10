@@ -11,8 +11,11 @@
 
 v2.5 重写版与 v2.2 的差异：
   - 状态机换成 mission.Mission（阶段注册制，阶段表见 task_config.STAGE_TABLE）
-  - 观测接口合并为 obs.VisionIF / obs.DepthIF（数据格式不变）
-  - 移除 kalman_launcher 托管与 auv_report 状态回传（需要时按旧版思路重加）
+  - 观测接口：obs.VisionIF（视觉）。
+  - ★ [2026-10-11 用户要求] **深度卡尔曼已从板端移除**：不再注入 obs.DepthIF、
+    不再经 kalman_launcher 拉起 depth_kalman；**所有深度判定一律改用固件深度计遥测
+    actual_depth_cm**（与下发 depth_cm 是同一固件帧，可直接相减）。
+  - auv_report 状态回传未接（需要时按旧版思路重加）
   - 本文件自带 sys.path 注入：v2.2 的 run.sh PYTHONPATH 不含 move_test 段也能接回
 """
 import os
@@ -30,7 +33,7 @@ from mode_base import ModeBase
 import task_config as TC
 import obs
 from mission import Mission, apply_yaw_mirror
-from kalman_launcher import DepthKalmanLauncher  # [2026-10-08 接回] 观测进程托管
+# [2026-10-11] 深度卡尔曼托管已移除（用户要求）：不再 import DepthKalmanLauncher
 
 
 class AuvMode(ModeBase):
@@ -61,11 +64,10 @@ class AuvMode(ModeBase):
         self.send_downlink(S.frame_mode(S.MODE_AUV), "0x04 AUV")
         self.state = "idle"
         # 每次进入都重建状态机：保证每次切进 AUV 都从头跑
+        # [2026-10-11] depth=None —— 深度卡尔曼已移除，深度判定走固件深度计遥测
+        #   （t_function.dive_step / exit_step 直接读 ctx.tel['actual_depth_cm']）
         self.mission = Mission(TC, vision=obs.VisionIF(log=self.log),
-                               depth=obs.DepthIF(log=self.log), log=self.log, task_pids=self.ctx.task_pids)
-        # [2026-10-08 接回托管] 进 AUV 自动拉起 depth_kalman（幂等：已在跑就复用）
-        self.depth_kalman = DepthKalmanLauncher(TC, log=self.log)
-        self.depth_kalman.ensure_started()
+                               depth=None, log=self.log, task_pids=self.ctx.task_pids)
         n = len(getattr(TC, 'STAGE_TABLE', []) or [])
         self._paused_since = None
         self._paused_log_ts = 0.0
@@ -90,10 +92,6 @@ class AuvMode(ModeBase):
         if self.mission is not None:
             self.mission.close()
         self.mission = None            # 丢弃状态机：阶段/计时器不残留到下次
-        dk = getattr(self, 'depth_kalman', None)  # [2026-10-08] 只停自己起的那个
-        if dk is not None:
-            dk.stop()
-            self.depth_kalman = None
         super().on_exit(next_id)
 
     # ---------------- 事件 ----------------

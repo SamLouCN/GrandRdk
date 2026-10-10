@@ -21,12 +21,12 @@
            未检出突变 → 自动完成。
     Step4. 暂空占位：直接完成，交接下一阶段。
 
-★ 无兜底口径：Step1 转向/定深判据失效（无 yaw 遥测 / 融合深度源不可用）即持续执行不完成；
+★ 无兜底口径：Step1 转向/定深判据失效（无 yaw 遥测 / 无 actual_depth_cm 遥测）即持续执行不完成；
   Step2 **丢帧也按上一帧方向继续、不设超时**（原"对中超时 → HOLD_FAULT"已按 2026-10-10
   新口径移除；_set_fault/_fault_cmd 保留备用）；唯一的兜底是 Step3 前冲的 RUSH_DUR_S（15s）。
 
 任务侧不直接碰共享内存：视觉走 ctx.vision（obs.VisionIF，fresh/poll），
-高度计走自建 AltIF（obs.AltIF，读原始 B/C），定深走 ctx.depth（obs.DepthIF）。
+高度计走自建 AltIF（obs.AltIF，读原始 B/C），定深判据走固件深度计遥测（ctx.tel['actual_depth_cm']）。
 """
 import os
 import sys

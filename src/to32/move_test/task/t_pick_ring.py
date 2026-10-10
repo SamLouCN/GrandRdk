@@ -10,7 +10,7 @@
     - 内部子状态机依次调用 t_function 运动原语，复用同一套原语语义
 
 动作序列（内部子步骤，1 + 6×N = 19 步）：
-    0. dive_step    定深到距池底 40cm（融合深度带内保持，无兜底）
+    0. dive_step    定深到距池底 40cm（固件深度计带内保持，无兜底）
     每循环 6 步（×AUV_PICK_RING_CYCLES）：
     1. forward_step 前进 1s
     2. turn_step    相对当前 yaw **右转** 180°（目标 = 当前 yaw + 转角，
@@ -30,7 +30,7 @@
       独立 st dict（计时器/锁存互不串）；turn 的目标角锁存进该子步骤的 st['_tgt']
 
 运行前提（无兜底口径，判据失效即死等）：
-    - 定深子步骤依赖 kalman 融合深度（ctx.depth → DepthIF），融合源 !ok 即永不完成
+    - 定深子步骤依赖**固件深度计遥测**（$TEL `actual_depth_cm`）；无遥测即永不完成
     - 转向子步骤依赖 yaw 遥测（$TEL actual_yaw），切入时读不到 → 永不完成（无兜底）
     - ★ 每个子步骤都显式传 target_height_cm：各子步骤 st 全新，原语"沿用上一拍"
       机制首拍会回落 AUV_DEFAULT_HEIGHT_CM(60)，必须逐子步骤显式传参规避

@@ -72,7 +72,7 @@ TEST_ECHO_S = 10.0             # EchoObs 观测回显时长(s)；<=0 = 一直跑
 class EchoObs(Stage):
     """内置观测回显测试项：不动船（中性悬停保持），节流打印三条观测链路读数。
 
-    用途：上水前验证 VisionIF（前视检测 JSON）/ DepthIF（融合深度）/ 遥测链路是否在线。
+    用途：上水前验证 VisionIF（前视检测 JSON）/ 深度计遥测（actual_depth_cm）/ 遥测链路是否在线。
     深度目标贴当前实测（≈悬停不调深）；无遥测时回落 t_function 沿用口径。
     """
 
@@ -86,18 +86,17 @@ class EchoObs(Stage):
         st.setdefault('t0', now)
         elapsed = now - st['t0']
 
-        # ---- 观测回显（1s 节流）：融合深度 / 前视 ball+gate / 遥测摘要 ----
-        d = self.ctx.depth.read(now)                       # DepthIF 永不抛；!ok 时 D=None
+        # ---- 观测回显（1s 节流）：固件深度计 / 前视 ball+gate / 遥测摘要 ----
+        # [2026-10-11] 深度卡尔曼已移除：不再读 ctx.depth（融合），改用固件深度计遥测
+        tel = self.ctx.tel or {}
         v_ball = self.ctx.vision.poll('front', 'ball', now)
         v_gate = self.ctx.vision.poll('front', 'gate', now)
-        tel = self.ctx.tel or {}
-        msg = ('Echo t=%.1fs 融合D=%s ball=%s gate=%s | yaw=%.1f° 深度计=%.1fcm'
+        msg = ('Echo t=%.1fs 深度计=%s ball=%s gate=%s | yaw=%.1f°'
                % (elapsed,
-                  ('%.3fm(ok)' % d['D']) if d.get('ok') and d.get('D') is not None else '无',
+                  ('%.1fcm' % float(tel['actual_depth_cm'])) if tel.get('actual_depth_cm') is not None else '无',
                   ('dx=%.0fpx w=%.0f' % (v_ball['dx'], v_ball['w'])) if v_ball else '无',
                   ('dx=%.0fpx' % v_gate['dx']) if v_gate else '无',
-                  float(tel.get('actual_yaw', 0.0) or 0.0),
-                  float(tel.get('actual_depth_cm', 0.0) or 0.0)))
+                  float(tel.get('actual_yaw', 0.0) or 0.0)))
         t_function._say_throttled(self.ctx, st, now, msg)
 
         # ---- 到时完成（TEST_ECHO_S<=0 = 一直跑到切模式）----

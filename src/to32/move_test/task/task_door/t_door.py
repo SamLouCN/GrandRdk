@@ -77,54 +77,54 @@ class DoorTask(Stage):
         self.depth = self._depth_target(self.depth)
         if require_depth and not self.depth_confirmed:
             surge, sway = 0., 0.
-            note += '；等待卡尔曼定深稳定'
+            note += '；等待深度计定深稳定'
         return TF._cmd(self.NAME, self.phase + ': ' + note, self.yaw, self.depth, surge, sway)
 
     def _read_depth(self, now):
-        """融合 D 以米返回；使用输出样本时间去重，不以控制 tick 计数。"""
+        """深度判据：**固件深度计遥测 actual_depth_cm**（cm）—— 与下发 depth_cm 同帧，可直接相减。
+
+        [2026-10-11] 深度卡尔曼已从板端移除：本函数原读融合 D（obs.DepthIF），现改读固件
+        深度计遥测；随之取消"融合目标相对映射"（fused_target_cm 现在就是固件帧目标）、
+        去掉 v_z 垂速门限（固件遥测不提供该量）。无遥测 → depth_confirmed 保持 False，
+        调用方 _command(require_depth=True) 会清零推力等待（安全语义不变）。
+        """
+        from task import t_function as TF
         self.depth_valid = False
+        a_d = TF._tel_f(self.ctx, 'actual_depth_cm')
         try:
-            d = self.ctx.depth.read(now)
-            depth, velocity, stamp = float(d['D'])*100., float(d['v_z']), float(d['sample_ts'])
-            self.depth_valid = (bool(d.get('ok')) and not d.get('stale', True)
-                                and all(math.isfinite(v) for v in (depth, velocity, stamp))
-                                and depth >= 0)
-        except (AttributeError, KeyError, TypeError, ValueError):
-            pass
-        if not self.depth_valid:
+            depth = float(a_d)
+        except (TypeError, ValueError):
+            depth = None
+        if depth is None or depth != depth or depth < 0:   # 缺失 / NaN / 负值
             self.depth_ok_count, self.depth_ready = 0, False
             self.depth_confirmed = False
             return
-        self.fused_depth_cm, self.depth_sample_ts = depth, stamp
+        self.depth_valid = True
+        self.fused_depth_cm, self.depth_sample_ts = depth, now
         in_band = (self.fused_target_cm is not None
-                   and abs(depth-self.fused_target_cm) <= self.cfg.depth_tolerance_cm
-                   and abs(velocity) <= self.cfg.depth_velocity_max_mps)
+                   and abs(depth - self.fused_target_cm) <= self.cfg.depth_tolerance_cm)
         if not in_band:
             self.depth_ok_count = 0
-        elif self.depth_last_counted_ts is None or stamp > self.depth_last_counted_ts:
+        else:
             self.depth_ok_count += 1
-        elif stamp < self.depth_last_counted_ts:
-            self.depth_ok_count = 0  # 写端重启／样本时间回退，重新确认
-            self.depth_confirmed = False
-        self.depth_last_counted_ts = stamp
+        self.depth_last_counted_ts = now
         self.depth_ready = self.depth_ok_count >= self.cfg.depth_hold_samples
         if self.depth_ready:
             self.depth_confirmed = True
         elif (self.fused_target_cm is not None
-              and (abs(depth-self.fused_target_cm) > self.cfg.depth_hold_tolerance_cm
-                   or abs(velocity) > self.cfg.depth_velocity_max_mps)):
+              and abs(depth - self.fused_target_cm) > self.cfg.depth_hold_tolerance_cm):
             self.depth_confirmed = False
 
     def _lock_depth_target(self, target):
-        # 锁定同一动作的两种口径，不直接将融合 D 与固件绝对深度相减。
-        # 使用钳位后的实际指令变化量，避免在深度限位处追逐不可达目标。
+        # [2026-10-11] 下发与判据现在都是**固件深度计帧** → 目标即自身，
+        # 不再需要原来"融合 D 与固件绝对深度不相减"的相对映射（fused_target_cm 保留
+        # 字段名以兼容旧引用，值就是固件帧目标）。
         self.depth = self._depth_target(target)
-        self.fused_target_cm = self.fused_depth_cm + self.depth-self.actual_depth
+        self.fused_target_cm = self.depth
         self.depth_ok_count, self.depth_ready = 0, False
         self.depth_confirmed = False
-        self.depth_last_counted_ts = self.depth_sample_ts
-        self.ctx.say('PassGate 定深：固件目标 %.1fcm；相对变化映射后的融合目标 %.1fcm'
-                     % (self.depth, self.fused_target_cm))
+        self.depth_last_counted_ts = None
+        self.ctx.say('PassGate 定深：固件深度目标 %.1fcm（深度计帧直比）' % self.depth)
 
     def _depth_target(self, value):
         from task import t_function as TF
@@ -437,12 +437,12 @@ class DoorTask(Stage):
         if not self.depth_valid:
             self.counts = {}
             if self.motion is not None and now-self.motion['start'] > cfg.motion_timeout_s:
-                return self._fault(now, '动作期间融合深度持续不可用，停止调整')
+                return self._fault(now, '动作期间深度计读数持续不可用，停止调整')
             if self.motion is not None and self.motion['kind'] == 'sway':
                 self.motion = None  # 停推时间不能算成已完成的横移距离
                 self.counts = {}
                 self.settle_until = now+cfg.settle_s
-            return self._command('融合深度不可用，保持目标并停止水平运动')
+            return self._command('深度计读数不可用，保持目标并停止水平运动')
         obs = self.vision.poll(now)
         if self.motion is not None:
             if self.motion['kind'] == 'sway' and (not self.depth_confirmed or not obs.get('valid')
@@ -454,7 +454,7 @@ class DoorTask(Stage):
             return self._motion_tick(now)
         if not self.depth_confirmed:
             self.counts = {}
-            return self._command('融合深度／垂速未连续到位')
+            return self._command('深度计读数未连续到位')
         if now < self.settle_until:
             return self._command('等待运动稳定')
         if not obs.get('valid'):

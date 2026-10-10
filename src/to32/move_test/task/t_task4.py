@@ -20,7 +20,7 @@
     - 参数全部走 task_config（AUV_TASK4_*），遵循「任务参数全部进 task_config」
 
 运行前提（无兜底口径，判据失效即死等）：
-    - 定深子步骤完成依赖 depth_kalman 融合深度（obs.DepthIF ← /dev/shm/momo_depth.json）
+    - 定深子步骤完成依赖**固件深度计遥测**（$TEL `actual_depth_cm`；深度卡尔曼已移除）
 """
 import os
 import sys

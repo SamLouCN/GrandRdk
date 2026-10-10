@@ -30,7 +30,7 @@
 #   ./run.sh --to32-dir /path    # To32 目录 (默认 <项目根>/src/to32)
 #   ./run.sh --to32-estop        # 保留 To32 的自动急停+锁存 (默认: 关闭)
 #   ./run.sh --to32-args "--mode rov"   # To32 附加参数透传
-#   ./run.sh --no-depthkf        # 不启动深度卡尔曼 (默认拉起; stop.sh 会一并停掉)
+#   ./run.sh --depthkf           # ★ [2026-10-11] 显式启动深度卡尔曼（默认已不启动：改用固件深度计遥测）
 #   ./run.sh --no-flow           # 不启动光流测速
 #   ./run.sh --flow-args "--fps 30 --port 8000"   # 光流测速附加参数透传
 #   ./run.sh --no-showcam        # 不启动第三路相机推流(CAM3)
@@ -61,7 +61,8 @@ NO_NGINX=0 # 1=不 reload Nginx
 SETUP_ONLY=0 # 1=只做初始化就退出
 NO_ALTIMETER=0 # 1=不启动高度计
 NO_TO32=0 # 1=不启动中位机
-NO_DEPTHKF=0 # 1=不启动深度卡尔曼（默认常驻，见 3.65 段）
+NO_DEPTHKF=1 # 1=不启动深度卡尔曼（★ [2026-10-11] 深度卡尔曼已从板端移除 → **默认不启动**；
+             #   加 --depthkf 可显式恢复启动。见 3.65 段）
 TO32_ESTOP=0 # 1=保留中位机自动急停与锁存
 TO32_DIR="$SRC_DIR/to32" # 中位机目录，可用 --to32-dir 覆盖
 NO_FLOW=0 # 1=不启动光流测速
@@ -99,6 +100,7 @@ while [ $# -gt 0 ]; do # 还有参数就继续解析
         --alt-args)       ALT_ARGS_STR="$2"; shift 2 ;;
         --no-to32)        NO_TO32=1; shift ;;
         --no-depthkf)     NO_DEPTHKF=1; shift ;;
+        --depthkf)        NO_DEPTHKF=0; shift ;; # [2026-10-11] 显式恢复启动深度卡尔曼（默认已不启动）
         --to32-dir)       TO32_DIR="$2"; shift 2 ;;
         --to32-estop)     TO32_ESTOP=1; shift ;;
         --to32-args)      TO32_ARGS_STR="$2"; shift 2 ;;
@@ -348,14 +350,15 @@ else # 正常启动中位机
 fi # 中位机启动段结束
 
 # ============================================================
-# 3.65 启动深度卡尔曼 (src/kalman/depth_kalman) —— [2026-10-08 起由本脚本托管]
-#     - 生命周期与 front/bottom/to32 同款: 清理段 pkill 上一轮实例, 本段拉起新的,
-#       stop.sh / Ctrl-C(cleanup) / 主链路退出都会停它。ROV 模式下 $TEL[41/42]
-#       的融合深度/净空恒有值 (tel_builder 持续读 momo_depth.json)。
-#     - 幂等双保险: 本段 pidfile+kill -0 判活 (兜住 kill -9 残留等漏网场景,
-#       活着就复用不起第二个); kalman_launcher.py 进 AUV 模式时同样判活复用 ——
-#       双进程同时写 momo_depth.json 会打架, 任何路径都绝不双开。
-#     - 启动失败仅告警, 不终止 run.sh (AUV 任务会走降级路径)。
+# 3.65 深度卡尔曼 (src/kalman/depth_kalman) —— ★ [2026-10-11 用户要求: 已从板端移除]
+#     - **默认不启动**（NO_DEPTHKF=1）：所有深度判定已改为读**固件深度计遥测
+#       actual_depth_cm**（$TEL 帧内，与下发 depth_cm 同帧可直比），不再需要融合深度；
+#       mode_auv / test_runner 也同步移除了 kalman_launcher 托管。
+#     - 需要临时恢复时：`./run.sh --depthkf`（本段逻辑原样保留，可直接复用）。
+#     - 历史（备查）：2026-10-08 起由本脚本托管；ROV 模式下 $TEL[41/42] 的融合深度/净空
+#       由 tel_builder 读 momo_depth.json 追加 —— 现在读不到 → 该两字段恒不追加（自动降级）。
+#     - 幂等双保险: pidfile+kill -0 判活，绝不双开（双进程同写 momo_depth.json 会打架）。
+#     - 启动失败仅告警, 不终止 run.sh。
 # ============================================================
 DEPTHKF_DIR="$SRC_DIR/kalman/depth_kalman" # 深度卡尔曼工程根（与板端 /userdata/GrandRDK 布局一致）
 DEPTHKF_PIDFILE="$DEPTHKF_DIR/logs/depth_kalman.pid" # run.sh --daemon 写的 pid 文件

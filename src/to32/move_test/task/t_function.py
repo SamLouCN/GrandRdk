@@ -47,11 +47,11 @@ st dict 里(键见各函数 docstring)——同一函数可被多个阶段实例
      定时即完成方式(touch_wall 模式可被 IMU 触壁判据提前结束)。
 
 已知限制(TODO 上车前处理)：
-  - 深度判据(2026-10-06 用户口径)：Dive 的完成/退出**只看 kalman 融合深度**
-    (obs.DepthIF ← /dev/shm/momo_depth.json),不与固件深度计混判；融合源 !ok
-    (depth_kalman 未起/超期/σ 超限)期间不判带内 → **永不完成(无超时兜底)**。
-    注意口径：融合 D=B 探头语义,与深度计差 ~0.18m(config/depth_config.py H_M
-    段"已知债务"),定深目标换算须与它配套。
+  - 深度判据(★ 2026-10-11 改)：Dive / Exit 只看**固件深度计遥测 actual_depth_cm**，
+    与下发的 depth_cm 是同一个固件帧 → 直接相减判带内；无遥测期间不判
+    → **永不完成(无超时兜底)**。
+    深度卡尔曼(depth_kalman → obs.DepthIF)已按用户要求**从板端移除**，
+    融合深度/离底净空路径不再参与任何判定。
   - touch_wall 触壁判据(2026-10-06)：接 **IMU 三轴加速度**(遥测 acc_x/acc_y/acc_z,
     link_stm32 已还原)幅值突降判触壁；阈值(AUV_TOUCH_ACC_*)待实车标定，
     遥测无加速度时退化为纯定时。V2 无线速度,不接 vx 判据。
@@ -266,19 +266,16 @@ def dive_step(ctx, st, now, dt, target_height_cm,
 
     行为(Task.md §4.1 Dive)：surge/sway=0,depth_cm 闭环(固件内),yaw 锁死当前航向
     (进入时首拍锁存,固定下发 —— _yaw_hold)。
-    完成(2026-10-08 修帧)：**kalman 融合的「离底净空」clearance**(ctx.depth → DepthIF,
-    即融合自己算的高度计离底高度 m)连续 hold_n 拍落在 [目标高度±tol_cm] 内 ——
-    判据与 target_height_cm 是**同一个物理量、同一个融合源**。
-    ⚠ 旧写法拿融合 D(探头帧：探头装舱底,比上部深度计低约一个机体高度 20cm)去比
-    d_target(固件深度计帧,已减过 20cm 机体高度) = **两帧混比**，实测恒定差 19.5cm
-    > tol 8cm ⇒ Dive 永远完不成（2026-10-08 板端实锤：固件深度 49.6cm / 融合 D 69.4cm）。
-    退化路径：clearance 缺失时改用同帧 D 判据 |D − (AUV_POOL_DEPTH_CM − 目标高度)|
-    (同样不减机体高度)。
-    ★ 无兜底(2026-10-06 用户口径)：融合源 !ok(depth_kalman 未起/超期/σ 超限)
-    或未入带期间**永不完成**,持续下发定深指令(要完成须先拉起 depth_kalman)。
+    完成(★ 2026-10-11 口径)：**固件深度计遥测 actual_depth_cm** 连续 hold_n 拍落在
+    [下发目标 depth_cm ± tol_cm] 内 —— 下发与判据是**同一个固件帧**，可直接相减。
+    这是深度卡尔曼从板端移除后的**唯一**深度判据（融合 clearance / 融合 D 路径已删除）。
+    （历史：2026-10-08 曾用融合 clearance 判，并踩过"融合探头帧 vs 固件深度计帧"恒定
+      差 19.5cm 的跨帧混比坑；改用同一固件帧后该坑自然消失。）
+    ★ 无兜底(2026-10-06 用户口径)：无 actual_depth_cm 遥测、或未入带期间**永不完成**，
+      持续下发定深指令（要完成须先保证 $TEL 遥测正常）。
 
     参数说明：
-        ctx:               mission.Ctx —— 上下文(ctx.tel 遥测 / ctx.depth 融合深度 / ctx.say 日志)
+        ctx:               mission.Ctx —— 上下文(ctx.tel 遥测 / ctx.say 日志)
         st:                dict —— 本阶段持久状态(函数自管键,见"st 键")
         now:               float —— 当前时间戳(Mission.step 透传)
         dt:                float —— 拍间隔秒数(Mission.step 透传)
@@ -303,44 +300,27 @@ def dive_step(ctx, st, now, dt, target_height_cm,
     d_target = clamp_depth_cm(target_depth_cm(target_height_cm))
     elapsed = now - st['t0']
 
-    # 完成判据(★ 2026-10-08 修帧，见 docstring)：只看融合 clearance(离底净空) vs 目标高度；
-    # 退化到融合 D 时用同帧目标(pool − 目标高度，不减机体高度)。融合源 !ok → 不判带内。
-    depth_if = getattr(ctx, 'depth', None)
-    h_now = None                               # 离底净空(cm，主判据)
-    d_now = None                               # 融合深度(cm，退化判据 + 日志)
-    if depth_if is not None:
-        d = depth_if.read(now)                 # DepthIF 永不抛；!ok 时字段为 None
-        if d.get('ok'):
-            try:
-                if d.get('clearance') is not None:
-                    h_now = float(d['clearance']) * 100.0
-                if d.get('D') is not None:
-                    d_now = float(d['D']) * 100.0
-            except (TypeError, ValueError):
-                h_now = d_now = None
-
-    judge_d = float(getattr(TC, 'AUV_POOL_DEPTH_CM', 106.0)) - float(target_height_cm)
-    if h_now is not None:                      # 主判据：离底净空 vs 目标离底高度(同帧同量)
-        in_band = abs(h_now - float(target_height_cm)) <= tol_cm
+    # 完成判据(★ 2026-10-11)：固件深度计遥测 actual_depth_cm vs 下发目标 depth_cm
+    #   —— 两者是同一个固件帧，可直接相减（深度卡尔曼已移除，融合路径不再参与）。
+    a_d = _tel_f(ctx, 'actual_depth_cm')
+    if a_d is not None:
+        try:
+            a_d = float(a_d)
+        except (TypeError, ValueError):
+            a_d = None
+    if a_d is not None:
+        in_band = abs(a_d - d_target) <= tol_cm
         _say_throttled(ctx, st, now,
-                       '%s 净空=%.1fcm 目标=%.0fcm(融合D=%s) ok=%d/%d t=%.1fs'
-                       % (stage, h_now, target_height_cm,
-                          ('%.1f' % d_now) if d_now is not None else 'None',
-                          st['ok_cnt'], hold_n, elapsed))
-    elif d_now is not None:                    # 退化判据：同帧 D vs (pool − 目标高度)
-        in_band = abs(d_now - judge_d) <= tol_cm
-        _say_throttled(ctx, st, now,
-                       '%s 无净空字段 → 退化 D 判据 D=%.1f 目标=%.1f ok=%d/%d t=%.1fs'
-                       % (stage, d_now, judge_d, st['ok_cnt'], hold_n, elapsed))
-    else:                                      # 融合源不可用 → 不判带内(无兜底)
+                       '%s 深度=%.1fcm 目标=%.1fcm(距底%.0fcm) ok=%d/%d t=%.1fs'
+                       % (stage, a_d, d_target, target_height_cm, st['ok_cnt'], hold_n, elapsed))
+    else:
         in_band = False
-        _say_throttled(ctx, st, now, '%s 融合深度源 !ok(无净空/深度) → 不判带内(无兜底)' % stage)
+        _say_throttled(ctx, st, now,
+                       '%s 无 actual_depth_cm 遥测 → 不判带内(无兜底，持续下发定深)' % stage)
     st['ok_cnt'] = st['ok_cnt'] + 1 if in_band else 0
     done = (st['ok_cnt'] >= hold_n)
-    why = ('带内保持 %d 拍(%s)'
-           % (st['ok_cnt'],
-              ('净空 %.1f/%.0fcm' % (h_now, target_height_cm)) if h_now is not None
-              else ('融合D %.1f/%.1fcm' % (d_now or 0.0, judge_d))))
+    why = ('带内保持 %d 拍(深度 %s/%.1fcm)'
+           % (st['ok_cnt'], ('%.1f' % a_d) if a_d is not None else 'N/A', d_target))
 
     yaw_ref = _yaw_hold(st, ctx)
     if yaw_ref is None:

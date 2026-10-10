@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """卡尔曼进程托管 —— 深度 / 图像两路，生命周期都跟着 AUV 模式走
 
+★★ [2026-10-11 用户要求] **深度卡尔曼已从板端移除** ★★
+  - 本模块的 ``DepthKalmanLauncher``（深度路）**已不再被 mode_auv / test_runner 使用**；
+  - 板端 ``run.sh`` 默认也不启动 depth_kalman（``NO_DEPTHKF=1``；``--depthkf`` 可临时恢复）；
+  - 所有深度判定统一改为读**固件深度计遥测 actual_depth_cm**（$TEL 帧内，
+    与下发 depth_cm 是同一个固件帧，可直接相减）；
+  - 本文件保留：``KalmanLauncher`` 基类与 ``ViskfLauncher``（图像路）仍可复用；
+    将来若要恢复深度路，把 ``DepthKalmanLauncher`` 重新挂回 mode_auv 即可（相关键都还在 task_config）。
+
 为什么做成"进程托管"而不是"接进 GrandRDK/run.sh"
 ------------------------------------------------
 用户明确要求：**上位机切到 AUV 模式就自动可用，不要额外的 start/stop 脚本**。
@@ -335,7 +343,11 @@ class KalmanLauncher(object):
 
 
 class DepthKalmanLauncher(KalmanLauncher):
-    """深度卡尔曼托管（`AUV_KALMAN_*`，输出 `momo_depth.json`）"""
+    """深度卡尔曼托管（`AUV_KALMAN_*`，输出 `momo_depth.json`）
+
+    ★ [2026-10-11] **已停用** —— 深度卡尔曼已从板端移除，mode_auv / test_runner
+    不再构造本类；深度判定改走固件深度计遥测 actual_depth_cm。保留以备恢复。
+    """
 
     def __init__(self, cfg, log=None, popen=None):
         """从 cfg 读 `AUV_KALMAN_*` 组装规格（每次构造都重读，方便台架改配置后重建）"""

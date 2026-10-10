@@ -192,7 +192,9 @@ class VisionIF(object):
 
 
 class DepthIF(object):
-    """深度接口：read(now) -> dict（永远返回 dict，绝不抛）
+    """深度接口（★ [2026-10-11] **已停用**：深度卡尔曼已从板端移除，本类不再被注入 ctx；
+    所有深度判定改读固件深度计遥测 actual_depth_cm。保留以备恢复）：
+    read(now) -> dict（永远返回 dict，绝不抛）
 
     返回 {'ok','D','v_z','clearance','sigma_D','age_s','sample_ts','stale','degraded','H'}
     ok=False 时不得做深度闭环，只能走「定时 + 上浮」的安全路径。

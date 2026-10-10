@@ -42,10 +42,10 @@ for _p in (_TO32, _MV, _TASK, _HERE):
 import link_stm32 as S        # 0x04/0x09 组帧
 from mode_base import ModeBase
 import task_config as TC      # YAW_MIRROR / AUV_LOG_EVERY_S（测试项参数都在那）
-import obs                    # VisionIF / DepthIF（Mission 观测接口）
+import obs                    # VisionIF（Mission 观测接口；深度走固件遥测，见下）
 from mission import Mission, apply_yaw_mirror
 import test_config as TCFG    # 本目录：TEST_MODE_ENABLED / TEST_TABLE / TEST_LOOP
-from kalman_launcher import DepthKalmanLauncher  # [2026-10-08] 观测进程托管
+# [2026-10-11] 深度卡尔曼托管已移除（用户要求）：不再 import DepthKalmanLauncher
 
 
 class TestMode(ModeBase):
@@ -83,11 +83,10 @@ class TestMode(ModeBase):
         # 故传一个只带 STAGE_TABLE 的轻量代理，正式任务表不受影响
         table = list(getattr(TCFG, 'TEST_TABLE', []) or [])
         cfg = types.SimpleNamespace(STAGE_TABLE=table)
+        # [2026-10-11] depth=None —— 深度卡尔曼已移除，深度判定走固件深度计遥测
+        #   （t_function.dive_step / exit_step 直接读 ctx.tel['actual_depth_cm']）
         self.mission = Mission(cfg, vision=obs.VisionIF(log=self.log),
-                               depth=obs.DepthIF(log=self.log), log=self.log, task_pids=self.ctx.task_pids)
-        # [2026-10-08 接回托管] 进 AUV(测试) 自动拉起 depth_kalman（幂等）
-        self.depth_kalman = DepthKalmanLauncher(TC, log=self.log)
-        self.depth_kalman.ensure_started()
+                               depth=None, log=self.log, task_pids=self.ctx.task_pids)
         self.log("[TEST] 测试模式接管 AUV 位：test_config.TEST_TABLE 共 %d 项"
                  "（任务状态机复位，从头开始）；上位机切 ROV(mode=0) 即退出停推" % len(table))
         if table:
@@ -113,10 +112,6 @@ class TestMode(ModeBase):
         if self.mission is not None:
             self.mission.close()
         self.mission = None              # 丢弃状态机：计时器/锁存不残留到下次进入
-        dk = getattr(self, 'depth_kalman', None)  # [2026-10-08] 只停自己起的那个
-        if dk is not None:
-            dk.stop()
-            self.depth_kalman = None
         super().on_exit(next_id)
 
     # ---------------- 事件 ----------------
