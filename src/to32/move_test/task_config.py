@@ -16,10 +16,23 @@ AUV_DET_FRONT = 'momo_det_front.json'          # 前视检测（front.py 写）
 AUV_DET_BOTTOM = 'momo_det_bottom.json'        # 下视检测（bottom.py 写）
 AUV_DET_STALE_S = 0.5                          # 检测 JSON 超期秒数，超期按无目标
 AUV_MIN_SCORE = 0.5                            # 检测置信度门槛
+<<<<<<< HEAD
 AUV_IMG_W = 640.0                             # 前摄画面宽（归一化偏差 ex 的分母）
 AUV_IMG_H = 480.0                             # 前摄画面高
 AUV_BOTTOM_IMG_W = 1280.0                     # 下摄仍为 1280×720，独立归一化
 AUV_BOTTOM_IMG_H = 720.0
+=======
+AUV_IMG_W = 640.0                              # ★ 检测框所在画面宽（**检测坐标空间**，非相机采集分辨率）
+                                               #   2026-10-10 改：原写 1280（相机采集宽），但检测框实际在
+                                               #   640×480 空间 —— 全项目其它地方都按 (320,240) 是画面中心：
+                                               #   config/auv_config.AUV_AIM_*=(320,240)、main_config.mark_point
+                                               #   =[320,240]、viskf_config.VISKF_X0_PX=320、web/index.html 的
+                                               #   `cx-320`、捡球方案文档 `dx=cx-320`。
+                                               #   用 1280 算出的中心是 640 → ex=cx-640 恒为负 → 过门横移
+                                               #   只会朝一个方向推、永远对不正（且归一化分母错一倍）。
+                                               #   ★ 若现场实测 det JSON 的 bbox x 上限是 1280，把这里改回 1280。
+AUV_IMG_H = 480.0                              # 画面高（同上，中心 y = 240）
+>>>>>>> 9c99bbf (door适应性修改)
 AUV_CLIP_MARGIN_PX = 4.0                       # 贴边判定余量（px），贴边时 w/h 不可信
 AUV_DEPTH_FILE = 'momo_depth.json'             # 融合深度（depth_kalman 写，20Hz）
 AUV_DEPTH_STALE_S = 1.0                        # 深度 JSON 超期秒数
@@ -144,11 +157,17 @@ AUV_PASS_DOOR_V2_GATES = [                 # 四门参数：turn=相对当前航
 ]
 AUV_PASS_DOOR_V2_CAM = 'front'             # 前视相机（YOLO 检测 door → canonical gate）
 AUV_PASS_DOOR_V2_WANT = 'gate'             # 检测目标 canonical 名
-AUV_PASS_DOOR_V2_SWAY_DIR = 1.0            # 无门帧横移方向：+1 右移 / -1 左移（找门）
-AUV_PASS_DOOR_V2_SWAY_THRUST = 0.3         # 无门帧横移推力幅度（找门速度档，-1~1）
+AUV_PASS_DOOR_V2_SWAY_DIR = 1.0            # 缺省横移方向（+1 右 / -1 左）：仅用于"从未见过门"时的起步找门方向，
+                                           #   之后一律由视觉误差决定方向（见下面 SWAY_KP/HYST）
+AUV_PASS_DOOR_V2_SWAY_THRUST = 0.3         # 横移推力档（**对齐时的限幅上限**，也是无框找门的幅度，-1~1）
+AUV_PASS_DOOR_V2_SWAY_KP = 1.0             # ★ 对中比例增益：sway = clamp(KP·ex/(0.5·画面宽), ±SWAY_THRUST)
+                                           #   ex = 框中心 x − 画面中心 x（框偏右为正 → 右移）
+AUV_PASS_DOOR_V2_SWAY_MIN_THRUST = 0.15    # 输出幅度保底（避免比例输出过小推不动）
+AUV_PASS_DOOR_V2_SWAY_HYST_PX = 24.0       # ★ 换向滞回带(px)：误差未越过 (容差+滞回) 到另一侧时不换向
+                                           #   → 保证"朝一个方向持续横移到对中"，不在中心附近来回抖
 AUV_PASS_DOOR_V2_LOST_S = 0.5              # 丢帧窗口(s)：见过门后短暂无有效目标帧(≤此值)保持上一帧 sway 输出，
                                            #   用下一有效帧修复；超过此值视为真丢门 → 固定方向横移找门（ok_cnt 清零）
-AUV_PASS_DOOR_V2_PX_TOL = 20.0             # 对准容差(px)：门中心 x 距画面中心 ≤ 此值
+AUV_PASS_DOOR_V2_PX_TOL = 20.0             # 对准容差(px)：门中心 x 距画面中心 ≤ 此值（口径=AUV_IMG_W 的检测空间）
 AUV_PASS_DOOR_V2_HOLD_N = 10               # 对准稳定帧数（带内连续 N 个新检测帧）
 AUV_PASS_DOOR_V2_SURGE = 0.5               # 前冲推力幅度（-1~1）
 AUV_PASS_DOOR_V2_RUSH_DUR_S = 15.0         # 每门前冲兜底时长(s)：B/C 突变未检出 → 到时自动过门

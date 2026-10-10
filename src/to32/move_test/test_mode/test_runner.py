@@ -54,6 +54,7 @@ class TestMode(ModeBase):
     id = -1                      # 注册时由 dispatcher 覆盖为 to32_config.MODE_AUV
     name = "TEST(AUV)"
     desc = "测试模式（test_mode/test_config.py 开关接管 AUV 位）"
+    RESELECT_RESTARTS = True     # [2026-10-10] 在测试模式里再选一次 AUV = 重新开始（整盘复位）
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -87,8 +88,8 @@ class TestMode(ModeBase):
         # [2026-10-08 接回托管] 进 AUV(测试) 自动拉起 depth_kalman（幂等）
         self.depth_kalman = DepthKalmanLauncher(TC, log=self.log)
         self.depth_kalman.ensure_started()
-        self.log("[TEST] 测试模式接管 AUV 位：test_config.TEST_TABLE 共 %d 项；"
-                 "上位机切 ROV(mode=0) 即退出停推" % len(table))
+        self.log("[TEST] 测试模式接管 AUV 位：test_config.TEST_TABLE 共 %d 项"
+                 "（任务状态机复位，从头开始）；上位机切 ROV(mode=0) 即退出停推" % len(table))
         if table:
             # [2026-10-10] 明确打出即将执行的阶段类（填错表时一眼可见，不用等日志里找）
             self.log("[TEST] 测试阶段：%s"

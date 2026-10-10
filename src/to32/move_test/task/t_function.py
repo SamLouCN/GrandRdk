@@ -692,7 +692,11 @@ def sway_align_step(ctx, st, now, dt, ex_px, target_height_cm, yaw_ref,
     else:                                              # 有效误差 → 比例输出 + 到位判据
         ex_px = float(ex_px)
         st['last_ex'] = ex_px
+<<<<<<< HEAD
         w = float(getattr(TC, 'AUV_IMG_W', 640.0))
+=======
+        w = float(getattr(TC, 'AUV_IMG_W', 640.0))   # 兜底=640（画面坐标口径，见 task_config 注释）
+>>>>>>> 9c99bbf (door适应性修改)
         sway_out = (sway_kp * ex_px / (0.5 * w)) if w > 0 else 0.0
         sway_out = max(-sway_max, min(sway_max, sway_out))   # 限幅 ±sway_max
         if abs(ex_px) <= px_tol:

@@ -346,7 +346,21 @@ class Dispatcher(object):  # 编排核心；同时充当各模式回调的 ctx
             self.log("[MODE] 未知模式 %r（已知 %s）-> 忽略" % (new_id, sorted(self.modes)))  # 打印已知模式列表
             return False  # 忽略未知模式
         if not initial and new_id == self.mode_id:  # 非初始化且目标就是当前模式
-            return False  # 未发生切换
+            # [2026-10-10] 重选当前模式：默认仍是"未发生切换"（ROV 等行为零变化）。
+            #   但自主任务模式（AUV / TEST）声明了 RESELECT_RESTARTS=True → 视为
+            #   "重新开始"：先 on_exit（停推、丢弃状态机）再 on_enter（重建任务状态机，
+            #   门1/子步骤0 从头跑）。
+            #   动机：上位机在 AUV 里再点一次 AUV（或"中止"后其实并没真正切到 ROV）时，
+            #   原来的早退会让 Mission/阶段计数原样保留 → 现场表现为
+            #   "中止后再开始会接着上次的任务继续，而不是从头开始"。
+            if not bool(getattr(self.modes[new_id], "RESELECT_RESTARTS", False)):
+                return False  # 未发生切换
+            self.log("[MODE] 重选当前模式 %s → 按“重新开始”处理（任务整盘复位）"
+                     % self.modes[new_id].name)
+            self.modes[new_id].on_exit(new_id)   # 先收尾：停推帧 + 丢弃状态机/子进程
+            self.modes[new_id].on_enter(new_id)  # 再进入：重建任务状态机，从头跑
+            self.stats["switch"] += 1            # 计一次切换（与普通切换一致）
+            return True  # 视为已切换
         old_id = self.mode_id  # 记住旧模式 id，供 on_exit/on_enter 传参
         if not initial:  # 初始化时没有旧模式需要退出
             self.modes[old_id].on_exit(new_id)  # 旧模式收尾（停输出/复位）

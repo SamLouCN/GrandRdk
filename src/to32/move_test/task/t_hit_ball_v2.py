@@ -159,7 +159,7 @@ class HitBallAll(Stage):                               # 撞球 v2 阶段：内�
         now, dt = self._now, self._dt                 # 本拍时间戳与拍间隔（KF 递推/计数用）
         cam = str(getattr(TC, 'AUV_HIT_V2_CAM', 'front'))  # 检测相机：前视
         want = str(getattr(TC, 'AUV_HIT_V2_WANT', 'red-ball')) # 检测目标：ball（CANON 归一）
-        img_w = float(getattr(TC, 'AUV_IMG_W', 1280.0))    # 画面宽(px)：与 obs.poll 的 cx/dx 同口径（中心=img_w/2）
+        img_w = float(getattr(TC, 'AUV_IMG_W', 640.0))     # 画面宽(px)：与 obs.poll 的 cx/dx 同口径（中心=img_w/2）
         center = 0.5 * img_w                           # 画面中心 x 坐标（像素）
         height = float(getattr(TC, 'AUV_HIT_V2_HEIGHT_CM', 60.0))  # 对准期间定深（距池底 cm）
 

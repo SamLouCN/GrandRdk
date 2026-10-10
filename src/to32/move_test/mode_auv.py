@@ -38,6 +38,7 @@ class AuvMode(ModeBase):
     id = C.MODE_AUV
     name = "AUV"
     desc = "自主任务模式（v2.5 重写骨架）"
+    RESELECT_RESTARTS = True       # [2026-10-10] 重复选择本模式 = 重新开始（整盘复位，见 dispatcher.switch_mode）
 
     def __init__(self, ctx):
         super().__init__(ctx)

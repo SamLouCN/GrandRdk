@@ -165,7 +165,7 @@ class HitBallAll(Stage):
 
         # ④ trust 门禁内的外环 PID：ex_kf → 递推 yaw_ref（dx>0 → 右转）
         if self.kf.trust_ok(now, self._f('AUV_HIT_KF_SIGMA_MAX', 60.0)):
-            half_w = self._f('AUV_IMG_W', 1280.0) / 2.0
+            half_w = self._f('AUV_IMG_W', 640.0) / 2.0
             err = (self.kf.x[0] - half_w) / half_w
             yaw_ref, out = vservo.yaw_servo_step(self.servo, self.pid, err, dt,
                                                  sign=self._f('AUV_HIT_YAW_SIGN', 1.0))
@@ -173,7 +173,7 @@ class HitBallAll(Stage):
             yaw_ref = self.servo['yaw_ref']  # 外推过期/σ 膨胀 → 锁住上拍目标
 
         # ⑤ 近场判据 → 切盲冲（w EMA 占比连续 N 拍）
-        if self.w_ema is not None and (self.w_ema / self._f('AUV_IMG_W', 1280.0)
+        if self.w_ema is not None and (self.w_ema / self._f('AUV_IMG_W', 640.0)
                                        ) >= self._f('AUV_HIT_RAM_W_RATIO', 0.45):
             if self.ram_gate.feed(True):
                 self.ctx.say('%s 第 %d 轮近场(w_ema=%.0fpx) → 盲冲'

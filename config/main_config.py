@@ -133,13 +133,23 @@ DEFAULT_CONFIG = {  # 合成后的全局配置字典，供各业务进程直接�
     'FRONT_CAMERA': {  # 前视相机采集参数段
         'device': QC.FRONT_DEVICE,  # 设备节点，由 camera_ports.device_for('cam1') 解析
         'index':  0,  # 相机节点 index 兜底值，实际以 device_for 结果为准
+<<<<<<< HEAD
         'width':  640,  # 前摄原生 VGA；YOLO 单独 letterbox 到模型输入尺寸
         'height': 480,  # 与 quad_cv_kit 前摄标定尺寸一致
+=======
+        'width':  640,  # ★ 2026-10-10 由 1280 改 640：与全项目口径对齐 ——
+                        #   quad_cv_kit/camera_correction_params.json 就是 640×480（内参 cx=320,cy=240）、
+                        #   task_config.AUV_IMG_W/H=640/480、task_door/config.image_width/height=640/480、
+                        #   mark_point=[320,240]、web 叠加 cx-320。
+                        #   配 1280 时 CV 侧 perception 会因帧尺寸不符直接判观测无效，且任务侧
+                        #   中心算成 640 → 横移只朝一个方向推（永远对不正）。
+        'height': 480,  # 采集高度（同上，必须与校正参数一致）
+>>>>>>> 9c99bbf (door适应性修改)
         'fps':    QC.FRONT_FPS,  # 请求帧率，受 USB 带宽与后端能力限制
         'format': 'MJPG',  # 像素格式，MJPG 才能走 JPU 硬件解码
         'backend': 'auto',  # OpenCV 采集后端，auto 优先选 V4L2
         'hardware_decode': True,  # True 用 JPU_LIB 硬解，False 退回 CPU 软解
-        'mark_point': [320, 240],  # 画面中心十字标注点，用于算目标相对偏移
+        'mark_point': [320, 240],  # 画面中心十字标注点（640×480 下的真正中心），用于算目标相对偏移
     },
 
     'FRONT_PREPROCESS': {  # 前视预处理参数段

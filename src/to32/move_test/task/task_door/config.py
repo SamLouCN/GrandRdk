@@ -9,9 +9,15 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class DoorConfig:
+<<<<<<< HEAD
     gates_to_pass: int = 4  # 完成数量；单门调试设为1，不使用v2预设路线
     image_width: int = 640
     image_height: int = 480
+=======
+    image_width: int = 640       # ★ 必须与前视采集/校正参数一致（quad_cv_kit 标定就是 640×480，
+    image_height: int = 480      #   2026-10-10 前视采集由 1280×720 改为 640×480）；不符时
+                                 #   perception 判观测无效、observation 直接丢弃该帧。
+>>>>>>> 9c99bbf (door适应性修改)
     gate_width_m: float = .70
     gate_height_m: float = .50
     area_near: float = .40
