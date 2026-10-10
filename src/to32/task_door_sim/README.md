@@ -3,6 +3,11 @@
 独立的门视觉实验，经 `src/front.py` 采集前摄，复用 `quad_cv_kit` v7 常驻 GPU CV。
 不控制推进器，不发布正式门任务的 `door` 控制观测。
 
+需要使用同一GPU算法驱动AUV时，运行 `move_test/task/task_door` 的 `DOOR_TABLE`（阶段名 `PassGate`）：
+该控制采用当前航向±45°扫视、YOLO航向/深度小步对中、约40%四点回正后直接盲冲；不自动右移找门。
+在 `move_test/test_mode/test_config.py` 手动设置 `TEST_TABLE = DOOR_TABLE`，然后普通 `./run.sh` 启动并切AUV；
+运动控制时不要添加 `--door-sim`。详见 [穿门控制说明](../move_test/task/task_door/README.md)。
+
 ## 当前链路
 
 前摄原生 **640×480 MJPG** → JPU 解码 BGR → GPU 相机校正 →
@@ -122,7 +127,7 @@ python3 src/to32/task_door_sim/run.py --source /path/door.mp4 --frames 100 --cv-
    当前下位机有线 ROV 模式值为 `0x06`，AUV 为 `0x05`，
    与上位机的 0/1 编号不同。
 4. **当前 `move_test/test_mode/test_config.py` 的 `TEST_MODE_ENABLED=True`**：
-   切 AUV 实际进入 `TestMode`，运行 `TEST_TABLE=TASK2_TABLE + RETURN_TABLE`。
+   切 AUV 实际进入 `TestMode`，运行 `TEST_TABLE=PASS_DOOR_V2_TABLE`。
    当前测试表没有 `DOOR_TABLE`；切 AUV 不会直接启动 `task_door`。
    开关只在中位机启动注册模式时读取，修改后需重启中位机。
 5. 测试开关关闭后，切 AUV 进入正式 `move_test/mode_auv.py`，
@@ -130,8 +135,10 @@ python3 src/to32/task_door_sim/run.py --source /path/door.mp4 --frames 100 --cv-
    到 `PassGate` 阶段时 `front.py` 启用正式门视觉流程，`DoorTask` 读取其 `door` 观测。
    切回 ROV 会停推并关闭任务；上位机在 AUV 下的手动杆位由该模式忽略。
 
-本次未将 `task_door_sim` 注册进 ROV/AUV，也未修改正式/测试任务表。
-模式与两种门任务的启动关系留待用户决策。`$VID` 是独立的视频开关，
+视觉实验不直接控制运动。启动模式和活动测试表保持现值；
+要上电自动AUV并运行新门任务，手动设 `START_MODE=MODE_AUV`、`DEFAULT_MODE=MODE_AUV`、
+`MODE_PERSIST=False`，并设 `TEST_TABLE=DOOR_TABLE`、`TEST_LOOP=False`、`TEST_MODE_ENABLED=True`，
+重启后运行普通 `./run.sh`。`$VID` 是独立的视频开关，
 不能选择两种门任务；`$TASKPID` 更新参数也不启动任务、不切模式。
 
 ## 无硬件验证

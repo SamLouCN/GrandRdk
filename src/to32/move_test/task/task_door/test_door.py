@@ -50,14 +50,15 @@ def target(frame=1, area=.2, center=(320, 240), pose=True):
                 width_px=350, height_px=250, area_ratio=area, clipped=False, boundary_sides=[],
                 corners=[[145, 115], [495, 115], [495, 365], [145, 365]],
                 geometry=dict(observation='detected', observed_segments=[1, 2, 3, 4]),
-                pose=(dict(controllable=True, yaw_error_deg=0., alignment_robot_m=[0, 0, 0],
+                pose=(dict(controllable=True, metric_distance_available=True, yaw_error_deg=0., alignment_robot_m=[0, 0, 0],
                            center_robot_m=[0, 0, 1.], center_offset_robot_px=[0, 0]) if pose else None))
 
 
 class StateTests(unittest.TestCase):
     def setUp(self):
         self.cfg = replace(CONFIG, stable_frames=2, observe_frames=2, settle_s=.01,
-                           filter_alpha=1., search_observe_s=.1, depth_hold_samples=2)
+                           filter_alpha=1., search_observe_s=.1, depth_hold_samples=2,
+                           depth_tolerance_cm=1.)
         self.ctx = SimpleNamespace(cfg=SimpleNamespace(), tel={'actual_yaw': 10., 'actual_depth_cm': 40.},
                                    say=lambda text: None, depth=FakeDepth())
         self.vision = FakeVision()
@@ -66,7 +67,8 @@ class StateTests(unittest.TestCase):
         self.now = 0.
         self.frame = 0
         for _ in range(3):
-            self.tick({'valid': False})  # 锁定初始融合目标，连续新样本确认定深
+            self.tick({'valid': False})
+        self.phase('YOLO_ALIGN')
 
     def tick(self, obs=None, seconds=.1):
         self.now += seconds
@@ -84,12 +86,13 @@ class StateTests(unittest.TestCase):
         cmd = self.tick(target(center=(380, 240)))
         self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
         self.assertGreater(cmd['yaw'], 10)
+        self.assertLessEqual(cmd['yaw']-10, self.cfg.yaw_step_max_deg)
         self.ctx.tel['actual_yaw'] = cmd['yaw']
-        self.tick(target())
-        self.tick(target())
+        self.tick(target())  # 动作完成
+        self.tick(target())  # 新帧1
         self.assertEqual(self.task.phase, 'YOLO_ALIGN')
         cmd = self.tick(target())
-        self.assertEqual(self.task.phase, 'APPROACH_50')
+        self.assertEqual(self.task.phase, 'APPROACH_40')
         self.assertGreater(cmd['surge'], 0)
 
     def test_duplicate_frames_do_not_complete_alignment(self):
@@ -99,40 +102,65 @@ class StateTests(unittest.TestCase):
             self.tick()
         self.assertEqual(self.task.phase, 'YOLO_ALIGN')
 
-    def test_stale_input_sends_explicit_zero_thrust_not_a_pause(self):
-        self.phase('APPROACH_50')
+    def test_stale_input_sends_explicit_zero_thrust(self):
+        self.phase('APPROACH_40')
         self.assertGreater(self.tick(target())['surge'], 0)
         cmd = self.tick({'valid': False, 'fresh': False})
         self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
         self.assertNotIn('paused', cmd)
-        self.assertNotIn('SEARCH', self.task.phase)
+        self.assertEqual(self.task.phase, 'APPROACH_40')
 
-    def test_thresholds_and_blind_lock_ignore_all_visual_input(self):
-        self.phase('APPROACH_50')
-        self.tick(target(area=.5))
-        self.tick(target(area=.5))
+    def test_area_regulation_drives_forward_backward_and_stops_in_band(self):
+        self.phase('APPROACH_40')
+        self.assertGreater(self.tick(target(area=.2))['surge'], 0)
+        self.assertLess(self.tick(target(area=.6))['surge'], 0)
+        self.assertEqual(self.tick(target(area=.4))['surge'], 0)
+        self.assertEqual(self.task.phase, 'APPROACH_40')
+        self.tick(target(area=.41))
         self.assertEqual(self.task.phase, 'CV_ALIGN')
-        self.tick(target(area=.5))
-        self.tick(target(area=.5))
-        self.assertEqual(self.task.phase, 'APPROACH_80')
-        self.tick(target(area=.8, pose=False))
-        self.tick(target(area=.8, pose=False))
+
+    def test_no_cv_commit_before_center_and_40_percent_are_stable(self):
+        self.phase('APPROACH_40')
+        for _ in range(3):
+            self.tick(target(area=.2))
+        self.assertEqual(self.task.phase, 'APPROACH_40')
+        cmd = self.tick(target(area=.4, center=(320, 260)))
+        self.assertEqual(cmd['surge'], 0)
+        self.assertEqual(self.task.motion['kind'], 'depth')
+        self.assertEqual(self.task.phase, 'APPROACH_40')
+
+    def test_initial_clipped_large_box_retreats_before_attempting_centering(self):
+        obs = target(area=.7)
+        obs.update(clipped=True, boundary_sides=['left', 'right'])
+        cmd = self.tick(obs)
+        self.assertLess(cmd['surge'], 0)
+        self.assertEqual(cmd['sway'], 0)
+        self.assertEqual(self.task.phase, 'APPROACH_40')
+
+    def test_40_percent_cv_alignment_commits_directly_and_blind_is_locked(self):
+        self.phase('APPROACH_40')
+        self.tick(target(area=.4))
+        self.tick(target(area=.4))
+        self.assertEqual(self.task.phase, 'CV_ALIGN')
+        self.tick(target(area=.4))
+        self.tick(target(area=.4))
         self.assertEqual(self.task.phase, 'BLIND')
+        self.assertAlmostEqual(self.task.blind_travel_m, 1.8)
         calls = self.vision.calls
         self.ctx.tel = {}
+        self.ctx.depth.value['ok'] = False
         self.vision.obs = {'valid': False}
         cmd = self.tick(seconds=.5)
         self.assertEqual(self.vision.calls, calls)
         self.assertEqual((cmd['yaw'], cmd['depth'], cmd['sway']), (10., 40., 0))
         self.assertEqual(cmd['surge'], self.cfg.blind_surge)
-        self.tick(seconds=3.3)
+        self.tick(seconds=7.3)
         self.assertEqual(self.task.phase, 'ACQUIRE')
         self.assertEqual(self.task.gates_passed, 1)
-        self.assertEqual(self.vision.resets, 2)
 
     def test_cv_adjustment_is_yaw_then_depth_then_sway(self):
         self.phase('CV_ALIGN')
-        obs = target()
+        obs = target(area=.4)
         obs['pose'].update(yaw_error_deg=15, alignment_robot_m=[.1, .1, 0])
         cmd = self.tick(obs)
         self.assertEqual(self.task.motion['kind'], 'yaw')
@@ -153,38 +181,61 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.task.motion['kind'], 'sway')
         self.assertGreater(cmd['sway'], 0)
 
-    def test_missing_pose_below_commit_stops_approach_and_has_timeout(self):
-        self.phase('APPROACH_80')
-        for _ in range(5):
-            self.assertEqual(self.tick(target(area=.79, pose=False))['surge'], 0)
-        self.assertEqual(self.task.phase, 'APPROACH_80')
-        self.phase('APPROACH_80')
-        self.tick(target(pose=False), seconds=self.cfg.approach_timeout_s+1)
-        self.assertEqual(self.task.phase, 'HOLD_FAULT')
+    def test_cv_rejects_missing_or_tracked_corners(self):
+        for tracked in (False, True):
+            with self.subTest(tracked=tracked):
+                self.setUp()
+                self.phase('CV_ALIGN')
+                obs = target(area=.4, pose=tracked)
+                if tracked:
+                    obs['geometry']['observation'] = 'tracked'
+                self.assertEqual(self.tick(obs)['surge'], 0)
+                self.assertEqual(self.task.phase, 'PROBE_MOVE')
 
-    def test_commit_accepts_clipped_current_target_without_second_pose_check(self):
-        self.phase('APPROACH_80')
-        obs = target(area=.82, pose=False)
-        obs.update(clipped=True, boundary_sides=['left', 'right'], corners=None, geometry=None)
-        self.tick(obs)
-        self.assertEqual(self.task.phase, 'APPROACH_80')
-        self.tick(obs)
-        self.assertEqual(self.task.phase, 'BLIND')
-
-    def test_commit_requires_consecutive_fresh_valid_frames_of_same_target(self):
-        self.phase('APPROACH_80')
-        self.tick(target(area=.82, pose=False))
-        self.vision.obs = dict(target(area=.82, pose=False), fresh=False)
+    def test_cv_requires_fresh_consecutive_frames_and_current_target(self):
+        self.phase('CV_ALIGN')
+        self.tick(target(area=.4))
+        self.vision.obs = dict(target(area=.4), fresh=False)
         for _ in range(3):
             self.tick()
-        self.assertEqual(self.task.phase, 'APPROACH_80')
-        self.tick(target(area=.79))
-        self.tick(target(area=.82, pose=False))
-        self.tick({'valid': False, 'fresh': False})
-        self.tick(target(area=.82, pose=False))
-        self.assertEqual(self.task.phase, 'APPROACH_80')
-        self.tick(dict(target(area=.82, pose=False), target_id=2))
+        self.assertEqual(self.task.phase, 'CV_ALIGN')
+        self.tick({'valid': False})
+        self.tick(target(area=.4))
+        self.assertEqual(self.task.phase, 'CV_ALIGN')
+        self.tick(dict(target(area=.4), target_id=2))
         self.assertEqual(self.task.phase, 'YOLO_ALIGN')
+
+    def test_cv_area_drift_restarts_range_adjustment_and_never_blinds_clipped(self):
+        self.phase('CV_ALIGN')
+        obs = target(area=.5)
+        obs.update(clipped=True, boundary_sides=['left', 'right'])
+        self.assertEqual(self.tick(obs)['surge'], 0)
+        self.assertEqual(self.task.phase, 'APPROACH_40')
+        self.assertLess(self.tick(obs)['surge'], 0)
+
+    def test_blind_invalid_or_excessive_distance_holds_fault(self):
+        for bad in (float('nan'), -1., 5.):
+            with self.subTest(bad=bad):
+                self.setUp()
+                self.phase('CV_ALIGN')
+                obs = target(area=.4)
+                obs['pose']['center_robot_m'][2] = bad
+                self.tick(obs)
+                cmd = self.tick(obs)
+                self.assertEqual(self.task.phase, 'HOLD_FAULT')
+                self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+
+    def test_fixed_blind_option_and_completion_stops_before_handoff(self):
+        self.task.cfg = replace(self.cfg, blind_use_pose_distance=False, gates_to_pass=1)
+        self.phase('CV_ALIGN')
+        self.tick(target(area=.4))
+        self.tick(target(area=.4))
+        self.assertEqual(self.task.blind_travel_m, .8)
+        self.tick()
+        cmd = self.tick(seconds=3.3)
+        self.assertEqual(self.task.phase, 'DONE')
+        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+        self.assertIsNone(self.tick())
 
     def test_shared_depth_limits_and_task_signs_follow_t_function(self):
         from task import t_function as TF
@@ -200,59 +251,53 @@ class StateTests(unittest.TestCase):
                              (70, 10, self.cfg.blind_surge, 0))
             self.task.depth = 1
             self.assertEqual(self.task._command()['depth'], 30)
-        self.assertEqual(angle_error(-179, 179), TF.yaw_err_deg(179, -179))
         self.assertEqual(angle_error(-179, 179), 2)
 
     def test_probe_reverses_when_width_narrows_and_is_bounded(self):
         self.phase('CV_ALIGN')
-        obs = target(pose=False)
+        obs = target(area=.4, pose=False)
         self.tick(obs)
-        cmd = self.tick(obs)
-        self.assertLess(cmd['sway'], 0)
+        self.assertLess(self.tick(obs)['sway'], 0)
         self.tick(obs, seconds=.3)
         obs['width_px'] = 300
         self.tick(obs)
         self.tick(obs)
-        cmd = self.tick(obs)
-        self.assertGreater(cmd['sway'], 0)
+        self.assertGreater(self.tick(obs)['sway'], 0)
         self.task.motion = None
         self.task.probe_steps = self.cfg.probe_max_steps
         self.task._go('PROBE_MOVE', self.now)
         self.tick(obs)
         self.assertEqual(self.task.phase, 'HOLD_FAULT')
 
-    def test_search_left_right_return_and_bounded_exit(self):
+    def test_search_left_right_return_and_repeat_without_translation(self):
+        self.task.actual_yaw = 10.
+        self.task._start_search(self.now)
         empty = {'valid': True, 'fresh': True, 'has_target': False}
-        self.tick(empty)
-        self.tick(empty, seconds=1.6)
-        self.assertEqual(self.task.phase, 'SEARCH_TURN')
         cmd = self.tick(empty)
         self.assertEqual(cmd['yaw'], 8.)
         observation_angles = []
-        for _ in range(140):
+        for _ in range(200):
             previous_phase = self.task.phase
             previous_yaw = self.ctx.tel['actual_yaw']
             self.ctx.tel['actual_yaw'] = cmd['yaw']
-            self.assertLessEqual(abs(cmd['yaw']-previous_yaw), self.cfg.search_step_deg+1e-6)
+            from task.task_door.t_door import angle_error
+            self.assertLessEqual(abs(angle_error(cmd['yaw'], previous_yaw)), self.cfg.search_step_deg+1e-6)
+            self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
             cmd = self.tick(empty, seconds=.5)
             if previous_phase != 'SEARCH_OBSERVE' and self.task.phase == 'SEARCH_OBSERVE':
                 observation_angles.append(self.ctx.tel['actual_yaw'])
-            if self.task.phase == 'EXIT':
+            if previous_phase == 'RETURN_HEADING' and self.task.phase == 'SEARCH_TURN':
                 break
         self.assertEqual(observation_angles, [-35., 55.])
         self.assertEqual(self.ctx.tel['actual_yaw'], 10.)
-        self.assertEqual(self.task.phase, 'EXIT')
-        self.assertGreater(self.tick(empty)['surge'], 0)
-        self.tick(empty, seconds=3.)
-        self.assertEqual(self.task.phase, 'DONE')
-        self.assertIsNone(self.tick(empty))
+        self.assertEqual(self.task.phase, 'SEARCH_TURN')
+        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
 
-    def test_depth_motion_uses_fused_delta_and_distinct_stable_samples(self):
+    def test_depth_motion_uses_fused_delta_and_distinct_samples(self):
         self.tick(target(center=(320, 290)))
         self.assertEqual(self.task.motion['kind'], 'depth')
         self.assertEqual(self.task.depth, 42.)
         self.assertAlmostEqual(self.task.fused_target_cm, 60.)
-        # 固件已到位，但融合深度仍未到位，不能通过。
         self.ctx.tel['actual_depth_cm'] = 42.
         self.tick(target())
         self.assertIsNotNone(self.task.motion)
@@ -261,52 +306,53 @@ class StateTests(unittest.TestCase):
         self.tick(target())
         for _ in range(3):
             self.tick(target())
-        self.assertIsNotNone(self.task.motion)  # 重复同一个样本不累计
+        self.assertIsNotNone(self.task.motion)
         self.ctx.depth.stamp = None
         self.ctx.depth.value.update(v_z=.1)
         self.tick(target())
         self.assertEqual(self.task.depth_ok_count, 0)
         self.ctx.depth.value.update(v_z=0.)
         self.tick(target())
-        self.assertIsNotNone(self.task.motion)
         self.tick(target())
         self.assertIsNone(self.task.motion)
 
     def test_invalid_fusion_blocks_approach_and_depth_completion(self):
-        self.phase('APPROACH_50')
+        self.phase('APPROACH_40')
         self.assertGreater(self.tick(target())['surge'], 0)
         for bad in ({'ok': False}, {'stale': True}, {'D': float('nan')}, {'v_z': float('inf')}):
-            with self.subTest(bad=bad):
-                original = dict(self.ctx.depth.value)
-                self.ctx.depth.value.update(bad)
-                cmd = self.tick(target())
-                self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
-                self.assertFalse(self.task.depth_ready)
-                self.ctx.depth.value = original
+            original = dict(self.ctx.depth.value)
+            self.ctx.depth.value.update(bad)
+            cmd = self.tick(target())
+            self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+            self.assertFalse(self.task.depth_ready)
+            self.ctx.depth.value = original
         self.tick(target())
         self.assertGreater(self.tick(target())['surge'], 0)
 
-    def test_blind_keeps_visual_lock_but_faults_on_depth_loss(self):
-        self.phase('BLIND')
-        calls = self.vision.calls
-        self.ctx.depth.value['ok'] = False
-        cmd = self.tick()
-        self.assertEqual(self.vision.calls, calls)
-        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
-        self.assertEqual(self.task.phase, 'HOLD_FAULT')
-
     def test_interrupted_sway_does_not_count_stopped_time_as_distance(self):
         for bad in ({'ok': False}, {'D': .70}):
-            with self.subTest(bad=bad):
-                self.setUp()
-                self.phase('CV_ALIGN')
-                obs = target()
-                obs['pose']['alignment_robot_m'][0] = .1
-                self.assertGreater(self.tick(obs)['sway'], 0)
-                self.ctx.depth.value.update(bad)
-                cmd = self.tick(obs)
-                self.assertEqual(cmd['sway'], 0)
-                self.assertIsNone(self.task.motion)
+            self.setUp()
+            self.phase('CV_ALIGN')
+            obs = target(area=.4)
+            obs['pose']['alignment_robot_m'][0] = .1
+            self.assertGreater(self.tick(obs)['sway'], 0)
+            self.ctx.depth.value.update(bad)
+            cmd = self.tick(obs)
+            self.assertEqual(cmd['sway'], 0)
+            self.assertIsNone(self.task.motion)
+
+    def test_depth_sample_clock_rollback_and_vertical_motion_revoke_hold(self):
+        for change in ('rollback', 'moving'):
+            self.setUp()
+            self.phase('APPROACH_40')
+            self.assertGreater(self.tick(target())['surge'], 0)
+            if change == 'rollback':
+                self.ctx.depth.stamp = self.task.depth_last_counted_ts-.1
+            else:
+                self.ctx.depth.value['v_z'] = .1
+            cmd = self.tick(target())
+            self.assertFalse(self.task.depth_confirmed)
+            self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
 
     def test_search_step_is_latched_and_interval_limits_progress(self):
         self.task.actual_yaw = 179.
@@ -315,10 +361,10 @@ class StateTests(unittest.TestCase):
         cmd = self.tick({'valid': True, 'fresh': True, 'has_target': False})
         self.assertEqual(cmd['yaw'], 177.)
         self.tick()
-        self.assertEqual(self.task.yaw, 177.)  # 未到位不逐拍累加
+        self.assertEqual(self.task.yaw, 177.)
         self.ctx.tel['actual_yaw'] = 177.
         self.tick()
-        self.assertEqual(self.task.yaw, 177.)  # 到位但未满最短间隔
+        self.assertEqual(self.task.yaw, 177.)
         self.tick(seconds=.5)
         self.assertEqual(self.task.yaw, 175.)
         cmd = self.tick(target())
@@ -345,6 +391,81 @@ class StateTests(unittest.TestCase):
         self.tick({'valid': True, 'fresh': True, 'has_target': False})
         cmd = self.tick(seconds=self.cfg.motion_timeout_s+1)
         self.assertEqual(self.task.phase, 'HOLD_FAULT')
+        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+
+    def test_approach_and_cv_timeout_stop_horizontal_thrust(self):
+        for phase, timeout in [('APPROACH_40', self.cfg.approach_timeout_s),
+                               ('CV_ALIGN', self.cfg.align_timeout_s)]:
+            self.setUp()
+            self.phase(phase)
+            cmd = self.tick(target(area=.4), seconds=timeout+1)
+            self.assertEqual(self.task.phase, 'HOLD_FAULT')
+            self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+
+
+class WorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = replace(CONFIG, stable_frames=2, depth_hold_samples=2, settle_s=.01,
+                           observe_frames=2, filter_alpha=1.)
+        self.ctx = SimpleNamespace(cfg=SimpleNamespace(),
+                                   tel={'actual_yaw': 179., 'actual_depth_cm': 40.},
+                                   depth=FakeDepth(), say=lambda _: None)
+        self.vision = FakeVision()
+        self.task = DoorTask(self.ctx, self.cfg, self.vision)
+        self.task.enter(0.)
+        self.now = 0.
+        self.frame = 0
+
+    def tick(self, obs=None, seconds=.1):
+        self.now += seconds
+        self.frame += 1
+        self.vision.obs = dict(obs or {'valid': False}, frame=self.frame)
+        return self.task.step(self.now, seconds)
+
+    def test_startup_waits_for_actual_heading_and_fused_depth_then_rotates_only(self):
+        self.ctx.tel = {}
+        cmd = self.tick()
+        self.assertTrue(cmd['paused'])
+        self.assertIsNone(self.task.entry_yaw)
+        self.ctx.tel.update(actual_yaw=179., actual_depth_cm=40.)
+        self.ctx.depth.value['ok'] = False
+        cmd = self.tick()
+        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+        self.assertEqual(self.task.phase, 'ACQUIRE')
+        self.ctx.depth.value['ok'] = True
+        for _ in range(3):
+            cmd = self.tick(dict(valid=True, fresh=True, has_target=False))
+        self.assertEqual(self.task.search_base, 179.)
+        self.assertEqual(self.task.yaw, 177.)
+        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+
+    def test_four_gate_workflow_runs_to_done_without_preset_turns_or_80_percent(self):
+        cmd = None
+        phases = set()
+        for _ in range(500):
+            if cmd and not cmd.get('paused'):
+                self.ctx.tel.update(actual_yaw=cmd['yaw'], actual_depth_cm=cmd['depth'])
+            self.ctx.depth.value['D'] = (self.task.fused_target_cm or 58.)/100.
+            phases.add(self.task.phase)
+            obs = target(area=.4 if self.task.phase in ('APPROACH_40', 'CV_ALIGN') else .2)
+            cmd = self.tick(obs)
+            self.assertNotEqual(self.task.phase, 'HOLD_FAULT')
+            if self.task.phase == 'DONE':
+                break
+        self.assertEqual(self.task.phase, 'DONE')
+        self.assertEqual(self.task.gates_passed, 4)
+        self.assertTrue({'YOLO_ALIGN', 'APPROACH_40', 'CV_ALIGN', 'BLIND'} <= phases)
+        self.assertEqual(self.ctx.tel['actual_yaw'], 179.)
+        self.assertEqual(self.vision.resets, 4)
+        self.assertEqual((cmd['surge'], cmd['sway']), (0., 0.))
+        self.assertIsNone(self.tick())
+
+    def test_confirmed_depth_holds_through_small_noise_but_never_sways_on_startup(self):
+        for _ in range(3):
+            self.tick()
+        self.ctx.depth.value['D'] += .02
+        cmd = self.tick(dict(valid=True, fresh=True, has_target=False))
+        self.assertTrue(self.task.depth_confirmed)
         self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
 
 

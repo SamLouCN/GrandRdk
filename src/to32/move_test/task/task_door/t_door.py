@@ -1,8 +1,8 @@
 """PassGate 状态机：只生成任务指令，不推理、不直接写串口。
 
-ACQUIRE -> YOLO_ALIGN -> APPROACH_50 -> CV_ALIGN -> APPROACH_80
-        -> BLIND -> ACQUIRE（下一门）
-无门：SEARCH_TURN/SEARCH_OBSERVE -> RETURN_HEADING -> EXIT -> DONE。
+ACQUIRE -> SEARCH_TURN/SEARCH_OBSERVE -> YOLO_ALIGN -> APPROACH_40
+        -> CV_ALIGN -> BLIND -> ACQUIRE（下一门）-> DONE。
+无门：左右各45°扫视并回基准，继续扫描；不横移或自动直行。
 四点缺失：PROBE_MOVE/PROBE_OBSERVE，有限小步探索；不可用时 HOLD_FAULT。
 """
 import math
@@ -60,9 +60,11 @@ class DoorTask(Stage):
         self.depth_last_counted_ts = None
         self.depth_ok_count = 0
         self.depth_ready = False
+        self.depth_confirmed = False
         self.depth_valid = False
+        self.blind_travel_m = self.cfg.blind_distance_m
         self.vision.reset_target()
-        self.ctx.say('穿门启动：70×50cm，面积阈值50%/80%，中心容差8px；距离采用标定速度定时执行')
+        self.ctx.say('穿门启动：当前航向±45°扫视；YOLO中心8px；40%四点回正后盲冲')
 
     def _go(self, phase, now):
         self.phase, self.phase_start = phase, now
@@ -70,10 +72,10 @@ class DoorTask(Stage):
         self.counts = {}
         self.ctx.say('PassGate -> ' + phase)
 
-    def _command(self, note='', surge=0., sway=0.):
+    def _command(self, note='', surge=0., sway=0., require_depth=True):
         from task import t_function as TF
         self.depth = self._depth_target(self.depth)
-        if not self.depth_ready:
+        if require_depth and not self.depth_confirmed:
             surge, sway = 0., 0.
             note += '；等待卡尔曼定深稳定'
         return TF._cmd(self.NAME, self.phase + ': ' + note, self.yaw, self.depth, surge, sway)
@@ -91,6 +93,7 @@ class DoorTask(Stage):
             pass
         if not self.depth_valid:
             self.depth_ok_count, self.depth_ready = 0, False
+            self.depth_confirmed = False
             return
         self.fused_depth_cm, self.depth_sample_ts = depth, stamp
         in_band = (self.fused_target_cm is not None
@@ -102,8 +105,15 @@ class DoorTask(Stage):
             self.depth_ok_count += 1
         elif stamp < self.depth_last_counted_ts:
             self.depth_ok_count = 0  # 写端重启／样本时间回退，重新确认
+            self.depth_confirmed = False
         self.depth_last_counted_ts = stamp
         self.depth_ready = self.depth_ok_count >= self.cfg.depth_hold_samples
+        if self.depth_ready:
+            self.depth_confirmed = True
+        elif (self.fused_target_cm is not None
+              and (abs(depth-self.fused_target_cm) > self.cfg.depth_hold_tolerance_cm
+                   or abs(velocity) > self.cfg.depth_velocity_max_mps)):
+            self.depth_confirmed = False
 
     def _lock_depth_target(self, target):
         # 锁定同一动作的两种口径，不直接将融合 D 与固件绝对深度相减。
@@ -111,6 +121,7 @@ class DoorTask(Stage):
         self.depth = self._depth_target(target)
         self.fused_target_cm = self.fused_depth_cm + self.depth-self.actual_depth
         self.depth_ok_count, self.depth_ready = 0, False
+        self.depth_confirmed = False
         self.depth_last_counted_ts = self.depth_sample_ts
         self.ctx.say('PassGate 定深：固件目标 %.1fcm；相对变化映射后的融合目标 %.1fcm'
                      % (self.depth, self.fused_target_cm))
@@ -250,17 +261,19 @@ class DoorTask(Stage):
         self._go('PROBE_MOVE', now)
         return self._command('四点不可用，开始有限左移试探')
 
-    def _start_search(self, now):
-        self.search_base = self.actual_yaw
+    def _start_search(self, now, base=None, reset=True):
+        self.search_base = self.actual_yaw if base is None else base
+        self.yaw = self.actual_yaw
         self.search_started = now
         self.search_index = 0
         self.search_angles = [-self.cfg.search_angle_deg, self.cfg.search_angle_deg]
         self.search_step_target = None
         self.search_next_step_at = now
         self.search_step_started = now
-        self.vision.reset_target()
+        if reset:
+            self.vision.reset_target()
         self.target_id = None
-        self.filtered_center = None
+        self.filtered_center = self.filtered_frame = None
         self._go('SEARCH_TURN', now)
         return self._command('无门，以相对小步左右扫视')
 
@@ -277,7 +290,8 @@ class DoorTask(Stage):
         if abs(error) <= self.cfg.yaw_command_tolerance_deg:
             self.yaw = self.actual_yaw
             if self.phase == 'RETURN_HEADING':
-                self._go('EXIT', now)
+                # 无门不等于结束赛段；返回同一基准后重新扫视，不输出平移推力。
+                return self._start_search(now, self.search_base)
             else:
                 self.search_valid_frames = 0
                 self._go('SEARCH_OBSERVE', now)
@@ -292,33 +306,52 @@ class DoorTask(Stage):
         self.search_next_step_at = now+self.cfg.search_step_interval_s
         return self._command('搜索相对转向 %+.2f°' % delta)
 
+    def _commit_blind(self, obs, now):
+        distance = self.cfg.blind_distance_m
+        if self.cfg.blind_use_pose_distance:
+            p = obs['pose']
+            try:
+                remaining = float(p['center_robot_m'][2])
+                if not p.get('metric_distance_available') or not math.isfinite(remaining) or remaining <= 0:
+                    raise ValueError('无可靠的门距离')
+                distance = remaining+self.cfg.blind_clearance_m
+            except (KeyError, TypeError, ValueError):
+                return self._fault(now, '四点度量距离不可用，不能计算盲冲距离')
+        if not 0 < distance <= self.cfg.blind_max_distance_m:
+            return self._fault(now, '盲冲距离超出配置范围，请核对内参／门尺寸')
+        self.blind_travel_m = distance
+        self.yaw = self.actual_yaw
+        self._go('BLIND', now)
+        return self._command('四点回正完成，锁定航向／深度，盲冲距离 %.2fm' % distance)
+
     def step(self, now, dt):
         cfg = self.cfg
         if self.phase == 'DONE':
             return None
         if self.phase == 'HOLD_FAULT':
             return self._command(self.fault_reason)
-        self._read_depth(now)
-        # 盲冲及赛段尾部直行不消费视觉，不修改已锁定目标；急停仍由外层模式管理。
-        if self.phase in ('BLIND', 'EXIT'):
-            if not self.depth_ready:
-                return self._fault(now, '直行中融合深度失效／离开定深带，停止前进')
+        # 已承诺的有界穿越不再消费视觉／门底梁污染的融合净空；外层急停仍生效。
+        if self.phase == 'BLIND':
             if self.drive_started is None:
-                self.drive_started = now  # 从首个实际前进指令开始计时，排除阶段切换停推拍
-            duration = (cfg.blind_distance_m/cfg.blind_speed_mps+cfg.blind_extra_s
-                        if self.phase == 'BLIND' else cfg.exit_distance_m/cfg.exit_speed_mps)
+                self.drive_started = now
+            duration = self.blind_travel_m/cfg.blind_speed_mps+cfg.blind_extra_s
             if now-self.drive_started < duration:
-                return self._command('定时开环直行', surge=cfg.blind_surge if self.phase == 'BLIND' else cfg.exit_surge)
-            if self.phase == 'EXIT':
-                self._go('DONE', now)
-                return self._command('门赛段结束，交接下一阶段')
+                return self._command('锁定航向／深度的定时盲冲',
+                                     surge=cfg.blind_surge, require_depth=False)
             self.gates_passed += 1
+            if self.gates_passed >= cfg.gates_to_pass:
+                self._go('DONE', now)
+                return self._command('全部门已完成，交接下一任务', require_depth=False)
             self.vision.reset_target()
-            self.target_id, self.filtered_center = None, None
+            self.target_id = self.filtered_center = self.filtered_frame = None
             self.empty_since, self.empty_frames = None, 0
             self.motion = None
+            self.entry_yaw = None
+            self.episode_started = now
             self._go('ACQUIRE', now)
-            return self._command('盲冲完成，重新捕获下一门')
+            return self._command('过门完成，重新锁存当前航向寻找下一门')
+
+        self._read_depth(now)
 
         tel = self.ctx.tel or {}
         try:
@@ -329,10 +362,13 @@ class DoorTask(Stage):
         except (KeyError, TypeError, ValueError):
             from task import t_function as TF
             return self._command('等待航向／深度遥测') if self.yaw is not None else TF.wait_cmd(self.NAME)
+        if self.entry_yaw is None:
+            self.entry_yaw = self.actual_yaw
         if self.yaw is None:
-            self.yaw, self.entry_yaw = self.actual_yaw, self.actual_yaw
+            self.yaw = self.actual_yaw
             self.depth = self._depth_target(self.actual_depth)
         if not self.depth_valid:
+            self.counts = {}
             if self.motion is not None and now-self.motion['start'] > cfg.motion_timeout_s:
                 return self._fault(now, '动作期间融合深度持续不可用，停止调整')
             if self.motion is not None and self.motion['kind'] == 'sway':
@@ -344,14 +380,15 @@ class DoorTask(Stage):
             self._lock_depth_target(self.depth)
         obs = self.vision.poll(now)
         if self.motion is not None:
-            if self.motion['kind'] == 'sway' and (not self.depth_ready or not obs.get('valid')
+            if self.motion['kind'] == 'sway' and (not self.depth_confirmed or not obs.get('valid')
                                                 or not obs.get('has_target')):
                 self.motion = None
                 self.counts = {}
                 self.settle_until = now+cfg.settle_s
                 return self._command('横移中观测失效／定深离带，停止横移')
             return self._motion_tick(now)
-        if not self.depth_ready:
+        if not self.depth_confirmed:
+            self.counts = {}
             return self._command('融合深度／垂速未连续到位')
         if now < self.settle_until:
             return self._command('等待运动稳定')
@@ -361,6 +398,9 @@ class DoorTask(Stage):
             return self._command('视觉未就绪／过期，保持零水平推力')
         if obs.get('capture_ts', now) < self.settle_until:
             return self._command('等待运动后采集的新帧')
+
+        if self.phase == 'ACQUIRE':
+            self._start_search(now, self.entry_yaw, reset=False)
 
         # 搜索转向：只有在目标角到位后的有效新帧，才开始计无门观察。
         if self.phase.startswith('SEARCH') or self.phase == 'RETURN_HEADING':
@@ -401,58 +441,56 @@ class DoorTask(Stage):
             self.target_id, self.filtered_center = obs['target_id'], None
             self.filtered_frame, self.episode_started = None, now
             self._go('YOLO_ALIGN', now)
-        if self.phase == 'ACQUIRE':
-            self._go('YOLO_ALIGN', now)
         if now-self.episode_started > cfg.target_episode_timeout_s:
             return self._fault(now, '当前门未完成对准／穿越，达到总时限')
 
-        if self.phase in ('YOLO_ALIGN', 'APPROACH_50'):
+        if self.phase in ('YOLO_ALIGN', 'APPROACH_40'):
             dx, dy = self._center_error(obs)
-            centered = not obs.get('clipped') and max(abs(dx), abs(dy)) <= cfg.center_tolerance_px
+            raw_dx = obs['center_px'][0]-obs['aim_px'][0]
+            raw_dy = obs['center_px'][1]-obs['aim_px'][1]
+            centered = (not obs.get('clipped') and
+                        max(abs(dx), abs(dy), abs(raw_dx), abs(raw_dy)) <= cfg.center_tolerance_px)
             stable = self._count('center', centered, obs)
             if self.phase == 'YOLO_ALIGN':
-                if stable:
-                    self._go('APPROACH_50', now)
-                else:
+                if obs.get('clipped') and obs['area_ratio'] > cfg.area_near+cfg.area_tolerance:
+                    self._go('APPROACH_40', now)
+                    return self._command('初次捕获框过大／裁切，先后退恢复完整框',
+                                         surge=-cfg.approach_surge)
+                if not stable:
                     action = self._yolo_adjust(obs, now)
                     return action or self._command('中心8px范围内，等待稳定')
-            if obs['area_ratio'] >= cfg.area_near:
-                if self._count('area', True, obs):
-                    self._go('CV_ALIGN', now)
-                return self._command('已到50%附近，停止接近并验证')
-            self._count('area', False, obs)
-            if obs.get('clipped') or max(abs(dx), abs(dy)) > cfg.pause_error_px:
-                self._go('YOLO_ALIGN', now)
-                return self._command('偏差过大，暂停接近')
-            action = self._yolo_adjust(obs, now)
-            return action or self._command('接近50%，持续纠偏', surge=cfg.approach_surge)
+                self._go('APPROACH_40', now)
+            if now-self.phase_start > cfg.approach_timeout_s:
+                return self._fault(now, '40%接近阶段超时，请核对目标／推力')
+            area = obs['area_ratio']
+            low, high = cfg.area_near-cfg.area_tolerance, cfg.area_near+cfg.area_tolerance
+            in_band = low <= area <= high and centered
+            if self._count('area', in_band, obs):
+                self._go('CV_ALIGN', now)
+                return self._command('约40%面积且对中，开始四点反算回正')
+            if in_band:
+                return self._command('约40%面积，停止前后运动并等待稳定新帧')
+            # 框过大或多侧贴边时先退回可观察距离，不能继续靠裁切框前进。
+            if area > high:
+                return self._command('框过大，后退至40%附近', surge=-cfg.approach_surge)
+            if not centered:
+                self.counts['area'] = 0
+                action = self._yolo_adjust(obs, now)
+                return action or self._command('暂停前后运动，重新对中')
+            return self._command('向门接近至40%附近', surge=cfg.approach_surge)
 
         if self.phase == 'CV_ALIGN':
             if now-self.phase_start > cfg.align_timeout_s:
-                return self._fault(now, '50%阶段四点回正超时')
+                return self._fault(now, '40%阶段四点回正超时')
+            if (obs.get('clipped') or not cfg.area_near-cfg.area_tolerance <= obs['area_ratio'] <= cfg.area_near+cfg.area_tolerance):
+                self._go('APPROACH_40', now)
+                return self._command('回正改变面积／框裁切，先重新调整40%距离')
             if not self._pose_good(obs):
                 self.counts['pose'] = 0
                 return self._start_probe(obs, now, 'CV_ALIGN')
             if self._count('pose', self._pose_aligned(obs), obs):
-                self._go('APPROACH_80', now)
-                return self._command('四点回正完成')
+                return self._commit_blind(obs, now)
             return self._cv_adjust(obs, now)
-
-        if self.phase == 'APPROACH_80':
-            if now-self.phase_start > cfg.approach_timeout_s:
-                return self._fault(now, '未达到稳定80%面积，请核对视场／门尺寸／阈值')
-            # The 50% CV alignment already completed. Close-range cropping or
-            # missing corners must not impose a second OpenCV commit gate.
-            if obs['area_ratio'] >= cfg.area_commit:
-                if self._count('area', True, obs):
-                    self._go('BLIND', now)
-                return self._command('80%面积阈值，锁定航向和深度；等待首拍盲冲')
-            self._count('area', False, obs)
-            if not self._pose_good(obs):
-                return self._command('接近中四点失效，停止前进；完整几何恢复后继续')
-            if not self._pose_aligned(obs):
-                return self._cv_adjust(obs, now)
-            return self._command('接近80%，保持CV回正', surge=cfg.approach_surge)
 
         if self.phase.startswith('PROBE'):
             if self._count('probe_pose', self._pose_good(obs), obs):

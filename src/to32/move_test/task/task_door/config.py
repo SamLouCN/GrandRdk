@@ -9,12 +9,13 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class DoorConfig:
+    gates_to_pass: int = 4  # 完成数量；单门调试设为1，不使用v2预设路线
     image_width: int = 640
     image_height: int = 480
     gate_width_m: float = .70
     gate_height_m: float = .50
-    area_near: float = .50
-    area_commit: float = .80
+    area_near: float = .40
+    area_tolerance: float = .03  # 停靠屏占比37%～43%，仅此处开始四点控制
     center_tolerance_px: float = 8.
     stable_frames: int = 5
     filter_alpha: float = .5
@@ -60,7 +61,8 @@ class DoorConfig:
     normal_yaw_tolerance_deg: float = .3  # CV法线容差需兼容8px中心要求
     yaw_command_tolerance_deg: float = .3
     depth_step_max_cm: float = 2.
-    depth_tolerance_cm: float = 1.
+    depth_tolerance_cm: float = 1.  # 视觉2cm小步调深的到位容差
+    depth_hold_tolerance_cm: float = 8.  # 已确认定深的保持带；小步到位仍用1cm
     depth_hold_samples: int = 5  # 连续不同卡尔曼样本到位，重复读取不计数
     depth_velocity_max_mps: float = .02
     translation_tolerance_m: float = .01
@@ -77,14 +79,14 @@ class DoorConfig:
     # TODO: 分别测量各档推力的速度；暂为估算，距离执行采用定时开环。
     approach_surge: float = .35
     blind_surge: float = .5
-    exit_surge: float = .35
     sway_thrust: float = .35
     blind_speed_mps: float = .25
-    exit_speed_mps: float = .20
     sway_speed_mps: float = .15
-    blind_distance_m: float = .80
+    blind_distance_m: float = .80  # 固定距离模式的距离
+    blind_use_pose_distance: bool = True
+    blind_clearance_m: float = .80  # 超过门平面的余量，需按机体实测
+    blind_max_distance_m: float = 4.  # 距离异常时保持，不静默截短盲冲
     blind_extra_s: float = 0.  # TODO: 从静止加速、惯性等实测补偿
-    exit_distance_m: float = .50  # TODO: 无门搜索后的直行距离，再交给下一任务
     probe_step_m: float = .03
     probe_max_travel_m: float = .18
     probe_max_steps: int = 6
@@ -98,16 +100,20 @@ class DoorConfig:
 
     def validate(self):
         import math
-        if not 0 < self.area_near < self.area_commit <= 1:
-            raise ValueError('屏占比必须满足 0 < near < commit <= 1')
+        if not isinstance(self.gates_to_pass, int) or self.gates_to_pass < 1:
+            raise ValueError('gates_to_pass 必须为正整数')
+        if not isinstance(self.blind_use_pose_distance, bool):
+            raise ValueError('blind_use_pose_distance 必须为布尔值')
+        if not 0 < self.area_tolerance < min(self.area_near, 1-self.area_near):
+            raise ValueError('屏占比目标和容差无效')
         positive = ('image_width', 'image_height', 'gate_width_m', 'gate_height_m',
                     'center_tolerance_px', 'stable_frames', 'observe_frames',
-                    'blind_speed_mps', 'exit_speed_mps', 'sway_speed_mps',
-                    'blind_distance_m', 'exit_distance_m', 'probe_step_m',
+                    'blind_speed_mps', 'sway_speed_mps',
+                    'blind_distance_m', 'blind_clearance_m', 'blind_max_distance_m', 'probe_step_m',
                     'probe_max_steps', 'vision_stale_s', 'motion_timeout_s',
                     'align_timeout_s', 'search_timeout_s', 'cv_every_frames',
                     'normal_yaw_tolerance_deg', 'approach_timeout_s', 'target_episode_timeout_s',
-                    'depth_tolerance_cm', 'depth_hold_samples', 'depth_velocity_max_mps',
+                    'depth_tolerance_cm', 'depth_hold_tolerance_cm', 'depth_hold_samples', 'depth_velocity_max_mps',
                     'search_angle_deg', 'search_step_deg', 'search_step_interval_s')
         if any(not math.isfinite(float(getattr(self, k))) or getattr(self, k) <= 0
                for k in positive):
@@ -116,6 +122,11 @@ class DoorConfig:
             raise ValueError('滤波系数或深度限值无效')
         if not isinstance(self.depth_hold_samples, int) or self.depth_hold_samples < 1:
             raise ValueError('depth_hold_samples 必须为正整数')
+        if self.depth_hold_tolerance_cm < self.depth_tolerance_cm:
+            raise ValueError('定深保持带不能小于到位容差')
+        if (not math.isfinite(self.blind_extra_s) or self.blind_extra_s < 0
+                or self.blind_distance_m > self.blind_max_distance_m):
+            raise ValueError('盲冲补偿时间或固定距离无效')
         for name, choices in {'cv_backend': ('auto', 'opencl', 'cpu'),
                               'cv_blur': ('pyramid', 'exact'),
                               'cv_quality': ('fast', 'precise')}.items():
@@ -127,7 +138,7 @@ class DoorConfig:
                 or not math.isfinite(self.overlay_line_height_px) or self.overlay_line_height_px <= 0
                 or not 0 <= self.overlay_background_alpha <= 1):
             raise ValueError('回传字号、行距或背景透明度无效')
-        for k in ('approach_surge', 'blind_surge', 'exit_surge', 'sway_thrust'):
+        for k in ('approach_surge', 'blind_surge', 'sway_thrust'):
             if not 0 < getattr(self, k) <= 1:
                 raise ValueError(k + ' 必须在 (0,1]')
         return self
