@@ -25,7 +25,17 @@ HBM 模型沿用当前穿门配置对应的单类整门模型；`--class-names` 
 默认是 **BPU YOLO + CPU OpenCV**；加 `--cv-backend opencl` 使用下面的显式 GPU 后端。
 HBM 输入尺寸从编译模型读取，`--imgsz/--device` 仅适用于 Ultralytics。
 
+OpenCL 视频入口现在默认使用 `--cv-execution resident`：CV 的颜色、连通区域、
+角点/光流/RANSAC、线段/模型选择和完整门框位姿全部在 GPU 执行，中间结果
+不回读，最终输出 800 字节。算法及 **Mali-G78AE 的耗时估算、质量限制和板端命令**
+见 [MALI_RESIDENT.md](MALI_RESIDENT.md)。30ms 是待板端验证的目标，预算参数仅统计达标率。
+库调用和 DoorSim 保持既有路径，需显式选择 resident 才会启用。
+
 ### S100 GPU Hough、拟合和图像处理
+
+以下 fast/precise、自适应搜索和 CPU LSD 的说明对应保留的
+`--cv-execution hybrid` 路径。resident 使用独立的颜色 Hough/采样拟合算法，
+不使用 CPU LSD 或预测带策略；这些旧路径选项不改变其候选生成算法。
 
 S100 的 Mali GPU 使用 OpenCL；本实现直接通过 `ctypes` 调用板端 OpenCL ICD，
 编译 `src/kernels/red_gate.cl`，无需 PyOpenCL、CUDA 或替换整个 OpenCV 安装。
@@ -100,7 +110,7 @@ Hough、批量拟合及完整/缺边/残缺门的检测对照；通过返回 0�
 GPU 执行的阶段：
 
 - 相机映射表的双线性重采样。
-- 融合亮度锐化：直接从 BGR 提取 V，在工作组内完成高斯模糊和通道同比例缩放。
+- 视频预处理只做可选旋转和相机矫正，不执行锐化或对比度增强。
 - 三尺度可分离高斯模糊、颜色阈值、形态学和红绿对数比。
 - Hough 前景压缩、360/720 个角度的投票、峰值及连续杆段。
 - 全部候选段的截面采样、L2 协方差拟合、宽度/残差排序和支持度过滤。
@@ -132,7 +142,7 @@ GPU 执行的阶段：
 上传改为非阻塞排队，主机数组保留至传输完成。
 
 后续 Mali 日志显示，即使分块，精确大核仍占跟踪帧约 80ms。因此 GPU 视频入口
-和板端自检默认使用 `--cv-blur pyramid`：sigma=3 与锐化 sigma=1.2 保持精确，
+和板端自检默认使用 `--cv-blur pyramid`：颜色模糊 sigma=3 保持精确，
 sigma=9/18 使用 4×4 面积平均后在小图上卷积，再线性插值回原尺寸；缩小后的
 sigma 扣除面积平均引入的方差。大尺度卷积像素数降至约 1/16，核也缩小。
 这是一种数值近似，不能保证阈值附近掩码与精确模式完全一致；日志记录
@@ -143,16 +153,19 @@ sigma 扣除面积平均引入的方差。大尺度卷积像素数降至约 1/16
 测试覆盖褪色杆、白角、短断口、缺边、重叠门、白支撑腿和残缺近门；实际录像
 仍需比较 `rows.jsonl` 和画面，不能把合成样例的漂移阈值当作真实视频准确率。
 
-`red-gate` 和 DoorSim 预处理现在仅做亮度锐化，已移除 `--contrast`。
-`--sharpen 0.6` 为默认强度，0 关闭。单个 `sharpen_only` 内核直接读取 BGR，
-用 16×16 输出分块和局部内存完成 sigma=1.2 的 11×11 高斯模糊、低于 3 级
-细节抑制及锐化，再同比例缩放 BGR；不再执行 HSV、直方图、中位数和全局对比度，
-不创建整图浮点模糊中间数组。模糊按有效非黑邻域归一化，保持无效边界原样。
-校正输出留在 GPU 上供锐化使用，有效掩码与权重跨帧缓存；增强 BGR 下载给
-YOLO、CPU 光流和输出后仍保留设备副本。CPU 参考实现采用相同规则。
-日志 `enhancement_mode=sharpen-only`、`sharpening_algorithm=normalized-value-fused-tile16`
-标记该路径；用 `details_ms.enhancement` 与 `gpu.kernel_ms.sharpen_only` 区分含读回
-的总耗时和内核耗时。原通用增强函数仍供独立对照 demo 使用。
+`red-gate` 视频入口已经完全删除 CPU/GPU 锐化步骤和 `--sharpen` 参数，
+YOLO、CV 和输出共用干净的矫正图。日志 `enhancement_mode=none`、
+`sharpening_algorithm=disabled`、`details_ms.enhancement=0`，内核列表无
+`sharpen_only`。必要的图像回读归入矫正阶段，原始输入只上传一次。
+库中独立增强/锐化对照函数不参与视频预处理；DoorSim 代码不在本轮修改范围。
+
+resident 峰值选择改为并行排名和三字掩码贪心 NMS，线段排序改为分块稳定
+Top128 与分层并行合并，保留原得分、同分顺序、抑制阈值及方向配额。
+v6 进一步融合形态学、用块内连通/跨块边合并及局部哈希统计八连通组件、
+一次判断局部极大值后分层合并每角度 Top8，保持原像素/连通/峰值规则。
+日志 `pipeline_version=6` 和各项 `total_gpu_ms` 标明完整成本；
+`check_opencl.py --resident-only` 会在板端执行与旧内核/OpenCV 的精度对照。
+详见 [MALI_RESIDENT.md](MALI_RESIDENT.md)。
 
 OpenCV 首次 LAB 调用的查表初始化移到显式 `warmup`，连同 GPU 预处理/颜色内核
 预热计入 `initialized.init_ms`，同时记录 `warmup.warmup_ms`；不推进跟踪器、不跑
@@ -236,7 +249,7 @@ OpenCL Hough 与 CPU LSD 重叠执行；每次拟合前汇合，候选顺序、L
 
 输出路径：
 
-- `quad_cv_kit/runs/after.mp4`：增强的校正画面、黄色 YOLO 框、绿色 CV 门边及视觉提示。
+- `quad_cv_kit/runs/after.mp4`：干净的校正画面、黄色 YOLO 框、绿色 CV 门边及视觉提示。
 - `quad_cv_kit/runs/rows.jsonl`：逐帧检测、几何、跟踪状态和 CV 内部诊断。
 - `quad_cv_kit/runs/camera_used.json`：实际模型、内参适配、尺寸、帧率和处理配置。
 - `quad_cv_kit/logs/perf.log`：追加写入的 JSONL；每次运行包含 `run_start`、`warmup`、
@@ -246,7 +259,7 @@ OpenCL Hough 与 CPU LSD 重叠执行；每次拟合前汇合，候选顺序、L
 
 | 阶段 | 统计范围 |
 | --- | --- |
-| `preprocess` | 读取/解码、可选旋转、相机校正、仅亮度锐化 0.6 |
+| `preprocess` | 读取/解码、可选旋转、相机校正和图像回读；无增强 |
 | `yolo` | 模型输入转换、推理、检测头解码/NMS 和检测框整理 |
 | `opencv` | YOLO 目标关联、ROI 红杆检测或当前帧图像跟踪 |
 | `postprocess` | 几何换算、视觉提示、绘制、结果 JSON 序列化和视频写入 |

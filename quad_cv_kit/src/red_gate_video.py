@@ -14,7 +14,7 @@ import numpy as np
 from .camera_correction import (DEFAULT_PARAMS_PATH, adapt_camera_params,
                                 create_corrector, load_camera_params)
 from .detect_red_gate import original_geometry, draw_gate_geometry
-from .gate_guidance import sharpen_frame, build_gate_guidance, draw_gate_guidance
+from .gate_guidance import build_gate_guidance, draw_gate_guidance
 from .video_input import FFmpegVideoInput
 from .video_output import VideoOutput
 from .yolo_quad import DEFAULT_CLASSES, DEFAULT_WEIGHTS, YoloQuadDetector, draw_detections
@@ -148,13 +148,14 @@ def parser():
                     help='GPU CV: bounded half-degree Hough and sparse sampling, or original precise algorithms')
     ap.add_argument('--cv-search', choices=('adaptive', 'full'), default='adaptive',
                     help='Certified predicted side crops with same-frame fallback, or full ROI at every search')
-    ap.add_argument('--cv-budget-ms', type=float, default=100., help='Report CV frames meeting this budget, without dropping work')
+    ap.add_argument('--cv-execution', choices=('resident', 'hybrid'),
+                    help='OpenCL defaults to resident GPU CV; hybrid retains the LSD reference workflow')
+    ap.add_argument('--cv-budget-ms', type=float, default=30., help='Report CV frames meeting this budget, without dropping work')
     ap.add_argument('--camera-params', type=Path, default=DEFAULT_PARAMS_PATH)
     ap.add_argument('--camera-fit', choices=('center-crop', 'resize', 'strict'), default='center-crop')
     ap.add_argument('--plane-distance', type=float)
     ap.add_argument('--no-correction', action='store_true')
     ap.add_argument('--rotate-180', action='store_true')
-    ap.add_argument('--sharpen', type=float, default=.6)
     ap.add_argument('--show', action='store_true')
     return ap
 
@@ -190,9 +191,8 @@ def run_video(argv=None):
         raise ValueError('--max-frames, --cv-every and --opencv-threads must be positive')
     if (not 0 < args.conf < 1 or not 0 <= args.iou <= 1 or args.imgsz < 1 or
             not 0 <= args.hold_seconds <= 1 or not 0 <= args.roi_padding <= 1 or
-            not 0 <= args.sharpen <= 2 or
             any(core < 0 for core in args.bpu_cores)):
-        raise ValueError('Invalid detector, tracking or enhancement parameters')
+        raise ValueError('Invalid detector or tracking parameters')
     if args.plane_distance is not None and (not np.isfinite(args.plane_distance) or args.plane_distance <= 0):
         raise ValueError('--plane-distance must be positive and finite')
     if not np.isfinite(args.cv_budget_ms) or args.cv_budget_ms <= 0:
@@ -220,7 +220,7 @@ def run_video(argv=None):
              stages=list(STAGES), cv_every=args.cv_every, opencv_version=cv2.__version__,
              opencv_threads=cv2.getNumThreads(),
              cv_backend_requested=args.cv_backend,
-             timing_scope=dict(preprocess='video read/decode, rotation, correction and enhancement',
+             timing_scope=dict(preprocess='video read/decode, rotation and correction; no enhancement',
                                yolo='model input preparation, inference, decode/NMS and box conversion',
                                opencv='YOLO target association, ROI red-pipe search or tracking',
                                postprocess='geometry, guidance, drawing, result serialization and video write',
@@ -228,6 +228,10 @@ def run_video(argv=None):
         try:
             init_started = time.perf_counter()
             gpu, cv_backend_info = create_backend(args.cv_backend, args.gpu_device, args.cv_hough, args.cv_blur, args.cv_quality)
+            execution = args.cv_execution or ('resident' if gpu is not None else 'hybrid')
+            if execution == 'resident' and gpu is None:
+                raise ValueError('--cv-execution resident requires an OpenCL GPU backend')
+            cv_backend_info['cv_execution'] = execution
             print(f'CV backend: {cv_backend_info}', flush=True)
             detector = create_detector(args)
             timed_detector = TimedBoxDetector(detector)
@@ -254,28 +258,39 @@ def run_video(argv=None):
             else:
                 valid = np.ones(first_frame.shape[:2], bool)
             valid.setflags(write=False)
-            warmup_started = time.perf_counter()
-            # OpenCV lazily builds LAB lookup tables on first use (~190ms on
-            # S100). Record the work explicitly in initialization, not frame 1.
-            cv2.cvtColor(np.zeros((16, 16, 3), np.uint8), cv2.COLOR_BGR2LAB)
-            if gpu is not None:
-                warm_raw = cv2.rotate(first_frame, cv2.ROTATE_180) if args.rotate_180 else first_frame
-                maps = None if corrector is None else corrector.maps(args.plane_distance)
-                warm_fixed, warm_enhanced, _, _ = gpu.preprocess(warm_raw, valid, args.sharpen, maps)
-                from .detect_red_gate import prepare_detection_frame
-                warm_reference = prepare_detection_frame(warm_fixed)[0]
-                warm_extra = prepare_detection_frame(warm_enhanced)[0]
-                gpu.combined_evidence(warm_extra, warm_reference)
-                gpu.red_mask(warm_reference)
-                del warm_fixed, warm_enhanced, warm_reference, warm_extra
-            _log(perf, event='warmup', warmup_ms=round((time.perf_counter()-warmup_started)*1000, 3),
-                 scope='LAB lookup tables and GPU preprocessing/color kernels; no YOLO, no tracker advancement',
-                 gpu=None if gpu is None else gpu.diagnostics())
             tracker = YoloRedGateTracker(timed_detector, fps=fps, detect_every=args.cv_every,
                 hold_seconds=args.hold_seconds, valid_mask=valid, roi_padding=args.roi_padding,
                 cv_contrast=1, cv_clahe_clip=0, cv_clahe_blend=0,
-                cv_sharpen=args.sharpen, cv_saturation=1, profile_cv=True, cv_backend=gpu,
+                cv_sharpen=0, cv_saturation=1, profile_cv=True, cv_backend=gpu,
+                cv_execution=execution,
                 adaptive_search=args.cv_search == 'adaptive')
+            if execution == 'resident' and corrector is not None:
+                tracker.cv.set_camera(corrector.output_matrix)
+            warmup_started = time.perf_counter()
+            if execution == 'hybrid':
+                # Lookup construction is startup work, not a frame measurement.
+                cv2.cvtColor(np.zeros((16, 16, 3), np.uint8), cv2.COLOR_BGR2LAB)
+            if gpu is not None:
+                with gpu.frame_batch():
+                    maps = None if corrector is None else corrector.maps(args.plane_distance)
+                    warm_fixed, warm_enhanced, _, _ = gpu.preprocess(
+                        first_frame, valid, maps=maps,
+                        device_reference=execution == 'resident', rotate_180=args.rotate_180)
+                    if execution == 'resident':
+                        # Exercise all kernels without calling external YOLO.
+                        warm_boxes = [dict(class_id=0, score=1., bbox=[0, 0, *size])]
+                        tracker.cv.update(warm_fixed, warm_enhanced, warm_boxes, {0}, valid)
+                        tracker.cv.reset()
+                        tracker.cv.index = 0
+                    else:
+                        from .detect_red_gate import prepare_detection_frame
+                        warm_reference = prepare_detection_frame(warm_fixed)[0]
+                        warm_extra = prepare_detection_frame(warm_enhanced)[0]
+                        gpu.combined_evidence(warm_extra, warm_reference)
+                        gpu.red_mask(warm_reference)
+            _log(perf, event='warmup', warmup_ms=round((time.perf_counter()-warmup_started)*1000, 3),
+                 scope='GPU preprocessing and CV kernels; no YOLO; tracker reset before video',
+                 gpu=None if gpu is None else gpu.diagnostics())
             writer = VideoOutput(output, fps, size)
             metadata = dict(source=str(args.source.resolve()), output=str(output.resolve()),
                             pipeline='red-gate', backend=args.backend, weights=str(args.weights.resolve()),
@@ -285,9 +300,9 @@ def run_video(argv=None):
                             camera_params=None if camera is None else str(args.camera_params.resolve()),
                             correction=corrector is not None, rotate_180=args.rotate_180,
                             inference_coordinates='corrected' if corrector else 'raw',
-                            cv_reference='clean frame', yolo_cv_input='enhanced frame',
-                            enhancement_mode='sharpen-only', sharpen=args.sharpen,
-                            cv_every=args.cv_every, cv_search=args.cv_search,
+                            cv_reference='clean frame', yolo_cv_input='clean frame',
+                            enhancement_mode='none',
+                            cv_every=args.cv_every, cv_search=args.cv_search, cv_execution=execution,
                             opencv_threads=cv2.getNumThreads(), cv_backend=cv_backend_info)
             if corrector is not None:
                 metadata['output_matrix'] = corrector.output_matrix.tolist()
@@ -312,14 +327,16 @@ def run_video(argv=None):
                     if (frame.shape[1], frame.shape[0]) != size:
                         raise ValueError('Source dimensions changed within a video')
                     with (gpu.frame_batch() if gpu is not None else nullcontext()):
-                        raw = cv2.rotate(frame, cv2.ROTATE_180) if args.rotate_180 else frame
                         if gpu is None:
+                            raw = cv2.rotate(frame, cv2.ROTATE_180) if args.rotate_180 else frame
                             fixed = raw if corrector is None else corrector.undistort(raw, args.plane_distance)
                             corrected_at = time.perf_counter()
-                            enhanced = sharpen_frame(fixed, args.sharpen, valid)
+                            enhanced = fixed
                         else:
                             maps = None if corrector is None else corrector.maps(args.plane_distance)
-                            fixed, enhanced, correction_ms, enhancement_ms = gpu.preprocess(raw, valid, args.sharpen, maps)
+                            fixed, enhanced, correction_ms, _ = gpu.preprocess(
+                                frame, valid, maps=maps,
+                                device_reference=execution == 'resident', rotate_180=args.rotate_180)
                             corrected_at = decoded_at+correction_ms/1000
                         preprocessed_at = time.perf_counter()
                         selected, _ = tracker.update(fixed, yolo_frame=enhanced, cv_frame=enhanced)
@@ -334,7 +351,8 @@ def run_video(argv=None):
                         after = draw_gate_geometry(after, geometry, count, fps, 'AFTER')
                         guidance = None
                         if corrector is not None:
-                            guidance = build_gate_guidance(status, geometry, corrector.output_matrix, size, valid)
+                            guidance = (tracker.cv.last_guidance if execution == 'resident' else
+                                        build_gate_guidance(status, geometry, corrector.output_matrix, size, valid))
                             after = draw_gate_guidance(after, guidance, corrector.output_matrix)
                         _log(rows, frame=count+1, time_s=count/fps, detections=boxes,
                              geometry=geometry, guidance=guidance, status=status)
@@ -351,7 +369,7 @@ def run_video(argv=None):
                             timings[stage].append(value)
                         cv_modes.setdefault(profile['mode'], []).append(stage_ms['opencv'])
                         details = dict(decode=decode_ms, correction=(corrected_at-decoded_at)*1000,
-                                       enhancement=(preprocessed_at-corrected_at)*1000,
+                                       enhancement=0.,
                                        drawing_and_results=(drawn_at-detected_at)*1000,
                                        video_write=(written_at-drawn_at)*1000)
                         if isinstance(detector, HbmBoxDetector):

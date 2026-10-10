@@ -1,5 +1,9 @@
 # S100 的 BPU 与批量 GPU 门框检测
 
+新视频默认路径是 `--cv-execution resident`，其完整 GPU 数据流、算法差异、
+Mali-G78AE 的估计耗时和板端测试命令见 [MALI_RESIDENT.md](MALI_RESIDENT.md)。
+本文以下批量搜索及 CPU 阶段说明对应旧的 `hybrid` 路径；DoorSim 仍使用该路径。
+
 BPU 执行厂商工具链编译的神经网络。工程通过 `src/function.py` 中的
 `hbm_runtime.HB_HBMRuntime` 加载 `.hbm` 并执行 YOLO。OpenCV 的 Mat/UMat、
 LSD、Hough、动态合线、连通域和 Python 几何循环没有直接切换到 BPU 的执行入口。
@@ -48,7 +52,7 @@ OpenCL float32 在临界值/半像素附近可能与 CPU float64 有差异。
 python3 quad_cv_kit/demo/demo_video.py quad_cv_kit/res/test.mp4 \
   --pipeline red-gate --backend hbm \
   --weights models/door_4_nashe_1280x1280_nv12.hbm --class-names door \
-  --cv-backend opencl --gpu-device Mali --cv-hough opencl \
+  --cv-backend opencl --gpu-device Mali --cv-execution hybrid --cv-hough opencl \
   --cv-quality fast --cv-blur pyramid --opencv-threads 3 --cv-budget-ms 40 \
   --out quad_cv_kit/runs/gpu_resident \
   --perf-log quad_cv_kit/logs/gpu_resident.log
@@ -77,24 +81,20 @@ CPU→GPU 上传和 GPU→CPU 读回；`gpu.residency=frame` 表示该帧已启�
 CPU LSD、光流和视频/BPU 输入接口仍需要主机视图，因此部分读回量不会减少。
 要继续消除这些接口，需要移植对应算法或更换输入 API；当前日志能直接指出剩余传输。
 
-## 仅锐化预处理
+## 无增强的视频预处理
 
-`red-gate` 与 DoorSim 已移除预处理对比度增强及 `--contrast` 参数，默认仅使用
-`--sharpen 0.6`，0 关闭锐化。`src/kernels/sharpen.cl` 的 `sharpen_only` 内核
-一次提交完成 BGR 最大通道亮度、sigma=1.2 的 11×11 高斯模糊、3 级噪声阈值
-及 BGR 同比例锐化。64 个线程共享 16×16 输出块和边界邻域，模糊中间值
-留在约 8.6 KiB 的工作组局部内存，不写入整图浮点缓冲区。
+`red-gate` 视频入口已删除 CPU/GPU 锐化和 `--sharpen` 参数，仅保留可选旋转
+及相机矫正。YOLO/CV 直接使用干净矫正图，BPU/绘制需要的 BGR 只读回一次，
+设备副本继续供 CV 使用。`details_ms.enhancement=0`、
+`gpu.enhancement_mode=none`，内核列表不再有 `sharpen_only`。
+矫正 wall time 包含必要的 BGR 输出等待，remap 事件耗时仍独立记录。
+库中独立锐化/增强对照函数仍可显式调用，但不参与此视频流程。
+此次仅修改 quad_cv_kit；DoorSim 需另行接入。
 
-有效非黑邻域参与归一化模糊，无效和黑像素原样输出，避免黑边亮晕。
-校正输入与锐化输出保留设备副本，权重和静态有效掩码跨帧复用。该阶段不再执行
-HSV 转换、直方图、全图中位数或全局对比度；颜色检测所需的局部色差仍保留。
-原通用增强函数保留给独立对照工具，不再用于上述实际预处理入口。
-
-核对日志的 `gpu.enhancement_mode=sharpen-only`、
-`gpu.sharpening_algorithm=normalized-value-fused-tile16` 和 `kernel_ms.sharpen_only`。
-`details_ms.enhancement` 仍包括 BGR 读回和接口开销；需在 S100 比较同一录像
-的均值/P95，不能从减少内核数量推断实际毫秒数。移除对比度会改变画面，需同时
-检查检测结果与画面。
+resident 峰值选择采用并行排名、邻近角度的稀疏抑制列表和轻量贪心输出，
+保留原来的排序/配额/抑制规则。实际收益应比较
+`rg_peak_prepare + rg_peak_order + rg_peak_select` 的事件总时长，
+日志 `gpu.peak_selector.total_gpu_ms` 已汇总；详见 [MALI_RESIDENT.md](MALI_RESIDENT.md)。
 
 ## 队列和搜索调度
 

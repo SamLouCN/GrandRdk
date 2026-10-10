@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src import red_gate_video as V
 from src.camera_correction import adapt_camera_params, create_corrector, load_camera_params
-from src.gate_guidance import sharpen_frame
 from src.video_output import VideoOutput
 
 
@@ -100,7 +99,7 @@ class RedGateVideoTests(unittest.TestCase):
             camera, _ = adapt_camera_params(load_camera_params(), 640, 360)
             corrector = create_corrector(camera)
             fixed = corrector.undistort(decoded)
-            expected = sharpen_frame(fixed, .6, corrector.valid_mask())
+            expected = fixed
             with patch.object(V, 'create_detector', return_value=detector):
                 self.assertEqual(V.run_video(self.arguments(folder, source)), 0)
             self.assertEqual(len(detector.frames), 5)
@@ -111,7 +110,7 @@ class RedGateVideoTests(unittest.TestCase):
             self.assertEqual(records[-1]['event'], 'run_summary')
             self.assertEqual(records[-1]['frames'], 5)
             for mode in records[-1]['cv_modes'].values():
-                self.assertEqual(mode['budget_ms'], 100.)
+                self.assertEqual(mode['budget_ms'], 30.)
                 self.assertLessEqual(mode['within_budget'], mode['n'])
                 self.assertGreaterEqual(mode['within_budget_pct'], 0)
                 self.assertLessEqual(mode['within_budget_pct'], 100)
@@ -155,7 +154,7 @@ class RedGateVideoTests(unittest.TestCase):
             source = self.source(folder, frames=2)
             with patch('src.opencl_backend.OpenCLRuntime', HostRuntime), \
                     patch.object(V, 'create_detector', return_value=FakeDetector()):
-                V.run_video(self.arguments(folder, source, '--cv-backend', 'opencl'))
+                V.run_video(self.arguments(folder, source, '--cv-backend', 'opencl', '--cv-execution', 'hybrid'))
             self.assert_video(folder/'runs'/'after.mp4', 2)
             records = self.records(folder/'logs'/'perf.log')
             frames = [r for r in records if r['event'] == 'frame']
@@ -168,8 +167,8 @@ class RedGateVideoTests(unittest.TestCase):
             self.assertIn('bgr_hsv', frames[0]['gpu']['kernel_ms'])
             self.assertNotIn('median_parameters', frames[0]['gpu']['kernel_ms'])
             self.assertNotIn('contrast_device', frames[0]['gpu']['kernel_ms'])
-            self.assertIn('sharpen_only', frames[0]['gpu']['kernel_ms'])
-            self.assertEqual(frames[0]['gpu']['enhancement_mode'], 'sharpen-only')
+            self.assertNotIn('sharpen_only', frames[0]['gpu']['kernel_ms'])
+            self.assertEqual(frames[0]['gpu']['enhancement_mode'], 'none')
             self.assertIn('trim_sections', frames[0]['gpu']['kernel_ms'])
             self.assertIn('trim_extract_fast', frames[0]['gpu']['kernel_ms'])
             self.assertIn('hough_runs_fast', frames[0]['gpu']['kernel_ms'])
@@ -179,6 +178,39 @@ class RedGateVideoTests(unittest.TestCase):
             self.assertIn('warmup', [r['event'] for r in records])
             self.assertGreater(frames[0]['gpu']['upload_bytes'], 0)
             self.assertIsNotNone(self.records(folder/'runs'/'rows.jsonl')[0]['geometry'])
+
+    @unittest.skipUnless(shutil.which('clang') and shutil.which('clang++'), 'Host kernel checks require clang/clang++')
+    def test_resident_video_export_uses_final_records_and_one_image_output(self):
+        from opencl_host import HostRuntime
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = self.source(folder, frames=2)
+            with patch('src.opencl_backend.OpenCLRuntime', HostRuntime), \
+                    patch.object(V, 'create_detector', return_value=FakeDetector()):
+                V.run_video(self.arguments(folder, source, '--cv-backend', 'opencl'))
+            self.assert_video(folder/'runs'/'after.mp4', 2)
+            records = self.records(folder/'logs'/'perf.log')
+            frames = [r for r in records if r['event'] == 'frame']
+            for frame in frames:
+                self.assertEqual(frame['gpu']['cv_execution'], 'resident')
+                self.assertEqual(frame['gpu']['pipeline_version'], 6)
+                self.assertEqual(frame['gpu']['cpu_stages'], [])
+                self.assertEqual(frame['gpu']['peak_selector']['selected'], 'device-parallel-rank-mask-greedy-nms')
+                self.assertEqual(frame['gpu']['components']['connectivity'], 8)
+                self.assertEqual(frame['gpu']['angle_peak_top']['selected'], 'exact-lane-top8-merge')
+                self.assertIn('morph3_fused', frame['gpu']['kernel_ms'])
+                self.assertNotIn('morph3', frame['gpu']['kernel_ms'])
+                self.assertNotIn('rg_cc_link', frame['gpu']['kernel_ms'])
+                self.assertNotIn('rg_peak_top', frame['gpu']['kernel_ms'])
+                self.assertEqual(frame['gpu']['download_bytes'], 640*360*3+800)
+                self.assertEqual(frame['cv_profile']['timing_kind'], 'host-kernel-emulation')
+                self.assertEqual(frame['cv_profile']['intermediate_readbacks'], 0)
+                self.assertIn('components', frame['cv_profile']['stages_ms'])
+                self.assertNotIn('contrast_device', frame['gpu']['kernel_ms'])
+                self.assertNotIn('sharpen_only', frame['gpu']['kernel_ms'])
+                self.assertEqual(frame['details_ms']['enhancement'], 0.)
+                self.assertEqual(frame['gpu']['enhancement_mode'], 'none')
+            self.assertTrue(all(row['geometry'] is not None for row in self.records(folder/'runs'/'rows.jsonl')))
 
     def test_gpu_startup_failure_logged_without_loading_yolo(self):
         from src.opencl_runtime import OpenCLError

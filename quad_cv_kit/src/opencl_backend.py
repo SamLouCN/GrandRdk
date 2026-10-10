@@ -2,7 +2,8 @@
 
 Detection LAB uses the local OpenCV build's exact byte lookup on the GPU;
 HSV uses OpenCV's integer convention. CPU HSV saturation may differ by one.
-LSD, partial graph selection and connected components remain on the CPU.
+The legacy hybrid path retains CPU LSD, partial groups and motion. The resident
+pipeline uses device colour Hough, components, line/model selection and motion.
 Ordered merging, split/contrast probes and complete-model geometry are batched
 OpenCL search stages; intermediates remain resident until accepted output.
 Frame operations defer profiling and synchronization until a host result is
@@ -52,7 +53,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             raise ValueError('Blur mode must be exact or pyramid')
         self.blur_mode = blur_mode
         source = '\n'.join((Path(__file__).parent/'kernels'/name).read_text(encoding='utf-8')
-                           for name in ('red_gate.cl', 'search.cl', 'residency.cl', 'color.cl', 'sharpen.cl'))
+                           for name in ('red_gate.cl', 'search.cl', 'residency.cl', 'color.cl', 'sharpen.cl', 'resident_pipeline.cl'))
         self.runtime = OpenCLRuntime(source, device_name, device_type)
         self._native_peak_selector, self.peak_selector_info = create_native_selector()
         self._native_postprocess, self.postprocess_info = create_native_postprocess()
@@ -91,6 +92,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
 
     def diagnostics(self):
         self.runtime.finish()
+        resident = getattr(self, '_resident_core_active', False)
         return dict(**self.runtime.info,
             kernel_ms={key: round(value, 3) for key, value in self.runtime.kernel_ms.items()},
             operation_ms={key: round(value, 3) for key, value in self.operation_ms.items()},
@@ -98,31 +100,55 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             transfer_bytes=dict(getattr(self.runtime, 'transfer_bytes', {})),
             transfer_calls=dict(getattr(self.runtime, 'transfer_calls', {})),
             residency='frame' if getattr(self, '_resident_frame', None) is not None else 'operation',
-            pipeline_version=2, residency_strategy='direct-outputs-readonly-aliases',
+            pipeline_version=6 if getattr(self, '_resident_core_active', False) else 2,
+            cv_execution='resident' if getattr(self, '_resident_core_active', False) else 'hybrid',
+            residency_strategy='direct-outputs-readonly-aliases',
             synchronization=dict(finish_calls=getattr(self.runtime, 'finish_calls', 0),
                                  read_wait_calls=getattr(self.runtime, 'read_wait_calls', 0)),
             profiling_cpu_ms=round(getattr(self.runtime, 'profiling_cpu_ms', 0.), 3),
             dispatch=dict(kernel_launch_calls=getattr(self.runtime, 'kernel_launch_calls', 0),
                           argument_set_calls=getattr(self.runtime, 'argument_set_calls', 0)),
-            cpu_stages=['LSD LAB/CLAHE', 'Hough peak ordering',
+            cpu_stages=[] if getattr(self, '_resident_core_active', False) else ['LSD LAB/CLAHE', 'Hough peak ordering',
                         'trimmed-line deduplication and partial groups', 'connected components', 'optical flow/RANSAC'],
-            search_execution='gpu-batched',
-            hough_backend=self.hough_backend,
-            hough_algorithm=('opencv-HoughLinesP' if self.hough_backend == 'cpu' else
+            search_execution='gpu-resident' if resident else 'gpu-batched',
+            hough_backend='opencl' if resident else self.hough_backend,
+            hough_algorithm=('resident-color-top8-per-angle' if resident else 'opencv-HoughLinesP' if self.hough_backend == 'cpu' else
                 'bounded-peaks-cooperative-runs' if self.quality == 'fast' else 'polar-votes-cooperative-greedy-consumption'),
-            cv_quality=self.quality, work_counts=dict(self.work_counts),
-            peak_selector=dict(self.peak_selector_info),
-            trimmed_line_merge=dict(self.postprocess_info),
-            hough_angles=360 if self.quality == 'fast' and self.hough_backend == 'opencl' else 720,
-            hough_peak_limit=self.hough_peak_limit if self.quality == 'fast' and self.hough_backend == 'opencl' else None,
-            line_sample_step=2 if self.quality == 'fast' else 1,
+            cv_quality='resident' if resident else self.quality, work_counts=dict(self.work_counts),
+            peak_selector=dict(selected='device-parallel-rank-mask-greedy-nms', neighbors_per_peak=72,
+                suppression_words_per_peak=3, suppression_record_bytes=16,
+                kernel_names=['rg_peak_prepare', 'rg_peak_order', 'rg_peak_select'],
+                total_gpu_ms=round(sum(self.runtime.kernel_ms.get(k, 0.) for k in
+                    ('rg_peak_prepare', 'rg_peak_order', 'rg_peak_select')), 3)) if resident else dict(self.peak_selector_info),
+            line_ranker=dict(selected='device-tiled-stable-topk', tile_slots=256,
+                kernel_names=['rg_rank_tiles', 'rg_rank_merge', 'rg_rank_gather', 'rg_rank'],
+                total_gpu_ms=round(sum(self.runtime.kernel_ms.get(k, 0.) for k in
+                    ('rg_rank_tiles', 'rg_rank_merge', 'rg_rank_gather', 'rg_rank')), 3)) if resident else None,
+            morphology=dict(selected='exact-tiled-pass-fusion', tile_size=[16, 16],
+                total_gpu_ms=round(self.runtime.kernel_ms.get('morph3_fused', 0.), 3)),
+            components=dict(selected='exact-tile-union-boundary-merge-local-hash', connectivity=8,
+                kernel_names=['rg_cc_tile', 'rg_cc_boundary', 'rg_cc_stats_hash', 'rg_cc_filter', 'rg_white_open2'],
+                total_gpu_ms=round(sum(self.runtime.kernel_ms.get(k, 0.) for k in
+                    ('rg_cc_tile', 'rg_cc_boundary', 'rg_cc_stats_hash', 'rg_cc_filter', 'rg_white_open2')), 3)) if resident else None,
+            angle_peak_top=dict(selected='exact-lane-top8-merge',
+                total_gpu_ms=round(self.runtime.kernel_ms.get('rg_peak_top_tiled', 0.), 3)) if resident else None,
+            trimmed_line_merge=dict(selected='device-ordered-merge-and-validation') if resident else dict(self.postprocess_info),
+            hough_angles=360 if resident or self.quality == 'fast' and self.hough_backend == 'opencl' else 720,
+            hough_peak_limit=256 if resident else self.hough_peak_limit if self.quality == 'fast' and self.hough_backend == 'opencl' else None,
+            line_sample_step=2 if resident or self.quality == 'fast' else 1,
             blur_mode=self.blur_mode,
-            gpu_stages=['fused brightness sharpening', 'line fitting', 'line trim',
+            gpu_stages=(['target association and ROI', 'area canvas and grayscale pyramids',
+                        'HSV/LAB and multiscale color', 'atomic connected components',
+                        'corner ranking and pyramidal LK', 'similarity RANSAC',
+                        'color Hough and device peak selection', 'sampled fitting and ordered merge',
+                        'line validation', 'complete/partial model selection', 'planar homography pose'] if resident else
+                        ['fused brightness sharpening', 'line fitting', 'line trim',
                         'ordered line merge', 'line split and contrast median',
                         'quad geometry and valid-mask probes', 'model side support',
-                        'partial joints and line color probes', 'detection HSV/LAB lookup', 'resident ROI transforms'],
+                        'partial joints and line color probes', 'detection HSV/LAB lookup', 'resident ROI transforms']),
             color_conversion='fused-hsv-exact-lab-a', lab_lookup_bytes=256**3,
-            enhancement_mode='sharpen-only', sharpening_algorithm='normalized-value-fused-tile16',
+            enhancement_mode='none' if getattr(self, '_preprocess_enhancement_removed', False) else 'sharpen-only',
+            sharpening_algorithm='disabled' if getattr(self, '_preprocess_enhancement_removed', False) else 'normalized-value-fused-tile16',
             gaussian_algorithm=('fused-small-area4-large-scales' if self.blur_mode == 'pyramid' else 'fused-small-symmetric-tiled'),
             precision='float32')
 
@@ -180,6 +206,14 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
 
     def _morph(self, source, w, h, steps, prefix):
         rt = self.runtime
+        if 1 < len(steps) <= 4:
+            target = self.device_output(prefix+'_result', w*h)
+            extent = 16+2*len(steps)
+            operations = sum(int(bool(dilate)) << i for i, dilate in enumerate(steps))
+            groups = ((w+15)//16)*((h+15)//16)
+            rt.run('morph3_fused', groups*64, [source, target, w, h, len(steps), operations,
+                   LocalMemory(extent*extent), LocalMemory(extent*extent)], local=64)
+            return target
         buffers = [rt.buffer(prefix+'_a', w*h), rt.buffer(prefix+'_b', w*h)]
         result = source
         for i, dilate in enumerate(steps):
@@ -368,6 +402,8 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             raise ValueError('Sharpen valid mask must match the frame')
         with self._operation('enhancement'):
             if amount == 0:
+                if _source is not None:
+                    return self.capture_read(_source, (h, w, 3), np.uint8)
                 return self.copy_host(frame)
             rt = self.runtime
             source = self.device_input('sharpen_source', frame) if _source is None else _source
@@ -385,24 +421,40 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
                     LocalMemory(26*16*4), LocalMemory(26*16*4), LocalMemory(6*4)], local=64)
             return self.capture_read(out, (h, w, 3), np.uint8)
 
-    def preprocess(self, frame, valid_mask, amount=.6, maps=None):
-        """Correct then sharpen, keeping both device results resident."""
+    def preprocess(self, frame, valid_mask, amount=0., maps=None, *, device_reference=False, rotate_180=False):
+        """Rotate/correct only; return clean pixels for both CV and external I/O.
+
+        There is no enhancement launch or extra image. Resident consumers keep
+        the clean device buffer while BPU/rendering receives one host readback.
+        The correction wall checkpoint includes that required output wait.
+        amount is an ignored compatibility argument for existing integrations;
+        it cannot enable sharpening. New calls should omit it and name maps.
+        """
+        self._frame(frame)
+        if valid_mask is not None and valid_mask.shape != frame.shape[:2]:
+            raise ValueError('Preprocessing valid mask must match the frame')
+        if device_reference and getattr(self, '_resident_frame', None) is None:
+            raise ValueError('Device-only preprocessing requires frame_batch')
+        self._preprocess_enhancement_removed = True
         started = time.perf_counter()
-        fixed = frame if maps is None else self.remap(frame, *maps)
-        corrected = time.perf_counter()
+        raw = self.rotate180(frame, device_only=device_reference) if rotate_180 else frame
+        fixed = raw if maps is None else self.remap(raw, *maps, device_only=device_reference)
         device_frame = self.resident_buffer(fixed)
-        if maps is not None and device_frame is None:
-            device_frame = self.runtime.buffer('remap_output', frame.size)
-        device_valid = None
-        if valid_mask is not None and not valid_mask.flags.writeable:
-            if valid_mask.shape != frame.shape[:2]:
-                raise ValueError('Preprocessing valid mask must match the frame')
-            if self.valid_cache is None or self.valid_cache[0] is not valid_mask:
-                self.valid_cache = (valid_mask, self.runtime.upload('preprocess_valid', np.uint8(valid_mask)))
-            device_valid = self.valid_cache[1]
-        enhanced = self.sharpen(fixed, amount, valid_mask, _source=device_frame, _valid=device_valid)
-        finished = time.perf_counter()
-        return fixed, enhanced, (corrected-started)*1000, (finished-corrected)*1000
+        if device_frame is None and getattr(self, '_resident_frame', None) is not None:
+            device_frame = self.device_input('preprocess_source', fixed)
+        output = (self.capture_read(device_frame, fixed.shape, np.uint8)
+                  if device_reference and (rotate_180 or maps is not None) else fixed)
+        elapsed_ms = (time.perf_counter()-started)*1000
+        return fixed, output, elapsed_ms, 0.
+
+    def rotate180(self, frame, *, device_only=False):
+        self._frame(frame)
+        rt = self.runtime
+        src = self.device_input('rotation_source', frame)
+        out = self.device_output('rotation_output', frame.size)
+        rt.run('rg_rotate_bgr', frame.shape[0]*frame.shape[1], [src, out, frame.shape[0]*frame.shape[1]])
+        return (self.device_descriptor(out, frame.shape, np.uint8) if device_only else
+                self.capture_read(out, frame.shape, np.uint8))
 
     def trim_lines(self, lines, mask, score, bounds):
         from .gate_models import merge_trimmed
@@ -465,7 +517,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             rt.run('side_support', len(lines), [src, seeds, out, w, h, len(lines)])
             return rt.read(out, (len(lines),), np.float32)
 
-    def remap(self, frame, map_x, map_y):
+    def remap(self, frame, map_x, map_y, *, device_only=False):
         self._frame(frame)
         with self._operation('correction'):
             rt = self.runtime
@@ -476,9 +528,10 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             # newly allocated map whose Python id reused a released object's id.
             if self.maps_cache is None or self.maps_cache[0] is not map_x or self.maps_cache[1] is not map_y:
                 self.maps_cache = (map_x, map_y, rt.upload('map_x', np.float32(map_x)), rt.upload('map_y', np.float32(map_y)))
-            src, out = rt.upload('remap_source', frame), self.device_output('remap_output', h*w*3)
+            src, out = self.device_input('remap_source', frame), self.device_output('remap_output', h*w*3)
             rt.run('remap_bgr', w*h, [src, self.maps_cache[2], self.maps_cache[3], out, w, h])
-            return self.capture_read(out, (h, w, 3), np.uint8)
+            return (self.device_descriptor(out, (h, w, 3), np.uint8) if device_only else
+                    self.capture_read(out, (h, w, 3), np.uint8))
 
     def hough_segments(self, mask, threshold=35, min_length=55, max_gap=10):
         self._mask(mask)

@@ -8,7 +8,7 @@
 #include <vector>
 
 extern "C" float cosf(float), sinf(float), logf(float), fabsf(float), ceilf(float), floorf(float),
-    sqrtf(float), nearbyintf(float), atan2f(float,float), fmaxf(float,float), fminf(float,float);
+    sqrtf(float), powf(float,float), nearbyintf(float), atan2f(float,float), fmaxf(float,float), fminf(float,float);
 using uint=unsigned int;
 using uchar=unsigned char;
 typedef float float2 __attribute__((ext_vector_type(2)));
@@ -50,6 +50,9 @@ extern "C" float ocl_fmin(float,float) SYMBOL("_Z4fminff");
 extern "C" float ocl_fmax(float,float) SYMBOL("_Z4fmaxff");
 extern "C" int ocl_abs(int) SYMBOL("_Z3absi");
 extern "C" int ocl_isfinite(float) SYMBOL("_Z8isfinitef");
+extern "C" float ocl_sqrt(float) SYMBOL("_Z4sqrtf");
+extern "C" float ocl_pow(float,float) SYMBOL("_Z3powff");
+float ocl_sqrt(float x){return sqrtf(x);} float ocl_pow(float x,float y){return powf(x,y);}
 float ocl_cos(float x){return cosf(x);} float ocl_sin(float x){return sinf(x);}
 float ocl_log(float x){return logf(x);} float ocl_fabs(float x){return fabsf(x);}
 float ocl_ceil(float x){return ceilf(x);} float ocl_floor(float x){return floorf(x);}
@@ -75,6 +78,23 @@ uint local_inc(volatile uint *p){return __atomic_fetch_add(p,1,__ATOMIC_RELAXED)
 int local_inc_i(volatile int *p){return __atomic_fetch_add(p,1,__ATOMIC_RELAXED);}
 uint global_add(volatile uint *p,uint n){return __atomic_fetch_add(p,n,__ATOMIC_RELAXED);}
 uint global_and(volatile uint *p,uint n){return __atomic_fetch_and(p,n,__ATOMIC_RELAXED);}
+extern "C" int global_add_i(volatile int*,int) SYMBOL("_Z10atomic_addPU8CLglobalVii");
+extern "C" int global_min_i(volatile int*,int) SYMBOL("_Z10atomic_minPU8CLglobalVii");
+extern "C" int global_max_i(volatile int*,int) SYMBOL("_Z10atomic_maxPU8CLglobalVii");
+int global_add_i(volatile int *p,int n){return __atomic_fetch_add(p,n,__ATOMIC_RELAXED);}
+int global_min_i(volatile int *p,int n){int old=__atomic_load_n(p,__ATOMIC_RELAXED);while(n<old&&!__atomic_compare_exchange_n(p,&old,n,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}return old;}
+int global_max_i(volatile int *p,int n){int old=__atomic_load_n(p,__ATOMIC_RELAXED);while(n>old&&!__atomic_compare_exchange_n(p,&old,n,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}return old;}
+extern "C" int local_add_i(volatile int*,int) SYMBOL("_Z10atomic_addPU7CLlocalVii");
+extern "C" int local_min_i(volatile int*,int) SYMBOL("_Z10atomic_minPU7CLlocalVii");
+extern "C" int local_max_i(volatile int*,int) SYMBOL("_Z10atomic_maxPU7CLlocalVii");
+extern "C" int local_cmp_i(volatile int*,int,int) SYMBOL("_Z14atomic_cmpxchgPU7CLlocalViii");
+extern "C" int global_cmp_i(volatile int*,int,int) SYMBOL("_Z14atomic_cmpxchgPU8CLglobalViii");
+int local_add_i(volatile int *p,int n){return __atomic_fetch_add(p,n,__ATOMIC_RELAXED);}
+int local_min_i(volatile int *p,int n){return global_min_i(p,n);}
+int local_max_i(volatile int *p,int n){return global_max_i(p,n);}
+int local_cmp_i(volatile int *p,int expected,int value){__atomic_compare_exchange_n(p,&expected,value,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED);return expected;}
+int global_cmp_i(volatile int *p,int expected,int value){__atomic_compare_exchange_n(p,&expected,value,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED);return expected;}
+
 
 extern "C" {
 void gaussian_axis(void*,void*,void*,int,int,int,int);
@@ -134,7 +154,50 @@ void gaussian_small_fused(void*,void*,void*,int,int,int,void*,void*,void*);
 void gaussian_local(void*,void*,void*,void*,int,int,int,int,void*,void*);
 void linear_up4_local(void*,void*,void*,int,int,int,int,int);
 void sharpen_only(void*,void*,void*,void*,int,int,int,float,void*,void*,void*,void*,void*);
+void rg_target(void*,void*,void*,void*,int,int,int,int,int,int,int,float,float,int,int);
+void rg_canvas(void*,void*,void*,void*,void*,void*,int,int,int,int,int,int,int);
+void rg_masks(void*,void*,void*,void*,void*,void*,void*,void*,void*);
+void rg_cc_init(void*,void*,void*,int,void*);
+void rg_cc_link(void*,void*,int,int,void*);
+void rg_cc_stats(void*,void*,void*,int,int,void*,void*);
+void rg_cc_filter(void*,void*,void*,void*,int,int,int,int,void*);
+void rg_peak_top(void*,void*,void*,void*,int,int,void*,void*);
+void rg_peak_select(void*,void*,void*,void*,void*,void*,int,void*);
+void rg_peak_prepare(void*,void*,void*,void*,void*,int);
+void rg_peak_order(void*,void*,void*,void*);
+void rg_rotate_bgr(void*,void*,int);
+void rg_white_open2(void*,void*,void*);
+void rg_hough_vote(void*,void*,void*,void*,void*,int,int,void*);
+void rg_runs(void*,void*,void*,void*,void*,void*,int,int,int,int,void*);
+void rg_fit(void*,void*,void*,void*,void*,int,int,void*);
+void rg_rank(void*,void*,int,int,int,void*,void*);
+void rg_rank_tiles(void*,void*,void*,int,int,void*,void*,void*);
+void rg_rank_merge(void*,void*,void*,void*,int,int);
+void rg_rank_gather(void*,void*,void*,int);
+void rg_test_peak_suppression(void*,void*,void*,int);
+void morph3_fused(void*,void*,int,int,int,int,void*,void*);
+void rg_cc_tile(void*,void*,void*,int,int,void*,void*);
+void rg_cc_boundary(void*,void*,int,int,void*);
+void rg_cc_stats_hash(void*,void*,void*,int,int,void*,void*);
+void rg_peak_top_tiled(void*,void*,void*,void*,int,int,void*,void*);
+void rg_clear(void*,int);
+void rg_merge(void*,void*,void*,int,void*);
+void rg_line_validate(void*,void*,void*,void*,void*,void*,int,void*,void*);
+void rg_pairs(void*,int);
+void rg_complete(void*,void*,void*,void*,void*,void*,void*,int);
+void rg_joints(void*,void*,void*);
+void rg_partial(void*,void*,void*,void*,void*,int);
+void rg_gray_down(void*,void*,int,int);
+void rg_corners(void*,void*,void*,void*,void*,void*);
+void rg_feature_rank(void*,void*,int);
+void rg_lk(void*,void*,void*,void*,void*,void*,void*,void*,void*,void*,void*);
+void rg_ransac(void*,void*,void*,void*);
+void rg_motion(void*,void*,void*,void*,void*,void*,void*,int,void*,void*);
+void rg_track_validate(void*,void*,void*,void*);
+void rg_select(void*,void*,void*,void*,int,void*,void*);
+void rg_pose(void*,void*,void*,float,int,int,int);
 }
+// Resident pipeline declarations are generated from its kernel signatures.
 struct Arg {void *pointer;int integer;float real;};
 #define P(i) args[i].pointer
 #define I(i) args[i].integer
@@ -198,6 +261,48 @@ void invoke(int kernel,Arg *args) {
     case 54:gaussian_local(P(0),P(1),P(2),P(3),I(4),I(5),I(6),I(7),P(8),P(9));break;
     case 55:linear_up4_local(P(0),P(1),P(2),I(3),I(4),I(5),I(6),I(7));break;
     case 56:sharpen_only(P(0),P(1),P(2),P(3),I(4),I(5),I(6),F(7),P(8),P(9),P(10),P(11),P(12));break;
+    case 57:rg_target(P(0),P(1),P(2),P(3),I(4),I(5),I(6),I(7),I(8),I(9),I(10),F(11),F(12),I(13),I(14));break;
+    case 58:rg_canvas(P(0),P(1),P(2),P(3),P(4),P(5),I(6),I(7),I(8),I(9),I(10),I(11),I(12));break;
+    case 59:rg_masks(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(8));break;
+    case 60:rg_cc_init(P(0),P(1),P(2),I(3),P(4));break;
+    case 61:rg_cc_link(P(0),P(1),I(2),I(3),P(4));break;
+    case 62:rg_cc_stats(P(0),P(1),P(2),I(3),I(4),P(5),P(6));break;
+    case 63:rg_cc_filter(P(0),P(1),P(2),P(3),I(4),I(5),I(6),I(7),P(8));break;
+    case 64:rg_peak_top(P(0),P(1),P(2),P(3),I(4),I(5),P(6),P(7));break;
+    case 65:rg_peak_select(P(0),P(1),P(2),P(3),P(4),P(5),I(6),P(7));break;
+    case 66:rg_hough_vote(P(0),P(1),P(2),P(3),P(4),I(5),I(6),P(7));break;
+    case 67:rg_runs(P(0),P(1),P(2),P(3),P(4),P(5),I(6),I(7),I(8),I(9),P(10));break;
+    case 68:rg_fit(P(0),P(1),P(2),P(3),P(4),I(5),I(6),P(7));break;
+    case 69:rg_rank(P(0),P(1),I(2),I(3),I(4),P(5),P(6));break;
+    case 70:rg_clear(P(0),I(1));break;
+    case 71:rg_merge(P(0),P(1),P(2),I(3),P(4));break;
+    case 72:rg_line_validate(P(0),P(1),P(2),P(3),P(4),P(5),I(6),P(7),P(8));break;
+    case 73:rg_pairs(P(0),I(1));break;
+    case 74:rg_complete(P(0),P(1),P(2),P(3),P(4),P(5),P(6),I(7));break;
+    case 75:rg_joints(P(0),P(1),P(2));break;
+    case 76:rg_partial(P(0),P(1),P(2),P(3),P(4),I(5));break;
+    case 77:rg_gray_down(P(0),P(1),I(2),I(3));break;
+    case 78:rg_corners(P(0),P(1),P(2),P(3),P(4),P(5));break;
+    case 79:rg_feature_rank(P(0),P(1),I(2));break;
+    case 80:rg_lk(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(8),P(9),P(10));break;
+    case 81:rg_ransac(P(0),P(1),P(2),P(3));break;
+    case 82:rg_motion(P(0),P(1),P(2),P(3),P(4),P(5),P(6),I(7),P(8),P(9));break;
+    case 83:rg_track_validate(P(0),P(1),P(2),P(3));break;
+    case 84:rg_select(P(0),P(1),P(2),P(3),I(4),P(5),P(6));break;
+    case 85:rg_pose(P(0),P(1),P(2),F(3),I(4),I(5),I(6));break;
+    case 86:rg_rotate_bgr(P(0),P(1),I(2));break;
+    case 87:rg_white_open2(P(0),P(1),P(2));break;
+    case 88:rg_peak_prepare(P(0),P(1),P(2),P(3),P(4),I(5));break;
+    case 89:rg_peak_order(P(0),P(1),P(2),P(3));break;
+    case 90:rg_rank_tiles(P(0),P(1),P(2),I(3),I(4),P(5),P(6),P(7));break;
+    case 91:rg_rank_merge(P(0),P(1),P(2),P(3),I(4),I(5));break;
+    case 92:rg_rank_gather(P(0),P(1),P(2),I(3));break;
+    case 93:rg_test_peak_suppression(P(0),P(1),P(2),I(3));break;
+    case 94:morph3_fused(P(0),P(1),I(2),I(3),I(4),I(5),P(6),P(7));break;
+    case 95:rg_cc_tile(P(0),P(1),P(2),I(3),I(4),P(5),P(6));break;
+    case 96:rg_cc_boundary(P(0),P(1),I(2),I(3),P(4));break;
+    case 97:rg_cc_stats_hash(P(0),P(1),P(2),I(3),I(4),P(5),P(6));break;
+    case 98:rg_peak_top_tiled(P(0),P(1),P(2),P(3),I(4),I(5),P(6),P(7));break;
     }
 }
 extern "C" int launch(const char *name,size_t size,size_t local,Arg *args) {
@@ -206,9 +311,9 @@ extern "C" int launch(const char *name,size_t size,size_t local,Arg *args) {
         "compact_foreground","hough_vote","hough_peaks","hough_runs","fit_sections","fit_moments","fit_statistics","hough_select","gaussian_tiled","hough_select_parallel","area_down4","linear_up4","bgr_hsv","median_parameters","contrast_device","sharpen_bgr","trim_probe","trim_morph","trim_extract","side_support","compact_foreground_fast","hough_runs_fast","trim_sections","trim_extract_fast","hough_vote_compacted","hough_peaks_compacted",
         "search_merge","search_probe","search_runs","search_contrast","search_quads","search_accept",
         "search_partial_joints","search_partial_color","search_side_support",
-        "resident_copy","resident_roi","resident_restrict","resident_and","resident_canvas","bgr_color","track_occupancy","gaussian_small_fused","gaussian_local","linear_up4_local","sharpen_only"};
+        "resident_copy","resident_roi","resident_restrict","resident_and","resident_canvas","bgr_color","track_occupancy","gaussian_small_fused","gaussian_local","linear_up4_local","sharpen_only","rg_target","rg_canvas","rg_masks","rg_cc_init","rg_cc_link","rg_cc_stats","rg_cc_filter","rg_peak_top","rg_peak_select","rg_hough_vote","rg_runs","rg_fit","rg_rank","rg_clear","rg_merge","rg_line_validate","rg_pairs","rg_complete","rg_joints","rg_partial","rg_gray_down","rg_corners","rg_feature_rank","rg_lk","rg_ransac","rg_motion","rg_track_validate","rg_select","rg_pose","rg_rotate_bgr","rg_white_open2","rg_peak_prepare","rg_peak_order","rg_rank_tiles","rg_rank_merge","rg_rank_gather","rg_test_peak_suppression","morph3_fused","rg_cc_tile","rg_cc_boundary","rg_cc_stats_hash","rg_peak_top_tiled"};
     int kernel=-1;
-    for(int i=0;i<57;++i)if(std::strcmp(names[i],name)==0){kernel=i;break;}
+    for(size_t i=0;i<sizeof(names)/sizeof(names[0]);++i)if(std::strcmp(names[i],name)==0){kernel=(int)i;break;}
     if(kernel<0)return -1;
     if(!local) {
         for(size_t i=0;i<size;++i){global_id=i;invoke(kernel,args);}

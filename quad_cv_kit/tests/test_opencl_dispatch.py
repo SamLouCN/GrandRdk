@@ -42,6 +42,7 @@ class DispatchTests(unittest.TestCase):
     def test_completed_commands_collect_events_without_another_queue_finish(self):
         rt = self.runtime()
         rt.events = [('probe', C.c_void_p(123))]
+        rt.event_stages = {123: 'motion'}
         def profile(event, key, size, output, unused):
             C.cast(output, C.POINTER(C.c_uint64)).contents.value = 100 if key == 0x1282 else 1100100
             return 0
@@ -49,4 +50,6 @@ class DispatchTests(unittest.TestCase):
         rt.finish()
         rt.lib.clFinish.assert_not_called()
         self.assertEqual(rt.kernel_ms, {'probe': 1.1})
+        self.assertEqual(rt.stage_kernel_ms, {'motion': 1.1})
+        self.assertEqual(rt.event_stages, {})
         rt.lib.clReleaseEvent.assert_called_once()

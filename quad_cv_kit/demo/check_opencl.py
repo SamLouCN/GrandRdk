@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.opencl_backend import create_backend
 from src.opencl_validation import validate_backend, benchmark_cv, benchmark_search
+from src.resident_validation import check_resident, benchmark_resident
 
 
 def main(argv=None):
@@ -17,11 +18,14 @@ def main(argv=None):
                         help='After validation, time full CV with GPU/CPU Hough; recommend 12 or more')
     parser.add_argument('--benchmark-search-frames', type=int, default=0,
                         help='Compare previous CPU search stages with batched GPU search on identical input')
+    parser.add_argument('--resident-only', action='store_true', help='Validate the resident GPU core only')
+    parser.add_argument('--benchmark-resident-frames', type=int, default=0,
+                        help='Measure resident search/track and per-stage GPU event durations after six warmup frames')
     parser.add_argument('--opencv-threads', type=int, default=3)
     parser.add_argument('--cv-blur', choices=('pyramid', 'exact'), default='pyramid')
     parser.add_argument('--cv-quality', choices=('fast', 'precise'), default='fast')
     args = parser.parse_args(argv)
-    if args.benchmark_frames < 0 or args.benchmark_search_frames < 0 or args.opencv_threads < 1:
+    if min(args.benchmark_frames, args.benchmark_search_frames, args.benchmark_resident_frames) < 0 or args.opencv_threads < 1:
         parser.error('benchmark-frames must be nonnegative and opencv-threads positive')
     import cv2
     cv2.setNumThreads(args.opencv_threads)
@@ -36,7 +40,14 @@ def main(argv=None):
             result['checks'].append(item)
             print(json.dumps(item, ensure_ascii=False), flush=True)
 
-        validate_backend(backend, report)
+        if args.resident_only:
+            report(check_resident(backend))
+        else:
+            validate_backend(backend, report)
+            report(check_resident(backend))
+        if args.benchmark_resident_frames:
+            result['resident_benchmark'] = benchmark_resident(backend, args.benchmark_resident_frames,
+                report=lambda item: print(json.dumps(item, ensure_ascii=False), flush=True))
         if args.benchmark_frames:
             result['benchmark'] = benchmark_cv(backend, frames=args.benchmark_frames,
                 report=lambda item: print(json.dumps(item, ensure_ascii=False), flush=True))

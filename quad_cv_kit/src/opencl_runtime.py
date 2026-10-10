@@ -223,6 +223,11 @@ class OpenCLRuntime:
         self.check(self.lib.clEnqueueNDRangeKernel(self.queue, kernel, 1, None, sizes, group,
                     0, None, C.byref(event)), f'launch {name}')
         self.events.append((name, event))
+        stage = getattr(self, 'current_stage', None)
+        if stage is not None:
+            if not hasattr(self, 'event_stages'):
+                self.event_stages = {}
+            self.event_stages[event.value] = stage
         self._pending_commands = True
         self.kernel_launch_calls += 1
 
@@ -269,13 +274,20 @@ class OpenCLRuntime:
                 self.check(self.lib.clGetEventProfilingInfo(event, 0x1282, 8, C.byref(start), None), 'profile start')
                 self.check(self.lib.clGetEventProfilingInfo(event, 0x1283, 8, C.byref(end), None), 'profile end')
                 self.kernel_ms[name] = self.kernel_ms.get(name, 0.)+(end.value-start.value)/1e6
+                stage = getattr(self, 'event_stages', {}).pop(event.value, None)
+                if stage is not None:
+                    if not hasattr(self, 'stage_kernel_ms'):
+                        self.stage_kernel_ms = {}
+                    self.stage_kernel_ms[stage] = self.stage_kernel_ms.get(stage, 0.)+(end.value-start.value)/1e6
         finally:
             for _, event in pending:
+                getattr(self, 'event_stages', {}).pop(event.value, None)
                 self.lib.clReleaseEvent(event)
             self.profiling_cpu_ms = getattr(self, 'profiling_cpu_ms', 0.)+(time.thread_time()-started_cpu)*1000
 
     def reset_stats(self):
         self.kernel_ms = {}
+        self.stage_kernel_ms = {}
         self.upload_bytes = self.download_bytes = 0
         self.transfer_bytes, self.transfer_calls = {}, {}
         self.finish_calls = self.read_wait_calls = 0

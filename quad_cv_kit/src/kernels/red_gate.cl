@@ -531,7 +531,7 @@ __kernel void hough_runs(__global const uchar *mask, __global const int4 *peaks,
 // One cooperative work group per bounded peak. Clip the line to the image,
 // sample every 2px in parallel, then extract runs from cheap local hit flags.
 // There is no global greedy-consumption dependency between candidates.
-__kernel void hough_runs_fast(__global const uchar *mask,__global const int4 *peaks,
+static inline void hough_runs_fast_impl(__global const uchar *mask,__global const int4 *peaks,
     __global const float2 *angles,__global float4 *segments,__global int *run_counts,
     int w,int h,int npeaks,int radius,int maxruns,int min_length,int max_gap,
     int stride,__local int *hits) {
@@ -567,6 +567,14 @@ __kernel void hough_runs_fast(__global const uchar *mask,__global const int4 *pe
         }
         run_counts[i]=runs;
     }
+}
+
+__kernel void hough_runs_fast(__global const uchar *mask,__global const int4 *peaks,
+    __global const float2 *angles,__global float4 *segments,__global int *run_counts,
+    int w,int h,int npeaks,int radius,int maxruns,int min_length,int max_gap,
+    int stride,__local int *hits) {
+    hough_runs_fast_impl(mask,peaks,angles,segments,run_counts,w,h,npeaks,radius,
+                         maxruns,min_length,max_gap,stride,hits);
 }
 
 // Greedy support consumption in descending peak-vote order, as in the CPU

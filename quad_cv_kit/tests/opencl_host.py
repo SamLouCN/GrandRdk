@@ -29,7 +29,8 @@ class HostRuntime:
         kernel_dir = Path(__file__).resolve().parents[1]/'src'/'kernels'
         kernels = output/'kernels.cl'
         kernels.write_text('\n'.join((kernel_dir/name).read_text()
-                                     for name in ('red_gate.cl', 'search.cl', 'residency.cl', 'color.cl', 'sharpen.cl')))
+                                     for name in ('red_gate.cl', 'search.cl', 'residency.cl', 'color.cl', 'sharpen.cl', 'resident_pipeline.cl'))
+                           +'\n'+Path(__file__).with_name('resident_reference.cl').read_text())
         subprocess.run(['clang', '-x', 'cl', '-D__kernel=', '-cl-std=CL1.2', '-O2',
                         '-c', str(kernels), '-o', str(output/'kernels.o')], check=True, capture_output=True)
         subprocess.run(['clang++', '-std=c++11', '-O2', '-shared', '-fPIC', '-pthread',
@@ -48,6 +49,7 @@ class HostRuntime:
 
     def reset_stats(self):
         self.kernel_ms = {}
+        self.stage_kernel_ms = {}
         self.upload_bytes = self.download_bytes = 0
         self.transfer_bytes, self.transfer_calls = {}, {}
         self._buffer_names = getattr(self, '_buffer_names', {})
@@ -99,7 +101,11 @@ class HostRuntime:
         code = self.lib.launch(name.encode(), size, local or 0, values)
         if code:
             raise RuntimeError(f'Unknown host kernel: {name}')
-        self.kernel_ms[name] = self.kernel_ms.get(name, 0.)+(time.perf_counter()-started)*1000
+        elapsed = (time.perf_counter()-started)*1000
+        self.kernel_ms[name] = self.kernel_ms.get(name, 0.)+elapsed
+        stage = getattr(self, 'current_stage', None)
+        if stage is not None:
+            self.stage_kernel_ms[stage] = self.stage_kernel_ms.get(stage, 0.)+elapsed
 
     def read_many(self, requests):
         return [self.read(buf, shape, dtype) for buf, shape, dtype in requests]

@@ -74,6 +74,18 @@ class GPUResidencyMixin:
         result = self.runtime.read(buffer, shape, dtype)
         return self.register_resident(result, buffer)
 
+    def device_descriptor(self, buffer, shape, dtype):
+        """Shape-only reference for an explicitly resident consumer.
+
+        Pixels are not available on this host array. Its read-only broadcast
+        storage is never uploaded; device_input resolves the resident buffer.
+        The caller must keep frame_batch alive until the consumer finishes.
+        """
+        if getattr(self, '_resident_frame', None) is None:
+            raise ValueError('Device-only references require frame_batch')
+        result = np.broadcast_to(np.zeros((), dtype), shape)
+        return self.register_resident(result, buffer, preserve=False)
+
     def hsv_device(self, frame, name, source=None):
         rt = self.runtime
         if self.hsv_tables is None:

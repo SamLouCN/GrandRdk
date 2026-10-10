@@ -76,10 +76,19 @@ class YoloRedGateTracker:
     def __init__(self, detector, fps=30, detect_every=3, hold_seconds=.2,
                  valid_mask=None, roi_padding=.08, cv_contrast=1.2,
                  cv_clahe_clip=2.0, cv_clahe_blend=.6,
-                 cv_sharpen=.6, cv_saturation=1.25, profile_cv=False, cv_backend=None, adaptive_search=True):
+                 cv_sharpen=.6, cv_saturation=1.25, profile_cv=False, cv_backend=None, adaptive_search=True,
+                 cv_execution='hybrid'):
         self.detector = detector
+        self.cv_execution = cv_execution
+        if cv_execution not in ('hybrid', 'resident'):
+            raise ValueError('CV execution must be hybrid or resident')
+        if cv_execution == 'resident' and cv_backend is None:
+            raise ValueError('Resident CV requires an explicit OpenCL backend')
         self.cv = RedGateTracker(fps, detect_every, hold_seconds, profile=profile_cv, backend=cv_backend,
                                  adaptive_search=adaptive_search)
+        if cv_execution == 'resident':
+            from .gpu_pipeline import ResidentGatePipeline
+            self.cv = ResidentGatePipeline(cv_backend, fps, detect_every, hold_seconds, roi_padding)
         self.cv_backend = cv_backend
         self.valid_mask = valid_mask
         self.roi_padding = roi_padding
@@ -89,7 +98,7 @@ class YoloRedGateTracker:
         self.cv_sharpen = cv_sharpen
         self.cv_saturation = cv_saturation
         self.last_cv_frame = None
-        self.hold_frames = self.cv.hold_frames
+        self.hold_frames = int(round(fps*hold_seconds))
         self.target = None
         self.last_yolo = None
         self.index = 0
@@ -113,6 +122,15 @@ class YoloRedGateTracker:
 
     def update(self, frame, *, yolo_frame=None, cv_frame=None):
         """Keep clean color evidence while optionally supplying enhanced inputs."""
+        if self.cv_execution == 'resident':
+            enhanced = frame if cv_frame is None else cv_frame
+            inputs = self.detector.detect_boxes(frame if yolo_frame is None else yolo_frame)
+            with self.cv_backend.frame_batch():
+                selected, lines = self.cv.update(frame, enhanced, inputs, self.detector.target_ids, self.valid_mask)
+            self.last_status = self.cv.last_status
+            self.last_cv_frame = enhanced
+            self.index += 1
+            return selected, lines
         boxes = self._boxes(frame if yolo_frame is None else yolo_frame)
         proposal = boxes[0] if boxes else None
         reason = 'largest-yolo-area' if proposal else 'yolo-gap'

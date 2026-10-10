@@ -213,24 +213,19 @@ def check_preprocess(backend):
     fixed, enhanced, _, _ = backend.preprocess(frame, valid, maps=maps)
     m1, m2 = cv2.convertMaps(*maps, cv2.CV_16SC2)
     np.testing.assert_array_equal(fixed, cv2.remap(frame, m1, m2, cv2.INTER_LINEAR))
-    expected = sharpen_frame(fixed, .6, valid)
-    pixel_error = int(np.max(np.abs(enhanced.astype(int)-expected.astype(int))))
-    if pixel_error > 2:
-        raise AssertionError(f'GPU preprocessing pixel error {pixel_error}>2')
-    np.testing.assert_array_equal(enhanced[~valid], fixed[~valid])
-    # Warming maps, tables and weights must remove those uploads from steady
-    # frames; corrected BGR pixels must not be re-uploaded for enhancement.
+    np.testing.assert_array_equal(enhanced, fixed)
+    # Immutable maps remain cached; no corrected-image reupload is permitted.
     backend.reset_stats()
-    backend.preprocess(frame, valid, maps=maps)
+    _, output, _, enhancement_ms = backend.preprocess(frame, valid, maps=maps)
+    np.testing.assert_array_equal(output, fixed)
     if backend.runtime.upload_bytes != frame.nbytes:
-        raise AssertionError('Resident preprocessing redundantly uploaded maps, valid mask or corrected frame')
-    forbidden = ('bgr_hsv', 'histogram_value', 'median_parameters', 'contrast_device', 'sharpen_bgr')
-    if any(name in backend.runtime.kernel_ms for name in forbidden):
-        raise AssertionError('Sharpen-only preprocessing ran a contrast/HSV stage')
-    if 'sharpen_only' not in backend.runtime.kernel_ms:
-        raise AssertionError('Fused sharpening kernel did not run')
-    return dict(max_pixel_error=pixel_error, steady_upload_bytes=backend.runtime.upload_bytes,
-                corrected_frame_reupload=False)
+        raise AssertionError('Preprocessing redundantly uploaded maps or corrected frame')
+    forbidden = ('bgr_hsv', 'histogram_value', 'median_parameters', 'contrast_device',
+                 'sharpen_bgr', 'sharpen_only')
+    if any(name in backend.runtime.kernel_ms for name in forbidden) or enhancement_ms != 0:
+        raise AssertionError('Correction-only preprocessing ran an enhancement stage')
+    return dict(max_pixel_error=0, steady_upload_bytes=backend.runtime.upload_bytes,
+                corrected_frame_reupload=False, enhancement_mode='none')
 
 
 def check_sharpen_only(backend):

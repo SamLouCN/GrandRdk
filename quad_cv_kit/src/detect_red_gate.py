@@ -845,6 +845,8 @@ class RedGateTracker:
 
     def _update(self, frame, search_bbox=None, anchor_bbox=None, allow_detect=True,
                 prefer_previous_width=False, reference_frame=None, valid_mask=None):
+        if self.backend is not None:
+            self.backend._resident_core_active = False
         profile = CvFrameProfile(self.profile_enabled)
         small, ratio, offset = prepare_detection_frame(frame, self.backend)
         reference = prepare_detection_frame(reference_frame, self.backend)[0] if reference_frame is not None else small
@@ -965,7 +967,9 @@ def original_geometry(frame, candidate):
     """Return serializable geometry in source-image pixels, including padding offset."""
     if candidate is None:
         return None
-    _, ratio, offset = prepare_detection_frame(frame)
+    height, width = frame.shape[:2]
+    ratio = min(640/width, 360/height)
+    offset = np.array([(640-round(width*ratio))//2, (360-round(height*ratio))//2], float)
     segments = [(np.asarray(s)-offset)/ratio for s in candidate['segments']]
     points = np.concatenate(segments)
     low, high = points.min(axis=0), points.max(axis=0)
