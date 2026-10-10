@@ -80,6 +80,22 @@ class PassDoorV2(Stage):
         """当前门显示名（1-based）。"""
         return '门%d' % (self.gate + 1)
 
+    def _poll_gate(self, gst, now):
+        """取本拍的门观测（**同一拍内只真正 poll 一次**，结果缓存复用）。
+
+        为什么必须缓存：`obs.VisionIF.poll` 带**同一帧去重**（同一 frame 号第二次调用返回
+        None）。如果 sub=0 的"是否已识别到门"判断先 poll 一次，紧接着 sub=1 的对中再 poll
+        就会拿到 None，被误判成"没看到门"→ 走找门分支。缓存把同一拍的两个消费者对齐。
+        """
+        if gst.get('_obs_t') == now:
+            return gst.get('_obs')
+        cam = str(getattr(TC, 'AUV_PASS_DOOR_V2_CAM', 'front'))
+        want = str(getattr(TC, 'AUV_PASS_DOOR_V2_WANT', 'gate'))
+        o = self.ctx.vision.poll(cam, want, now)
+        gst['_obs_t'] = now
+        gst['_obs'] = o
+        return o
+
     # ---------------- Stage 契约（enter / step） ----------------
     def enter(self, now):
         self.gates = list(getattr(TC, 'AUV_PASS_DOOR_V2_GATES', []))
@@ -170,8 +186,26 @@ class PassDoorV2(Stage):
                 return cmd
             gst['turned'] = True
             self.log('%s 转向完成：%+.0f° → %.1f°，开始定深 %.0fcm(离底)' % (self._gname(), turn_deg, tgt, height))
-        return t_function.dive_step(self.ctx, gst.setdefault('dive', {}), now, dt,
-                                    target_height_cm=height, stage=self.NAME)
+        # ---- sub=0 后半：定深到本门高度 ----
+        d = t_function.dive_step(self.ctx, gst.setdefault('dive', {}), now, dt,
+                                 target_height_cm=height, stage=self.NAME)
+        if d is None:                                     # 定深到位 → 正常进 sub=1
+            return None
+        # [2026-10-10] ★「看到门就允许对中」：定深判据依赖融合深度（depth_kalman / 池深标定），
+        #   它一旦不可用就**永不完成**（设计上无兜底）—— 此时哪怕门就在正前方，也永远轮不到
+        #   "横移对中"，现场表现就是"YOLO 已经识别到门了，却不进对准逻辑"。
+        #   故：转向已到位 + 已识别到门 + ALIGN_EARLY → 立刻转 sub=1；定深不中断，
+        #   对中/前冲每拍仍会下发定深目标（_align/_pass 里的 _depth_out）。
+        if bool(getattr(TC, 'AUV_PASS_DOOR_V2_ALIGN_EARLY', True)):
+            o = self._poll_gate(gst, now)                  # 与 _align 共用同一拍观测（见 _poll_gate）
+            if o is not None:
+                gst['_align_early'] = True
+                self.log('%s 已识别到门(cx=%.0f) → 提前进入横移对中（定深目标继续下发，不等定深到位）'
+                         % (self._gname(), float(o['cx'])))
+                return None                                # 完成 sub=0 → 同拍进 sub=1
+            self._say(gst, '%s 转向已到位：尚未识别到门 → 继续定深（或 ALIGN_EARLY 关时等定深到位）'
+                           % self._gname())
+        return d
 
     #=====门循环 sub=1：横移对中 ==============
     def _align(self, gst, cfg):
@@ -186,8 +220,6 @@ class PassDoorV2(Stage):
         """
         now = self._now
         height = float(cfg['height'])
-        cam = str(getattr(TC, 'AUV_PASS_DOOR_V2_CAM', 'front'))
-        want = str(getattr(TC, 'AUV_PASS_DOOR_V2_WANT', 'gate'))
         kp = float(getattr(TC, 'AUV_PASS_DOOR_V2_SWAY_KP', 1.0))
         sway_max = float(getattr(TC, 'AUV_PASS_DOOR_V2_SWAY_THRUST', 0.3))
         sway_min = float(getattr(TC, 'AUV_PASS_DOOR_V2_SWAY_MIN_THRUST', 0.15))
@@ -196,6 +228,11 @@ class PassDoorV2(Stage):
         hold_n = int(getattr(TC, 'AUV_PASS_DOOR_V2_HOLD_N', 10))
         img_w = float(_det_img_w(self.ctx) or getattr(TC, 'AUV_IMG_W', 640.0))
         center = 0.5 * img_w
+        # 状态键兜底（正常路径在下面的锁存块里初始化；这里保证任何入口进来都不 KeyError）
+        gst.setdefault('ok_cnt', 0)
+        gst.setdefault('last_seen', None)
+        gst.setdefault('last_sway', 0.0)
+        gst.setdefault('dir', 1.0 if float(getattr(TC, 'AUV_PASS_DOOR_V2_SWAY_DIR', 1.0)) >= 0 else -1.0)
 
         # 起步：锁存本门对中航向（全程不动，只横移）+ 初始化方向（仅"从未见门"时用）
         if gst.get('yaw_ref') is None:
@@ -212,31 +249,45 @@ class PassDoorV2(Stage):
                      % (self._gname(), gst['yaw_ref'], center, px_tol, hold_n, hyst_px))
 
         lost_s = float(getattr(TC, 'AUV_PASS_DOOR_V2_LOST_S', 0.5))
-        o = self.ctx.vision.poll(cam, want, now)
+        o = self._poll_gate(gst, now)                      # 同一拍复用 sub=0 的观测
         if o is None:                                     # 无新有效目标帧
             if gst.get('last_seen') is None:               # 从未见过门：按初始方向找门
                 note = '%s 未见门：按 %s 方向横移找门 (sway=%.2f)' % (
                     self._gname(), '右' if gst['dir'] > 0 else '左', gst['dir'] * sway_max)
-            else:
-                lost = now - gst['last_seen']
-                gst['ok_cnt'] = 0                          # 长时间无帧：对中计数清零
-                if lost <= lost_s:                         # 短暂丢帧：保持上一拍输出，等下一有效帧修复
-                    keep = float(gst.get('last_sway') or 0.0)
-                    note = '%s 丢帧保持 %.2fs sway=%+.2f' % (self._gname(), lost, keep)
-                    self._say(gst, note)
-                    return t_function._cmd(self.NAME, note, gst['yaw_ref'],
-                                           t_function._depth_out(gst, height), sway=keep)
-                note = '%s 丢门 %.1fs：按最后方向 %s 继续找门 (sway=%.2f)' % (
-                    self._gname(), lost, '右' if gst['dir'] > 0 else '左', gst['dir'] * sway_max)
+                self._say(gst, note)
+                return t_function._cmd(self.NAME, note, gst['yaw_ref'],
+                                       t_function._depth_out(gst, height), sway=gst['dir'] * sway_max)
+            lost = now - gst['last_seen']
+            if lost <= lost_s:
+                # 短暂丢帧（**含 VisionIF 同一帧去重造成的隔拍 None**）：保持上一拍输出，
+                #   ★ ok_cnt 绝不清零 —— 判到位要的是"连续 N 个新检测帧"，清零会让
+                #   对中永远攒不满 hold_n（2026-10-10 修：原来清零写在这条分支之前）。
+                keep = float(gst.get('last_sway') or 0.0)
+                note = '%s 丢帧保持 %.2fs sway=%+.2f' % (self._gname(), lost, keep)
+                self._say(gst, note)
+                return t_function._cmd(self.NAME, note, gst['yaw_ref'],
+                                       t_function._depth_out(gst, height), sway=keep)
+            gst['ok_cnt'] = 0                              # 真丢门（>LOST_S）才清零计数器
+            note = '%s 丢门 %.1fs：按最后方向 %s 继续找门 (sway=%.2f)' % (
+                self._gname(), lost, '右' if gst['dir'] > 0 else '左', gst['dir'] * sway_max)
             self._say(gst, note)
             return t_function._cmd(self.NAME, note, gst['yaw_ref'],
                                    t_function._depth_out(gst, height), sway=gst['dir'] * sway_max)
 
         gst['last_seen'] = now                             # 见门：刷新丢门计时
+        # 口径校正：obs 按相机分别给出本帧的画面宽（见 obs.VisionIF：优先读写端发布的
+        #   img_w/img_h，回落该相机配置）→ 有就用它，前/下摄不同分辨率也不会算错中心。
+        try:
+            _w = float(o.get('img_w'))
+            if _w > 0:
+                img_w, center = _w, 0.5 * _w
+        except (TypeError, ValueError):
+            pass
         cx = float(o['cx'])
         ex = cx - center                                   # 正 = 门在画面右侧
         # ---- 方向锁 + 换向滞回：只有误差翻到另一侧且越过 (容差+滞回) 才允许换向（防抖）----
         want_dir = 1.0 if ex > 0 else -1.0
+        gst.setdefault('dir', 1.0 if float(getattr(TC, 'AUV_PASS_DOOR_V2_SWAY_DIR', 1.0)) >= 0 else -1.0)
         if want_dir != gst['dir'] and abs(ex) > (px_tol + hyst_px):
             gst['dir'] = want_dir
             self._say(gst, '%s 换向→%s（ex=%+.0fpx 越过容差+滞回 %.0fpx）'

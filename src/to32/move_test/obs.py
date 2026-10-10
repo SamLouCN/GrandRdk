@@ -131,7 +131,6 @@ class VisionIF(object):
         except Exception:
             cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
 
-<<<<<<< HEAD
         img_w, img_h = self.sizes[cam]
         # New writers publish actual dimensions; legacy files use per-camera
         # defaults so lowering front resolution never rescales bottom output.
@@ -146,16 +145,15 @@ class VisionIF(object):
                 img_w = value
             else:
                 img_h = value
-=======
-        # [2026-10-10] 坐标系自检：检测框超出配置的画面宽 ⇒ AUV_IMG_W 与检测坐标系不符
-        #   （典型：相机采集 1280，而模型/写端给的是 640 空间）。只提示一次，不阻断。
-        #   该错配会让"中心"算成 640 而实际中心 320 → ex 恒单侧 → 对中永远对不正。
-        if self.w > 0 and (cx > self.w or x2 > self.w + self.margin):
+        # [2026-10-10] 坐标系自检：框超出**本相机**的画面宽 ⇒ 配置口径与检测坐标系不符
+        #   （典型：相机采集/写端给的是 1280 而配置写 640，或反之）。只提示一次，不阻断。
+        #   该错配会让"中心"取错 → ex 恒单侧 → 对中永远对不正。
+        if img_w > 0 and (cx > img_w or x2 > img_w + self.margin):
             self._warn('coord_%s' % cam,
-                       '检测框 x=%.0f/右边界=%.0f 超出配置画面宽 %.0f —— AUV_IMG_W 与'
-                       '检测坐标系不符？（改 task_config.AUV_IMG_W）' % (cx, x2, self.w))
-
->>>>>>> 9c99bbf (door适应性修改)
+                       '检测框 x=%.0f/右边界=%.0f 超出 %s 配置画面宽 %.0f —— 检测坐标系与'
+                       '配置口径不符？（查 %s 的 img_w/img_h 与 AUV_%sIMG_W）'
+                       % (cx, x2, cam, img_w, fname,
+                          'BOTTOM_' if cam == 'bottom' else ''))
         if aim is None:
             aim = (0.5 * img_w, 0.5 * img_h)
         dx, dy = cx - float(aim[0]), cy - float(aim[1])

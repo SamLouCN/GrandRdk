@@ -16,23 +16,17 @@ AUV_DET_FRONT = 'momo_det_front.json'          # 前视检测（front.py 写）
 AUV_DET_BOTTOM = 'momo_det_bottom.json'        # 下视检测（bottom.py 写）
 AUV_DET_STALE_S = 0.5                          # 检测 JSON 超期秒数，超期按无目标
 AUV_MIN_SCORE = 0.5                            # 检测置信度门槛
-<<<<<<< HEAD
 AUV_IMG_W = 640.0                             # 前摄画面宽（归一化偏差 ex 的分母）
 AUV_IMG_H = 480.0                             # 前摄画面高
 AUV_BOTTOM_IMG_W = 1280.0                     # 下摄仍为 1280×720，独立归一化
 AUV_BOTTOM_IMG_H = 720.0
-=======
-AUV_IMG_W = 640.0                              # ★ 检测框所在画面宽（**检测坐标空间**，非相机采集分辨率）
-                                               #   2026-10-10 改：原写 1280（相机采集宽），但检测框实际在
-                                               #   640×480 空间 —— 全项目其它地方都按 (320,240) 是画面中心：
-                                               #   config/auv_config.AUV_AIM_*=(320,240)、main_config.mark_point
-                                               #   =[320,240]、viskf_config.VISKF_X0_PX=320、web/index.html 的
-                                               #   `cx-320`、捡球方案文档 `dx=cx-320`。
-                                               #   用 1280 算出的中心是 640 → ex=cx-640 恒为负 → 过门横移
-                                               #   只会朝一个方向推、永远对不正（且归一化分母错一倍）。
-                                               #   ★ 若现场实测 det JSON 的 bbox x 上限是 1280，把这里改回 1280。
-AUV_IMG_H = 480.0                              # 画面高（同上，中心 y = 240）
->>>>>>> 9c99bbf (door适应性修改)
+# ★ 2026-10-10 口径说明（前摄为什么必须是 640×480）：
+#   ① quad_cv_kit/camera_correction_params.json 前摄标定就是 640×480（内参 cx=320,cy=240）；
+#   ② task_door/perception.py 在帧尺寸 ≠ image_width/height 时**直接判观测无效**（PassGate 会看不到门）；
+#   ③ 全项目其它地方也一律按 (320,240) 是画面中心：auv_config.AUV_AIM_*、main_config.mark_point、
+#      viskf_config.VISKF_X0_PX、web/index.html 的 `cx-320`、捡球方案 `dx=cx-320`。
+#   原来前摄配 1280 时：任务侧中心算成 640 → ex=cx-640 **恒为负** → 过门横移只朝一个方向推、永远对不正。
+#   ★ 下摄保持 1280×720（AUV_BOTTOM_IMG_*）：obs.VisionIF 按相机分别取尺寸，前摄降分辨率不影响下摄。
 AUV_CLIP_MARGIN_PX = 4.0                       # 贴边判定余量（px），贴边时 w/h 不可信
 AUV_DEPTH_FILE = 'momo_depth.json'             # 融合深度（depth_kalman 写，20Hz）
 AUV_DEPTH_STALE_S = 1.0                        # 深度 JSON 超期秒数
@@ -165,6 +159,12 @@ AUV_PASS_DOOR_V2_SWAY_KP = 1.0             # ★ 对中比例增益：sway = cla
 AUV_PASS_DOOR_V2_SWAY_MIN_THRUST = 0.15    # 输出幅度保底（避免比例输出过小推不动）
 AUV_PASS_DOOR_V2_SWAY_HYST_PX = 24.0       # ★ 换向滞回带(px)：误差未越过 (容差+滞回) 到另一侧时不换向
                                            #   → 保证"朝一个方向持续横移到对中"，不在中心附近来回抖
+AUV_PASS_DOOR_V2_ALIGN_EARLY = True        # ★ 看到门就允许对中（2026-10-10）：
+                                           #   默认 True = sub=0 转向到位后，**只要已识别到门就立刻进入
+                                           #   sub=1 横移对中**，不必等定深到位（定深目标仍每拍下发，下潜不中断）。
+                                           #   动机：定深判据依赖融合深度（depth_kalman/池深标定），判据不可用时
+                                           #   按"无兜底"口径永不完成 → 门就在正前方也永远轮不到对准。
+                                           #   False = 恢复"先定深到位再对中"的老顺序。
 AUV_PASS_DOOR_V2_LOST_S = 0.5              # 丢帧窗口(s)：见过门后短暂无有效目标帧(≤此值)保持上一帧 sway 输出，
                                            #   用下一有效帧修复；超过此值视为真丢门 → 固定方向横移找门（ok_cnt 清零）
 AUV_PASS_DOOR_V2_PX_TOL = 20.0             # 对准容差(px)：门中心 x 距画面中心 ≤ 此值（口径=AUV_IMG_W 的检测空间）
