@@ -11,7 +11,6 @@ class DoorSimConfig:
     camera_fit: str = 'center-crop'
     correction_enabled: bool = True
     correction_plane_distance_m: object = None
-    sharpen_amount: float = .6
     cv_every_frames: int = 3  # 间隔帧仍按当前图像跟踪/验证；跟踪失败立即重新搜索。
     hold_seconds: float = .2
     roi_padding: float = .08
@@ -24,11 +23,12 @@ class DoorSimConfig:
     cv_hough: str = 'opencl'
     cv_blur: str = 'pyramid'
     cv_quality: str = 'fast'
+    cv_execution: str = 'resident'  # Mali 使用 quad_cv_kit v7；CPU 对照使用 hybrid。
     cv_search: str = 'adaptive'
     opencv_threads: int = 3
 
     def validate(self):
-        limits = {'sharpen_amount': (0, 2), 'min_score': (0, 1),
+        limits = {'min_score': (0, 1),
                   'jpeg_quality': (1, 100)}
         for name, (low, high) in limits.items():
             value = getattr(self, name)
@@ -38,7 +38,8 @@ class DoorSimConfig:
             raise ValueError('cv_every_frames 必须为正整数')
         for name, choices in {'cv_backend': ('cpu', 'auto', 'opencl'),
                               'cv_hough': ('cpu', 'opencl'), 'cv_blur': ('exact', 'pyramid'),
-                              'cv_quality': ('precise', 'fast'), 'cv_search': ('full', 'adaptive')}.items():
+                              'cv_quality': ('precise', 'fast'), 'cv_search': ('full', 'adaptive'),
+                              'cv_execution': ('resident', 'hybrid')}.items():
             if getattr(self, name) not in choices:
                 raise ValueError(name + ' 配置无效')
         if not isinstance(self.opencv_threads, int) or self.opencv_threads < 1:

@@ -8,8 +8,8 @@
 惯例: 与设备/相机相关的真值不在 quick_config 写死; 通过 camera_ports.py 按 USB 物理口解析。  # 注释: 配置按惯例说明
 """                                                                          # 注释: 文档字符串结束
 
-# YOLO模型(2026-10-08 回退单模型: 前视/下视同一份 door_3, 只有 door 一个类别)
-YOLO_MODEL_FRONT  = 'door_3_640x640.hbm'  # 前视模型: door_3, 只识别 door
+# YOLO模型：前视使用新 NV12 门模型；下视保留原配置。
+YOLO_MODEL_FRONT  = 'door_6_nashe_640x640_nv12.hbm'  # 前视/穿门模型，只识别 door
 YOLO_MODEL_BOTTOM = 'door_3_640x640.hbm'  # 下视模型: 同 door_3, 只识别 door(2026-10-08 回退)
 YOLO_MODEL        = 'test_nashe_640x640_nv12.hbm'  # 旧单模型, 两路不再引用(兼容/回退参考)
 
@@ -28,11 +28,11 @@ FRONT_FPS       = 250  # 前视相机请求帧率(实测低于此值, 受 USB �
 BOTTOM_FPS      = 250  # 下视相机请求帧率(同上)  # 注释: 帧率上限
 
 # === 识别目标(模型类别顺序在各路 CLASS_NAMES, 这里只列出"实际想筛出谁") ===         # 注释: 分组标题
-# [2026-10-08 回退单模型] 两路都用 door_3, 类别只有 door; 下视不再有 ring/red-ball/yellow-ball。
+# 两路基线类别均只有 door；任务阶段按 stage_model 切换。
 #   ⚠ 影响: t_search_ball 的"下视见 ball 即完成"快路径、捡球方案的 poll('bottom','ball') 将永不成立。
 FRONT_TARGETS   = ['door']                 # 前视目标类别: 只 door(过门)
 BOTTOM_TARGETS  = ['door']                 # 下视目标类别: 只 door(2026-10-08 回退)
-FRONT_CLASS_NAMES  = ['door']              # door_3 模型类别(索引0=door)
+FRONT_CLASS_NAMES  = ['door']              # 前视模型类别(索引0=door)
 BOTTOM_CLASS_NAMES = ['door']              # 下视同 door_3, 索引0=door(2026-10-08 回退)
 CLASS_NAMES     = ['door', 'red-ball', 'yellow-ball']     # 旧单模型类别(兼容/回退参考)
 

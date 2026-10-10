@@ -15,9 +15,9 @@
 #
 # 用法:
 #   ./run.sh                     # 真实相机 + 全部启动
-#   ./run.sh --door-sim          # task_door_sim/run.py 调用 front.py：增强 -> YOLO/CV -> 共享帧 -> :5000/cam1
+#   ./run.sh --door-sim          # task_door_sim/run.py 调用 front.py：640×480 校正 -> YOLO/GPU CV -> 共享帧 -> :5000/cam1
 #   ./run.sh --door-sim --to32-args "--mode rov"   # ROV 启动，同时运行门视觉测试
-#   ./run.sh --door-sim --door-sim-args "--contrast 1.3 --sharpen 0.8"   # 测试参数透传
+#   ./run.sh --door-sim --door-sim-args "--cv-backend opencl --gpu-device Mali --cv-execution resident"   # 测试参数透传
 # #   ./run.sh --frames 100        # 每个检测进程跑 100 帧
 #   ./run.sh --no-web            # 只跑检测, 不起 Web/Nginx
 #   ./run.sh --setup-only        # 只做初始化 (依赖检查 + Nginx 配置)

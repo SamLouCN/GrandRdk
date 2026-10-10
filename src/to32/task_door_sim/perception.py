@@ -1,4 +1,4 @@
-"""干净校正图保留颜色证据；增强图同时进入 YOLO 和 OpenCV。"""
+"""front.py 前摄 -> 干净校正图 -> BPU YOLO + quad_cv_kit 常驻 GPU CV。"""
 import sys
 import time
 import json
@@ -17,7 +17,7 @@ if _ROOT not in sys.path:
 
 from quad_cv_kit.src.camera_correction import load_camera_params, adapt_camera_params, create_corrector
 from quad_cv_kit.src.detect_red_gate import original_geometry, draw_gate_geometry
-from quad_cv_kit.src.gate_guidance import sharpen_frame, build_gate_guidance, draw_gate_guidance
+from quad_cv_kit.src.gate_guidance import build_gate_guidance, draw_gate_guidance
 from quad_cv_kit.src.yolo_quad import draw_detections
 from quad_cv_kit.src.yolo_red_gate import YoloRedGateTracker
 from quad_cv_kit.src.opencl_backend import create_backend
@@ -34,7 +34,8 @@ class DoorDetectorAdapter:
 
     def detect_boxes(self, frame):
         result = []
-        # 图像已校正、增强，必须重新转模型输入，不能复用采集时的 NV12。
+        # 图像已校正，必须重新 letterbox 到模型元数据中的输入尺寸。
+        # 不能复用未经校正的采集 NV12；框由模型后处理还原为当前帧坐标。
         started = time.perf_counter()
         detections = self.detector.detect(frame, nv12=None)
         self.last_detect_ms = (time.perf_counter()-started)*1000
@@ -55,6 +56,8 @@ class DoorSimFrameProcessor:
         self.tracker = None
         self.cv_backend = None
         self.cv_backend_info = None
+        self.cv_execution = None
+        self.camera_adaptation = None
         self.closed = False
         self.lock = threading.Lock()
 
@@ -64,22 +67,31 @@ class DoorSimFrameProcessor:
             cv2.setNumThreads(cfg.opencv_threads)
             self.cv_backend, self.cv_backend_info = create_backend(
                 cfg.cv_backend, cfg.gpu_device, cfg.cv_hough, cfg.cv_blur, cfg.cv_quality)
+            self.cv_execution = cfg.cv_execution if self.cv_backend is not None else 'hybrid'
+            self.cv_backend_info = dict(self.cv_backend_info, cv_execution=self.cv_execution)
             print('[DoorSim] CV backend: '+json.dumps(self.cv_backend_info, ensure_ascii=False), flush=True)
         if cfg.correction_enabled:
-            camera, _ = adapt_camera_params(load_camera_params(cfg.camera_params_path),
+            camera, self.camera_adaptation = adapt_camera_params(load_camera_params(cfg.camera_params_path),
                                             width, height, cfg.camera_fit)
             self.corrector = create_corrector(camera)
             self.valid_mask = self.corrector.valid_mask(cfg.correction_plane_distance_m)
         else:
             self.corrector = None
+            self.camera_adaptation = None
             self.valid_mask = np.ones((height, width), bool)
+        self.valid_mask.setflags(write=False)
         self.tracker = YoloRedGateTracker(self.detector, fps=self.fps,
                                           detect_every=cfg.cv_every_frames,
                                           hold_seconds=cfg.hold_seconds,
                                           valid_mask=self.valid_mask,
                                           roi_padding=cfg.roi_padding, profile_cv=cfg.cv_profile,
                                           cv_backend=self.cv_backend,
+                                          cv_contrast=1, cv_clahe_clip=0, cv_clahe_blend=0,
+                                          cv_sharpen=0, cv_saturation=1,
+                                          cv_execution=self.cv_execution,
                                           adaptive_search=cfg.cv_search == 'adaptive')
+        if self.cv_execution == 'resident' and self.corrector is not None:
+            self.tracker.cv.set_camera(self.corrector.output_matrix)
         self.size = (width, height)
 
     def process(self, frame):
@@ -105,41 +117,40 @@ class DoorSimFrameProcessor:
         started = time.perf_counter()
         maps = self.corrector.maps(cfg.correction_plane_distance_m) if self.corrector else None
         if self.cv_backend is not None:
-            preprocess_started = time.perf_counter()
-            fixed, enhanced, correction_ms, _ = self.cv_backend.preprocess(
-                frame, self.valid_mask, cfg.sharpen_amount, maps)
-            corrected_at = preprocess_started+correction_ms/1000
+            reference, fixed, _, _ = self.cv_backend.preprocess(
+                frame, self.valid_mask, maps=maps,
+                device_reference=self.cv_execution == 'resident')
         else:
-            fixed = (self.cv_backend.remap(frame, *maps) if self.cv_backend is not None and maps is not None else
-                     self.corrector.undistort(frame, cfg.correction_plane_distance_m) if self.corrector else frame.copy())
-            corrected_at = time.perf_counter()
-            enhanced = sharpen_frame(fixed, cfg.sharpen_amount, self.valid_mask)
-        enhanced_at = time.perf_counter()
-        candidate, _ = self.tracker.update(fixed, yolo_frame=enhanced, cv_frame=enhanced)
+            fixed = self.corrector.undistort(frame, cfg.correction_plane_distance_m) if self.corrector else frame
+            reference = fixed
+        corrected_at = time.perf_counter()
+        candidate, _ = self.tracker.update(reference, yolo_frame=fixed, cv_frame=reference)
         tracked_at = time.perf_counter()
         status = self.tracker.last_status
         geometry = original_geometry(fixed, candidate)
-        detections = [dict(det, selected=det['bbox'] == status['target_bbox'])
+        detections = [dict(det, selected=status['yolo_age_frames'] == 0 and
+                          list(det['bbox']) == status['target_bbox'])
                       for det in status['yolo_detections']]
-        display = draw_detections(enhanced, detections)
+        display = draw_detections(fixed, detections)
         display = draw_gate_geometry(display, geometry, self.tracker.index-1,
                                       self.fps, 'DoorSim')
         guidance = None
         if self.corrector is not None:
-            guidance = build_gate_guidance(status, geometry, self.corrector.output_matrix,
-                                           self.size, self.valid_mask)
+            guidance = (self.tracker.cv.last_guidance if self.cv_execution == 'resident' else
+                        build_gate_guidance(status, geometry, self.corrector.output_matrix,
+                                            self.size, self.valid_mask))
             display = draw_gate_guidance(display, guidance, self.corrector.output_matrix)
         observation = dict(valid=True, has_target=status['yolo_count'] > 0,
                            coordinate_space='corrected' if self.corrector else 'raw',
                            img_w=width, img_h=height, geometry=geometry, yolo=status,
                            guidance=guidance,
-                           input='enhanced', enhancement_mode='sharpen-only',
-                           sharpen_amount=cfg.sharpen_amount,
+                           input='clean', enhancement_mode='none', cv_execution=self.cv_execution,
+                           camera_adaptation=self.camera_adaptation,
                            cv_backend=dict(self.cv_backend_info),
                            timing_ms=dict(correction=round((corrected_at-started)*1000, 2),
-                                          enhancement=round((enhanced_at-corrected_at)*1000, 2),
+                                          enhancement=0.,
                                           yolo=round(self.detector.last_detect_ms, 2),
-                                          cv=round((tracked_at-enhanced_at)*1000-self.detector.last_detect_ms, 2),
+                                          cv=round(max(0., (tracked_at-corrected_at)*1000-self.detector.last_detect_ms), 2),
                                           overlay=round((time.perf_counter()-tracked_at)*1000, 2)))
         if self.cv_backend is not None:
             observation['gpu'] = self.cv_backend.diagnostics()

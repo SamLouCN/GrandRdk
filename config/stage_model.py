@@ -20,7 +20,7 @@ MODELS = {
         'target_class_ids': [],
     },
     'gate': {
-        'model_path': 'door_4_nashe_1280x1280_nv12.hbm',
+        'model_path': 'door_6_nashe_640x640_nv12.hbm',
         'class_names': ['door'],
         'target_class_names': ['door'],
         'target_class_ids': [],

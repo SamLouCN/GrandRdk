@@ -16,8 +16,10 @@ AUV_DET_FRONT = 'momo_det_front.json'          # 前视检测（front.py 写）
 AUV_DET_BOTTOM = 'momo_det_bottom.json'        # 下视检测（bottom.py 写）
 AUV_DET_STALE_S = 0.5                          # 检测 JSON 超期秒数，超期按无目标
 AUV_MIN_SCORE = 0.5                            # 检测置信度门槛
-AUV_IMG_W = 1280.0                              # 画面宽（归一化偏差 ex 的分母）
-AUV_IMG_H = 720.0                              # 画面高
+AUV_IMG_W = 640.0                             # 前摄画面宽（归一化偏差 ex 的分母）
+AUV_IMG_H = 480.0                             # 前摄画面高
+AUV_BOTTOM_IMG_W = 1280.0                     # 下摄仍为 1280×720，独立归一化
+AUV_BOTTOM_IMG_H = 720.0
 AUV_CLIP_MARGIN_PX = 4.0                       # 贴边判定余量（px），贴边时 w/h 不可信
 AUV_DEPTH_FILE = 'momo_depth.json'             # 融合深度（depth_kalman 写，20Hz）
 AUV_DEPTH_STALE_S = 1.0                        # 深度 JSON 超期秒数
@@ -243,7 +245,8 @@ STAGE_TABLE = (TASK1_TABLE + HIT_BALL_TABLE + TASK2_TABLE + DOOR_TABLE
 
 # ---------------- 卡尔曼进程托管（[2026-10-08] 进 AUV 自动拉起，老版思路重加） ----------------
 AUV_KALMAN_AUTOSTART = True                    # 进 AUV 时自动拉起【深度】卡尔曼
-AUV_KALMAN_DIR = '/userdata/GrandRDKv2.5/src/kalman/depth_kalman'   # 工程根（main.py 平铺）
+AUV_KALMAN_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..',
+                                            'kalman', 'depth_kalman'))  # 跟随实际部署目录
 AUV_KALMAN_START_WAIT_S = 3.0                  # 退出时等优雅退出的秒数
 AUV_KALMAN_FRESH_S = 1.5                       # momo_depth.json 比这新 → 视为已在跑
 AUV_VISKF_AUTOSTART = False                    # viskf 待穿门任务接入时再开

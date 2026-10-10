@@ -1,5 +1,13 @@
 # GrandRDK v2.5 · 板端视觉与感知总控
 
+> **2026-10-10 前摄/DoorSim 更新**：前摄原生 640×480，默认/穿门阶段模型为
+> `models/door_6_nashe_640x640_nv12.hbm`；上下各填充 80 像素后输入 BPU。
+> `./run.sh --door-sim` 经 `front.py` 使用 quad_cv_kit v7 常驻 GPU CV，处理后共享帧发布到
+> `http://<板端IP>:5000/cam1`。配置/启动详见 [task_door_sim](src/to32/task_door_sim/README.md)。
+
+> 正式 [task_door](src/to32/move_test/task/task_door/README.md) 的 `PassGate` 也已接入 v7 常驻 GPU CV，
+> 保留四点 IPPE 控制姿态检查；50%回正后，稳定80%面积直接进入盲冲，移除 `CV_FINAL` 二次验证。
+
 > **v3.8 PID修正**：STM32二进制PID默认只转发0～3；4～7是参考补偿环，需核实后另行启用。
 > 新增 `$TASKPID` 命名S100参数及确认，当前仅gate；直接更新实际GatePid，PASS_GATE_TABLE可选阶段共用同一对象。未实现的撞球/捡球明确拒绝。参数更新不会启动任务或切模式，默认任务排序保持原样。下方原说明为历史版本记录。
 
@@ -36,7 +44,7 @@ RDK S100 上跑的水下机器人（ROV/AUV）**板端软件总线**：两路相
 
 | 功能 | 状态 | 说明 |
 |---|---|---|
-| 相机采集 + YOLO 检测（front/bottom） | ✅ 运行中 | 基线（IDLE/DONE）cam1/cam2 都找 `door`（2026-10-08 回退单模型）；**AUV 任务运行时由 `stage_model` 按阶段热切换**（撞球→test_nashe 找球、穿门→door_3、捡球→bottom.hbm），画框后写共享内存 |
+| 相机采集 + YOLO 检测（front/bottom） | ✅ 运行中 | 基线（IDLE/DONE）cam1/cam2 都找 `door`（2026-10-08 回退单模型）；**AUV 任务运行时由 `stage_model` 按阶段热切换**（撞球→test_nashe 找球、穿门→door_6、捡球→bottom.hbm），画框后写共享内存 |
 | YOLO 模型按阶段动态切换 | ✅ 已接线 | `config/stage_model.py` `StageDetector`：读 `momo_stage.json` → 模型配置变化即热重载；切换丢旧结果、失败 1s 重试。详见文件地图 |
 | 图像回传 `/cam1` `/cam2`（:5000） | ✅ 运行中 | web_server 读共享内存发 MJPEG，**带检测框**，是上位机画面唯一来源；与光流/AUV 完全无关 |
 | 检测状态接口 `/api/status` `/api/detections` `/ws/status` `/healthz` | ✅ 运行中 | |
@@ -159,8 +167,8 @@ cd /userdata/GrandRDK
 | `config/udev/99-rover-cameras.rules` | ★ udev 物理口↔相机绑定规则（SYMLINK `cam1/cam2/cam3`，只认 index=0 采集节点）。⚠ **其 cam1=口1-2 / cam2=口3-2 与 `camera_ports.py`（cam1=3-2 / cam2=1-2）记载相反**，二选一必有一个过时，启用前现场核对 |
 | `config/auv_config.py` | AUV 旧参数段（`to32_config.py` 末尾 `from auv_config import *` 并入）。⚠ **v2.5 任务参数已迁 `src/to32/move_test/task_config.py`**（自包含），调任务改那边 |
 | `nginx_setup.sh` | Nginx 安装与站点配置 |
-| `config/quick_config.py` | **日常调参入口**：相机节点、目标类别、阈值、开关、BPU 核。⚠ **2026-10-08 回退单模型**：`YOLO_MODEL_FRONT`/`YOLO_MODEL_BOTTOM` 均 `door_3_640x640.hbm`、`FRONT_TARGETS`/`BOTTOM_TARGETS` 均 `['door']` |
-| `config/stage_model.py` | ★（2026-10-09 新增）**YOLO 模型按阶段动态切换**：`MODELS` 三套配置（ball=test_nashe / gate=door_3 / pick=bottom.hbm）+ `STAGE_MODELS` 阶段映射 + `StageDetector`（每帧读 `momo_stage.json`，配置变化即热重载、`is_current()` 丢过时结果、失败 1s 重试） |
+| `config/quick_config.py` | **日常调参入口**：相机节点、目标类别、阈值、开关、BPU 核。 前视默认 door_6 NV12 640×640，下视基线保留 door_3；目标类别均为 door |
+| `config/stage_model.py` | ★（2026-10-09 新增）**YOLO 模型按阶段动态切换**：`MODELS` 三套配置（ball=test_nashe / gate=door_6 / pick=bottom.hbm）+ `STAGE_MODELS` 阶段映射 + `StageDetector`（每帧读 `momo_stage.json`，配置变化即热重载、`is_current()` 丢过时结果、失败 1s 重试） |
 | `config/main_config.py` | 全局配置：路径、共享内存、光流、Web；从 quick_config 合成 `DEFAULT_CONFIG`。⚠ 光流两开关（`FLOW_ENABLE` / `ENABLE_FLOW_SHARE_BOTTOM`）**已 False** |
 | `config/to32_config.py` | **中位机配置**：端口、串口、模式、PID、映射量纲、图像回传；`START_MODE = MODE_IDLE` |
 | `config/nginx/vp.conf` | Nginx 站点（静态页 + `/cam1` `/cam2` `/api` `/ws` 反代） |
@@ -179,7 +187,7 @@ cd /userdata/GrandRDK
 | `logs/to32_mode_state.json` | 中位机模式记忆文件（原子写；当前 `MODE_PERSIST=False` 不写） |
 | `src/utils/flow_share.py` | 帧共享桥，flock 互斥避免读写撕裂（光流停用后暂无消费者，保留） |
 | `src/utils/py_utils/` | **第三方 vendored 库**（非本项目代码，别改） |
-| `models/*.hbm` | BPU 模型（3 个）：`door_3_640x640.hbm`（基线/穿门，前后视默认）、`test_nashe_640x640_nv12.hbm`（撞球/寻球）、`bottom.hbm`（捡球）——由 `stage_model.py` 按阶段选用 |
+| `models/*.hbm` | 当前前视/穿门 `door_6_nashe_640x640_nv12.hbm`，下视基线 `door_3_640x640.hbm`，撞球 `test_nashe_640x640_nv12.hbm`，捡球 `bottom.hbm`；其他文件为历史模型 |
 | `libs/libmjpg_hw.so` | JPU 硬件解码动态库 |
 | `web/index.html` | 监控页面（Nginx 实际分发，**Win8.1 磁贴风**） |
 | `web/index_v2.html` | 新版页面，**尚未接入**（Nginx `index index.html`，代码里没人引用） |
@@ -211,8 +219,8 @@ cd /userdata/GrandRDK
 
 | 文件 | 行数 | 作用 |
 |---|---|---|
-| `quick_config.py` | 56 | **日常调参入口**：相机节点（`device_for('cam1')`/`device_for('cam2')`）、目标类别、阈值、推理开关、BPU 核。⚠ **2026-10-08 回退单模型**：`YOLO_MODEL_FRONT=YOLO_MODEL_BOTTOM='door_3_640x640.hbm'`、`FRONT_TARGETS=BOTTOM_TARGETS=['door']`、`FRONT_CLASS_NAMES=BOTTOM_CLASS_NAMES=['door']`（旧 `YOLO_MODEL` 单键保留注释作回退参考） |
-| `stage_model.py` | 143 | ★（2026-10-09 新增）**YOLO 按阶段热切换**：`MODELS` 三套配置（`ball`→test_nashe 找 red-ball / `gate`→door_3 找 door / `pick`→bottom.hbm 找 red-ball）+ `STAGE_MODELS` 阶段映射（Task1/SearchBall/HitBall→ball；Task2/PassGate→gate；PickBall→pick）+ `publish_stage()`/`StageDetector`（读 `/dev/shm/momo_stage.json`，模型配置变化即重载，推理期间切走丢旧结果，加载失败 1s 重试） |
+| `quick_config.py` | 56 | **日常调参入口**：相机节点（`device_for('cam1')`/`device_for('cam2')`）、目标类别、阈值、推理开关、BPU 核。 前视默认 door_6 NV12 640×640，下视基线保留 door_3；目标类别均为 door |
+| `stage_model.py` | 143 | ★（2026-10-09 新增）**YOLO 按阶段热切换**：`MODELS` 三套配置（`ball`→test_nashe 找 red-ball / `gate`→door_6 找 door / `pick`→bottom.hbm 找 red-ball）+ `STAGE_MODELS` 阶段映射（Task1/SearchBall/HitBall→ball；Task2/PassGate→gate；PickBall→pick）+ `publish_stage()`/`StageDetector`（读 `/dev/shm/momo_stage.json`，模型配置变化即重载，推理期间切走丢旧结果，加载失败 1s 重试） |
 | `main_config.py` | 216 | 全局配置：路径、`/dev/shm` 键名、光流 `FLOW_*`、Web。⚠ `FLOW_ENABLE=False`、`ENABLE_FLOW_SHARE_BOTTOM=False`（2026-10-04 光流停用） |
 | `to32_config.py` | 134 | **中位机配置**：UDP 8080/8081、串口、模式表、PID 系数、量纲映射、图像回传开关（停用）；`MODE_IDLE=-1`、`START_MODE=MODE_IDLE`（待命）；末尾 `from auv_config import *` |
 | `auv_config.py` | 216 | AUV 旧参数段（被 `to32_config.py` 并入）。⚠ **v2.5 任务参数已迁 `src/to32/move_test/task_config.py`**（自包含、不 import to32_config；`AUV_SPEED_MPS`/`AUV_YAW_RATE_DPS`/`AUV_POOL_DEPTH_CM` 等占位值待上车标定） |
@@ -426,12 +434,12 @@ momo_det_front.json ──> src/kalman/camera_kalman/（图像卡尔曼 viskf �
 
 | 键 | 当前值 | 含义 |
 |---|---|---|
-| `YOLO_MODEL_FRONT` / `YOLO_MODEL_BOTTOM` | `door_3_640x640.hbm` / `door_3_640x640.hbm` | **前后视独立** BPU 模型文件名（2026-10-08 回退单模型；旧单键 `YOLO_MODEL` 保留注释） |
+| `YOLO_MODEL_FRONT` / `YOLO_MODEL_BOTTOM` | `door_6_nashe_640x640_nv12.hbm` / `door_3_640x640.hbm` | 前后视独立 BPU 模型文件名 |
 | `FRONT_DEVICE` | `device_for('cam1')` | 前视相机节点（按 USB 物理口绑定，见 `config/camera_ports.py`） |
 | `BOTTOM_DEVICE` | `device_for('cam2')` | 下视相机节点（按 USB 物理口绑定） |
 | `FRONT_TARGETS` / `BOTTOM_TARGETS` | `['door']` / `['door']` | 基线检测目标（2026-10-08 回退；撞球/捡球时由 stage_model 切模型自动扩目标） |
 | `FRONT_CLASS_NAMES` / `BOTTOM_CLASS_NAMES` | `['door']` / `['door']` | 模型类别顺序，改模型必须同步改 |
-| `stage_model.MODELS` | `ball`=test_nashe / `gate`=door_3 / `pick`=bottom.hbm | ★（2026-10-09）三套按阶段切换的模型配置 |
+| `stage_model.MODELS` | `ball`=test_nashe / `gate`=door_6 / `pick`=bottom.hbm | ★（2026-10-09）三套按阶段切换的模型配置 |
 | `stage_model.STAGE_MODELS` | Task1/SearchBall/HitBall→`ball`；Task2/PassGate→`gate`；PickBall→`pick` | 阶段名 → 模型配置映射；未列出（IDLE/DONE）用基线 |
 | `SCORE_THRES` / `NMS_THRES` | `0.6` / `0.45` | 置信度 / NMS 阈值 |
 | `ENABLE_FRONT` / `ENABLE_BOTTOM` | `True` / `True` | 两路相机总开关 |
@@ -466,7 +474,7 @@ momo_det_front.json ──> src/kalman/camera_kalman/（图像卡尔曼 viskf �
 ./run.sh                      # 真实相机，全部启动（光流除外——已停用）
 ./run.sh --door-sim            # task_door_sim/run.py -> front.py 写处理后的共享帧 -> :5000/cam1（日志 logs/front.log）
 ./run.sh --door-sim --to32-args "--mode rov"  # ROV 启动，同时立即运行门视觉测试
-./run.sh --door-sim --door-sim-args "--contrast 1.3 --sharpen 0.8"  # 门视觉测试参数透传
+./run.sh --door-sim --door-sim-args "--cv-backend opencl --gpu-device Mali --cv-execution resident"  # 门视觉测试参数透传
 ./run.sh --frames 100         # 每路只跑 100 帧（透传给检测进程）
 ./run.sh --no-web             # 只跑检测，不起 Web / Nginx
 ./run.sh --no-flow            # （兼容保留）光流已整体停用，此参数无实际效果

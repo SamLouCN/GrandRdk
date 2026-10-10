@@ -40,9 +40,16 @@ class DoorFrontPipeline:
                 display = draw_door_overlay(fixed, dets, observation)
                 ok, encoded = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if ok:
+                    frame_writer.width, frame_writer.height = display.shape[1], display.shape[0]
                     frame_writer.write(encoded.tobytes())
             if det_writer is not None:
                 det_writer.write(dict(frame=frame_id, ts=time.time(), capture_ts=captured_at,
+                                      img_w=fixed.shape[1], img_h=fixed.shape[0],
                                       dets=dets, stage='PassGate', status='done' if detector.ready else 'model_error',
                                       model_path=detector.cfg['model_path'], door=observation))
             return fixed, dets
+
+    def close(self):
+        with self.lock:
+            if self.processor is not None:
+                self.processor.close()

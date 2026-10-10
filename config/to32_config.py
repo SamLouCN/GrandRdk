@@ -121,9 +121,9 @@ DEFAULT_MODE = MODE_IDLE         # 启动时的初始模式（与 START_MODE 一
 VIDEO_ENABLED_AT_START = False   # 不主动开图像回传（即使跑 main.py 不带 --no-video 也不碰相机）  # 注释: 是否启动时开回传
 VIDEO_HTTP_PORT = 5000           # MJPEG HTTP 端口（上位机 VideoCapture 目标）  # 注释: HTTP 端口
 VIDEO_BIND_IP = "0.0.0.0"        # 监听地址（0.0.0.0 = 全部网卡）          # 注释: 绑定地址
-VIDEO_WIDTH = 1280               # 采集宽（cam1 节点支持 MJPG 1280x720@30）  # 注释: 采集宽度
-VIDEO_HEIGHT = 720               # 采集高                                    # 注释: 采集高度
-VIDEO_FPS = 15                   # 采集与推流帧率（越高越吃带宽；720p@15 约 0.7 MB/s）  # 注释: 帧率
+VIDEO_WIDTH = 640                # 独立调试前摄也采用 VGA，与 front.py 一致
+VIDEO_HEIGHT = 480               # 采集高
+VIDEO_FPS = 15                   # 采集与推流帧率（越高越吃带宽）  # 注释: 帧率
 VIDEO_QUALITY = 70               # JPEG 质量（0~100）                        # 注释: 画质
 # 摄像头路径映射（已停用）：To32 不再独占任何摄像头设备节点；VIDEO_PATHS 留作调试兜底  # 注释: 路径说明
 # 旧值（2026-09-21 前）含两个 cam 的设备节点映射（cam1/cam2），节点号已废弃，仅作历史记录留痕  # 注释: 历史说明

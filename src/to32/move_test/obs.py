@@ -13,6 +13,7 @@ DepthIF  : 读 /dev/shm/momo_depth.json  → 融合深度 D / 垂速 v_z / 离�
   6. 永远不抛异常：poll/read 任何失败都退化成 None / ok=False
 """
 import json
+import math
 import os
 
 import task_config as TC
@@ -74,6 +75,9 @@ class VisionIF(object):
         self.file = {'front': TC.AUV_DET_FRONT, 'bottom': TC.AUV_DET_BOTTOM}
         self.w = float(TC.AUV_IMG_W)
         self.h = float(TC.AUV_IMG_H)
+        self.sizes = {'front': (self.w, self.h),
+                      'bottom': (float(getattr(TC, 'AUV_BOTTOM_IMG_W', self.w)),
+                                 float(getattr(TC, 'AUV_BOTTOM_IMG_H', self.h)))}
         self.margin = float(TC.AUV_CLIP_MARGIN_PX)
         self._last_frame = {}
         self._warn = _WarnOnce(log)
@@ -127,17 +131,32 @@ class VisionIF(object):
         except Exception:
             cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
 
+        img_w, img_h = self.sizes[cam]
+        # New writers publish actual dimensions; legacy files use per-camera
+        # defaults so lowering front resolution never rescales bottom output.
+        for key, fallback in (('img_w', img_w), ('img_h', img_h)):
+            try:
+                value = float(obj.get(key, fallback))
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(value) or value <= 0:
+                return None
+            if key == 'img_w':
+                img_w = value
+            else:
+                img_h = value
         if aim is None:
-            aim = (0.5 * self.w, 0.5 * self.h)
+            aim = (0.5 * img_w, 0.5 * img_h)
         dx, dy = cx - float(aim[0]), cy - float(aim[1])
-        ex = dx / (0.5 * self.w) if self.w > 0 else 0.0
-        ey = dy / (0.5 * self.h) if self.h > 0 else 0.0
+        ex = dx / (0.5 * img_w)
+        ey = dy / (0.5 * img_h)
 
         m = self.margin
         clip_l, clip_t = x1 <= m, y1 <= m
-        clip_r, clip_b = x2 >= self.w - m, y2 >= self.h - m
+        clip_r, clip_b = x2 >= img_w - m, y2 >= img_h - m
         return {
             'canon': want, 'label': d.get('label'), 'score': score,
+            'img_w': img_w, 'img_h': img_h,
             'cx': cx, 'cy': cy, 'dx': dx, 'dy': dy, 'ex': ex, 'ey': ey,
             'w': w, 'h': h, 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
             'clip_l': clip_l, 'clip_r': clip_r, 'clip_t': clip_t, 'clip_b': clip_b,
@@ -166,7 +185,7 @@ class VisionIF(object):
 class DepthIF(object):
     """深度接口：read(now) -> dict（永远返回 dict，绝不抛）
 
-    返回 {'ok','D','v_z','clearance','sigma_D','age_s','stale','degraded','H'}
+    返回 {'ok','D','v_z','clearance','sigma_D','age_s','sample_ts','stale','degraded','H'}
     ok=False 时不得做深度闭环，只能走「定时 + 上浮」的安全路径。
     ★ clearance = 离底净空(m) 多探头取最小 —— 坐底判定的绝对量，
       不受池深、固件钳位、深度计漂移影响。
@@ -180,7 +199,7 @@ class DepthIF(object):
     def _empty(self, age=None):
         return {'ok': False, 'D': None, 'v_z': None, 'clearance': None,
                 'sigma_D': None, 'age_s': age, 'stale': True, 'degraded': True,
-                'H': None}
+                'H': None, 'sample_ts': None}
 
     def read(self, now):
         path = os.path.join(self.shm_dir, self.fname)
@@ -224,7 +243,7 @@ class DepthIF(object):
             'ok': ok, 'D': d_m, 'v_z': v_z, 'clearance': cl,
             'sigma_D': sig, 'age_s': age, 'stale': False,
             'degraded': bool((d.get('flags') or {}).get('degraded', cl is None)),
-            'H': d.get('H'),
+            'H': d.get('H'), 'sample_ts': mtime,
         }
 
 

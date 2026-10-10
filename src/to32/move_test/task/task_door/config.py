@@ -9,8 +9,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class DoorConfig:
-    image_width: int = 1280
-    image_height: int = 720
+    image_width: int = 640
+    image_height: int = 480
     gate_width_m: float = .70
     gate_height_m: float = .50
     area_near: float = .50
@@ -20,13 +20,16 @@ class DoorConfig:
     filter_alpha: float = .5
     pause_error_px: float = 40.
 
-    # 与算法库 after demo 一致：YOLO 吃干净校正帧；CV 吃普通增强帧。
+    # YOLO 和 v7 resident CV 共用干净校正图，不做锐化/对比度增强。
     camera_params_path: str = str(Path(__file__).resolve().parents[5] /
                                   'quad_cv_kit/camera_correction_params.json')
     camera_fit: str = 'center-crop'  # TODO: 核对前视采集裁剪模式及水下内参
     correction_plane_distance_m: object = None  # 未知距离时沿用库的远场近似
-    contrast_gain: float = 1.2
-    sharpen_amount: float = .6
+    cv_backend: str = 'auto'
+    gpu_device: str = 'Mali'
+    cv_blur: str = 'pyramid'
+    cv_quality: str = 'fast'
+    opencv_threads: int = 3
     cv_every_frames: int = 1
     roi_padding: float = .08
     min_score: float = .5
@@ -58,6 +61,8 @@ class DoorConfig:
     yaw_command_tolerance_deg: float = .3
     depth_step_max_cm: float = 2.
     depth_tolerance_cm: float = 1.
+    depth_hold_samples: int = 5  # 连续不同卡尔曼样本到位，重复读取不计数
+    depth_velocity_max_mps: float = .02
     translation_tolerance_m: float = .01
     unactuated_tilt_max_deg: float = 12.
     vertical_gain: float = .5
@@ -86,8 +91,10 @@ class DoorConfig:
     probe_max_s: float = 15.
     width_trend_min_fraction: float = .03
     search_angle_deg: float = 45.
+    search_step_deg: float = 2.  # 相对当前航向锁存的小步目标
+    search_step_interval_s: float = .5  # 小步间最短间隔，限制目标推进速度
     search_observe_s: float = .6
-    search_timeout_s: float = 15.
+    search_timeout_s: float = 90.  # 慢速扫视左45°、右45°、回基准需要更长时间
 
     def validate(self):
         import math
@@ -99,12 +106,23 @@ class DoorConfig:
                     'blind_distance_m', 'exit_distance_m', 'probe_step_m',
                     'probe_max_steps', 'vision_stale_s', 'motion_timeout_s',
                     'align_timeout_s', 'search_timeout_s', 'cv_every_frames',
-                    'normal_yaw_tolerance_deg', 'approach_timeout_s', 'target_episode_timeout_s')
+                    'normal_yaw_tolerance_deg', 'approach_timeout_s', 'target_episode_timeout_s',
+                    'depth_tolerance_cm', 'depth_hold_samples', 'depth_velocity_max_mps',
+                    'search_angle_deg', 'search_step_deg', 'search_step_interval_s')
         if any(not math.isfinite(float(getattr(self, k))) or getattr(self, k) <= 0
                for k in positive):
             raise ValueError('尺寸、计数、速度、距离和超时必须为正有限值')
         if not 0 < self.filter_alpha <= 1 or not 0 < self.min_depth_cm < self.max_depth_cm:
             raise ValueError('滤波系数或深度限值无效')
+        if not isinstance(self.depth_hold_samples, int) or self.depth_hold_samples < 1:
+            raise ValueError('depth_hold_samples 必须为正整数')
+        for name, choices in {'cv_backend': ('auto', 'opencl', 'cpu'),
+                              'cv_blur': ('pyramid', 'exact'),
+                              'cv_quality': ('fast', 'precise')}.items():
+            if getattr(self, name) not in choices:
+                raise ValueError(name + ' 配置无效')
+        if not isinstance(self.opencv_threads, int) or self.opencv_threads <= 0:
+            raise ValueError('opencv_threads 必须为正整数')
         if (not math.isfinite(self.overlay_font_scale) or self.overlay_font_scale <= 0
                 or not math.isfinite(self.overlay_line_height_px) or self.overlay_line_height_px <= 0
                 or not 0 <= self.overlay_background_alpha <= 1):

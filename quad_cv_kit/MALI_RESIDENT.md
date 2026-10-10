@@ -3,7 +3,9 @@
 `demo/demo_video.py --pipeline red-gate --cv-backend opencl` 默认使用新的
 `resident` 路径。库调用需要显式设置 `YoloRedGateTracker(...,
 cv_backend=gpu, cv_execution='resident')`；旧调用保持 `hybrid` 行为。
-此次修改仅涉及 quad_cv_kit，不会自动切换 DoorSim 的调用方式。
+GrandRdk 的 `task_door_sim` 已接入 v7 resident 路径，前摄为 640×480，
+默认门模型为 `door_6_nashe_640x640_nv12.hbm`。启动命令见
+[task_door_sim/README.md](../src/to32/task_door_sim/README.md)。
 
 ## 执行位置与数据流
 
@@ -32,6 +34,7 @@ CV 核心最后一次批量等待读取 800 字节：门框/跟踪/目标状态 
 组件统计、候选门框、光流和 RANSAC 结果均不回读。
 在 1280×720 视频路径中，稳态输出回读约为 2,764,800 + 800 字节：
 前者是外部 BPU/绘制需要的干净 BGR，后者是 CV 最终输出。
+640×480 DoorSim 路径的稳态 BGR 回读相应为 921,600 + 800 字节。
 这不是将整个解码、BPU 输入转换、YOLO 后处理或编码都改为 GPU。
 
 CPU 仍负责一次性的查表/相机映射初始化、OpenCL 提交、外部检测输入、

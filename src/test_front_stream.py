@@ -24,6 +24,49 @@ from to32.task_door_sim.test_door_sim import FakeDetector, scene
 
 
 class FrontStreamTests(unittest.TestCase):
+    def test_front_closes_and_discards_shared_formal_gpu_pipeline(self):
+        from unittest.mock import Mock
+        pipeline = Mock()
+        with patch.object(front, '_door_pipeline', pipeline):
+            front.close_door_pipeline()
+            front.close_door_pipeline()
+            pipeline.close.assert_called_once_with()
+            self.assertIsNone(front._door_pipeline)
+
+    def test_front_camera_and_reference_geometry_use_vga(self):
+        from to32.move_test.task.task_door.config import CONFIG as door_config
+        from quad_cv_kit.src.camera_correction import load_camera_params
+        self.assertEqual((front.W, front.H), (640, 480))
+        self.assertEqual(front.MARK_POINT, [320, 240])
+        self.assertEqual((door_config.image_width, door_config.image_height), (640, 480))
+        camera = load_camera_params(CONFIG.camera_params_path)
+        self.assertEqual((camera['width'], camera['height']), (640, 480))
+
+    def test_camera_negotiating_wrong_resolution_stops_before_publication(self):
+        from types import SimpleNamespace
+        camera = SimpleNamespace(read=lambda: (True, np.zeros((720, 1280, 3), np.uint8)))
+        q, stop, stats = queue.Queue(), threading.Event(), front.StageStats()
+        front.producer(camera, q, 1, stop, 1, stats, False, None, None,
+                       expected_size=(640, 480))
+        self.assertTrue(stop.is_set())
+        self.assertIn('640×480', stats.capture_error)
+        self.assertIn('1280×720', stats.capture_error)
+        self.assertTrue(q.empty())
+
+    def test_camera_requests_vga_on_hardware_and_opencv_paths(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        hardware = Mock()
+        with patch.dict(sys.modules, {'hw_camera': SimpleNamespace(HwMjpgCamera=hardware)}):
+            with patch.dict(front.CAM, hardware_decode=True):
+                front.open_camera('/dev/front', 0)
+        self.assertEqual(hardware.call_args.args[:3], ('/dev/front', 640, 480))
+        capture = Mock()
+        with patch.dict(front.CAM, hardware_decode=False), patch.object(cv2, 'VideoCapture', return_value=capture):
+            front.open_camera('/dev/front', 0)
+        capture.set.assert_any_call(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        capture.set.assert_any_call(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
     def test_slow_consumer_receives_latest_camera_frame_without_capture_backpressure(self):
         finished_capture = threading.Event()
 
@@ -111,7 +154,7 @@ class FrontStreamTests(unittest.TestCase):
                 writer.close()
 
     def test_cv_interval_tracks_current_image_and_researches_when_tracking_fails(self):
-        processor = DoorSimFrameProcessor(FakeDetector(), replace(CONFIG, correction_enabled=False))
+        processor = DoorSimFrameProcessor(FakeDetector(), replace(CONFIG, correction_enabled=False, cv_backend='cpu'))
         raw = scene()
         statuses = [processor.process(raw)[2] for _ in range(4)]
         self.assertEqual([s['yolo']['detection_ran'] for s in statuses], [True, False, False, True])

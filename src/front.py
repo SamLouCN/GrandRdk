@@ -58,6 +58,14 @@ def door_pipeline():
         return _door_pipeline
 
 
+def close_door_pipeline():
+    global _door_pipeline
+    with _door_pipeline_lock:
+        if _door_pipeline is not None:
+            _door_pipeline.close()
+            _door_pipeline = None
+
+
 TASK = 'front'                                                        # 任务名，用于日志前缀和共享内存命名
 CAM = CFG['FRONT_CAMERA']                                             # 前视相机参数：分辨率、帧率、设备号、像素格式
 YOLO_CFG = CFG['FRONT_YOLO']                                          # 前视 YOLO 参数：模型路径、置信度阈值、预处理方式
@@ -126,6 +134,7 @@ class StageStats:  # 分阶段耗时统计：采集/检测/显示
     def __init__(self, simple=False):  # simple 为真时只累计帧数不累计耗时
         self.lock = threading.Lock()  # 多线程累加计数用的互斥锁
         self.simple = bool(simple)  # 记住是否为简化统计模式
+        self.capture_error = None
         self.capture_s = 0.0  # 采集阶段累计耗时，单位秒
         self.detect_s = 0.0  # 检测阶段累计耗时
         self.display_s = 0.0  # 显示阶段累计耗时
@@ -236,7 +245,7 @@ def put_latest_frame(q, item):
 
 
 def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采集线程：读帧入队，并周期性写共享内存统计
-             log_writer, stats_w, prefer_nv12=False, want_bgr=True, latest_only=False):
+             log_writer, stats_w, prefer_nv12=False, want_bgr=True, latest_only=False, expected_size=None):
     """采集线程：读帧 -> 入队；周期性写统计到共享内存。
 
     只读真实相机; 不再支持虚拟帧(2026-09-21 移除 --virtual/make_frame)。
@@ -284,6 +293,14 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
                     fid += 1  # 帧号继续推进
                     continue  # 本轮不投递
                 fail_cnt = 0  # 软解读成功，清零失败计数
+            actual_size = ((frame.shape[1], frame.shape[0]) if frame is not None else
+                           (nv12.shape[1], nv12.shape[0]*2//3))
+            if expected_size is not None and actual_size != expected_size:
+                stats.capture_error = ('前摄请求 %d×%d，驱动实际输出 %d×%d；停止以避免错误标定/坐标'
+                                       % (*expected_size, *actual_size))
+                print('[front] '+stats.capture_error, file=sys.stderr, flush=True)
+                stop.set()
+                break
             t1 = time.perf_counter()  # 读帧结束时刻
             if enable_timing:  # 只在开启统计时才计时
                 stats.add('capture', t1 - t0)  # 记录本次采集耗时
@@ -444,8 +461,7 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                 if ok:  # 编码成功才有数据可写
                     try:  
                         write_start = time.perf_counter()
-                        if door_sim_processor is not None:
-                            frame_w.width, frame_w.height = frame.shape[1], frame.shape[0]
+                        frame_w.width, frame_w.height = vis.shape[1], vis.shape[0]
                         frame_w.write(buf.tobytes())  # 把 JPEG 字节写入共享内存 /dev/shm
                         if door_sim_observation is not None:
                             stream = dict(jpeg_bytes=int(buf.size), jpeg_quality=int(jpeg_quality),
@@ -473,6 +489,8 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                         'frame': fid,  # 帧号，供消费端对齐画面
                         'ts': time.time(),  # 时间戳，供消费端判断数据是否过期
                         'capture_ts': captured_at,
+                        'img_w': frame.shape[1] if frame is not None else W,
+                        'img_h': frame.shape[0] if frame is not None else H,
                         'status': status,
                         'dets': dets,  # 检测目标列表
                         'stage': detector.stage if detector is not None else 'IDLE',
@@ -600,7 +618,8 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
         return 1  # 返回非零退出码，供看门狗判定启动失败
 
     src_is_hw = cap is not None and hasattr(cap, 'grab_raw_nv12') and hasattr(cap, 'read_both')  # 用鸭子类型判断是不是硬解相机对象
-    prefer_nv12 = bool(src_is_hw and PRE_MODE in ('auto', 'nv12'))  # 只有硬解且预处理模式允许时才走 NV12 直通
+    prefer_nv12 = bool(src_is_hw and door_sim_processor is None and PRE_MODE in ('auto', 'nv12'))
+    # DoorSim 校正后重新生成模型 NV12，只采集 BGR，避免缓存未校正 NV12。
     want_bgr = True   # 需要写共享内存，必须能拿到 BGR
 
     latest_only = door_sim_processor is not None and video_source is None
@@ -612,7 +631,7 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
         target=producer,  # 线程入口为 producer
         args=(cap, q, args.frames, stop, args.workers,  # 传入相机、队列、帧上限、停止事件与统计对象
               stats, enable_timing, log_writer, stats_w,  # 继续传统计、日志与共享内存写端
-              prefer_nv12, want_bgr, latest_only),
+              prefer_nv12, want_bgr, latest_only, (W, H) if video_source is None else None),
         daemon=True)]  # 设为守护线程，主进程退出即刻回收
     for i in range(args.workers):  # 按配置数量启动多个检测 worker
         threads.append(threading.Thread(  # 追加一个 worker 线程
@@ -641,6 +660,9 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
             signal.signal(sig, handler)
         if cap is not None:  # 相机对象存在才释放
             cap.release()  # 释放相机设备，否则下次可能打不开
+        for th in threads:
+            th.join()  # Stop producers/workers before releasing the shared CV backend.
+        close_door_pipeline()
         if log_writer is not None:  # 日志对象存在才关闭
             log_writer.close()  # 关闭逐帧日志文件
         frame_w.close()  # 关闭帧共享内存写端
@@ -652,7 +674,7 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
             print(f'[{TASK}] 结束统计: 总运行={elapsed:.2f}s '  # 打印汇总信息开头：总运行时长
                   f'总帧数={stats.capture_frames} 总检测帧={stats.detect_frames} '  # 总帧数与总检测帧数
                   f'平均帧率={total / elapsed:.1f}fps', flush=True)  # 平均帧率按总帧数除以总时长估算
-    return 0  # 正常退出
+    return 1 if stats.capture_error else 0
 
 
 if __name__ == '__main__':  # 仅直接运行时才执行，被 import 时不启动

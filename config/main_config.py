@@ -24,7 +24,7 @@ if os.path.isabs(QC.YOLO_MODEL):  # 判断模型名是绝对路径还是仅文�
 else:  # 只有文件名的情况
     YOLO_MODEL = os.path.join(PATH_MODELS, QC.YOLO_MODEL)  # 拼到 models/ 下形成完整路径
 
-# [2026-10-07 双模型] 前视 door_3 / 下视 bottom 各自独立模型路径(解析规则同 YOLO_MODEL)
+# 前视/下视各自独立模型路径(解析规则同 YOLO_MODEL)
 if os.path.isabs(QC.YOLO_MODEL_FRONT):
     YOLO_MODEL_FRONT = QC.YOLO_MODEL_FRONT
 else:
@@ -133,8 +133,8 @@ DEFAULT_CONFIG = {  # 合成后的全局配置字典，供各业务进程直接�
     'FRONT_CAMERA': {  # 前视相机采集参数段
         'device': QC.FRONT_DEVICE,  # 设备节点，由 camera_ports.device_for('cam1') 解析
         'index':  0,  # 相机节点 index 兜底值，实际以 device_for 结果为准
-        'width':  1280,  # 采集宽度，需相机 MJPG 支持该分辨率否则开流失败
-        'height': 720,  # 采集高度
+        'width':  640,  # 前摄原生 VGA；YOLO 单独 letterbox 到模型输入尺寸
+        'height': 480,  # 与 quad_cv_kit 前摄标定尺寸一致
         'fps':    QC.FRONT_FPS,  # 请求帧率，受 USB 带宽与后端能力限制
         'format': 'MJPG',  # 像素格式，MJPG 才能走 JPU 硬件解码
         'backend': 'auto',  # OpenCV 采集后端，auto 优先选 V4L2
@@ -152,16 +152,16 @@ DEFAULT_CONFIG = {  # 合成后的全局配置字典，供各业务进程直接�
         'clahe_tile': (8, 8),  # CLAHE 分块网格，块越小局部增强越强
     },
 
-    'FRONT_YOLO': {  # 前视推理参数段（door_3 模型, 只识别 door）
+    'FRONT_YOLO': {  # 前视推理参数段（door_6 NV12 模型, 只识别 door）
         'backend': 'hbm',  # BPU 推理后端，hbm 表示走 hbm_runtime
         'preprocess_mode': 'auto',  # 预处理模式，auto 按模型输入自动选择
-        'model_path': YOLO_MODEL_FRONT,  # 前视专用 .hbm 模型(door_3_640x640.hbm)
+        'model_path': YOLO_MODEL_FRONT,  # door_6_nashe_640x640_nv12.hbm
         'score_thres': QC.SCORE_THRES,  # 置信度阈值，低于此值的检测框被丢弃
         'nms_thres':   QC.NMS_THRES,  # NMS 的 IoU 阈值，越大保留的框越多
         'strides': [8, 16, 32],  # YOLO 三个输出尺度，需与模型结构一致
         'priority': 0,  # 进程优先级，0 为默认
         'bpu_cores': QC.FRONT_BPU_CORES,  # 允许使用的 BPU 核列表，限定前视可用算力
-        'class_names': QC.FRONT_CLASS_NAMES,  # door_3 模型类别名列表，顺序必须与训练一致
+        'class_names': QC.FRONT_CLASS_NAMES,  # 类别名顺序必须与训练一致
         'label_file': None,  # 可选的 labels.txt 覆盖类别名(预留)
         'target_class_names': QC.FRONT_TARGETS,  # 前视真正要筛出的类别名
         'target_class_ids': [],  # 目标类别 id，留空由 function.py 运行时换算

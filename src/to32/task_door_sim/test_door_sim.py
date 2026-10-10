@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 import shutil
+import struct
 import asyncio
 import threading
 import tempfile
@@ -21,13 +22,12 @@ for path in (ROOT, ROOT/'src', ROOT/'config'):
 from to32.task_door_sim.config import CONFIG
 from to32.task_door_sim.perception import DoorSimFrameProcessor
 from to32.task_door_sim.front_pipeline import DoorSimFrontPipeline
-from quad_cv_kit.src.gate_guidance import sharpen_frame
 from shm_writer import ShmFrameWriter, ShmJsonWriter
 from shm_reader import ShmFrameReader, ShmJsonReader
 
 
 def scene():
-    frame = np.full((360, 640, 3), (120, 90, 40), np.uint8)
+    frame = np.full((480, 640, 3), (120, 90, 40), np.uint8)
     cv2.rectangle(frame, (220, 130), (390, 275), (50, 60, 230), 5)
     return frame
 
@@ -50,14 +50,13 @@ class DoorSimTests(unittest.TestCase):
     def setUp(self):
         self.cfg = replace(CONFIG, correction_enabled=False, cv_backend='cpu')
 
-    def test_yolo_cv_share_enhanced_input_and_clean_color_evidence(self):
+    def test_yolo_cv_share_clean_input_without_any_enhancement(self):
         raw = scene()
         original = raw.copy()
         detector = FakeDetector()
         processor = DoorSimFrameProcessor(detector, self.cfg)
-        processor._prepare(640, 360)
-        expected = sharpen_frame(raw, .6, processor.valid_mask)
-        self.assertFalse(np.array_equal(raw, expected))
+        processor._prepare(640, 480)
+        expected = original
         with patch.object(processor.tracker.cv, 'update', wraps=processor.tracker.cv.update) as update:
             display, dets, obs = processor.process(raw)
         np.testing.assert_array_equal(detector.inputs[0], expected)
@@ -68,6 +67,8 @@ class DoorSimTests(unittest.TestCase):
         self.assertIsNotNone(obs['geometry'])
         self.assertEqual(obs['geometry']['observation'], 'detected')
         self.assertFalse(np.array_equal(display, expected))
+        self.assertEqual(obs['enhancement_mode'], 'none')
+        self.assertEqual(obs['timing_ms']['enhancement'], 0.)
 
     def test_only_door_detections_enable_cv(self):
         detector = FakeDetector([dict(label='red-ball', score=.99, bbox=[210, 120, 400, 285])])
@@ -81,20 +82,22 @@ class DoorSimTests(unittest.TestCase):
 
     def test_corrected_coordinates_and_resolution_change(self):
         processor = DoorSimFrameProcessor(FakeDetector([]), replace(CONFIG, cv_backend='cpu'))
-        for size in ((640, 360), (1280, 720)):
+        for size in ((640, 480), (1280, 720)):
             display, _, obs = processor.process(cv2.resize(scene(), size))
             self.assertEqual(display.shape[:2], size[::-1])
             self.assertEqual((obs['img_w'], obs['img_h']), size)
             self.assertEqual(obs['coordinate_space'], 'corrected')
             self.assertTrue(obs['guidance']['ui_only'])
             self.assertEqual(processor.tracker.index, 1)
+            if size == (640, 480):
+                np.testing.assert_array_equal(obs['camera_adaptation']['reference_to_processing'], np.eye(3))
 
     def test_shared_jpeg_json_roundtrip_has_no_control_observation(self):
         pipeline = DoorSimFrontPipeline(FakeDetector(), self.cfg)
         with tempfile.TemporaryDirectory() as directory:
             frame_path = str(Path(directory)/'momo_frame_front.bin')
             det_path = str(Path(directory)/'momo_det_front.json')
-            frame_writer = ShmFrameWriter(frame_path, 640, 360)
+            frame_writer = ShmFrameWriter(frame_path, 640, 480)
             det_writer = ShmJsonWriter(det_path)
             frame_reader = ShmFrameReader(frame_path)
             try:
@@ -133,7 +136,7 @@ class DoorSimTests(unittest.TestCase):
         import front
         with tempfile.TemporaryDirectory() as directory:
             source = str(Path(directory)/'door.avi')
-            writer = cv2.VideoWriter(source, cv2.VideoWriter_fourcc(*'MJPG'), 10, (640, 360))
+            writer = cv2.VideoWriter(source, cv2.VideoWriter_fourcc(*'MJPG'), 10, (640, 480))
             self.assertTrue(writer.isOpened())
             for _ in range(3):
                 writer.write(scene())
@@ -198,9 +201,13 @@ class DoorSimTests(unittest.TestCase):
             self.assertEqual(main(['--device', '/dev/video9', '--workers', '3', '--frames', '20']), 0)
         self.assertEqual(factory.call_args.args[0]['model_path'],
                          model_config('PassGate', front.YOLO_CFG)['model_path'])
+        self.assertEqual(Path(factory.call_args.args[0]['model_path']).name,
+                         'door_6_nashe_640x640_nv12.hbm')
         self.assertEqual(entry.call_args.args[0],
                          ['--no-show', '--device', '/dev/video9', '--workers', '3', '--frames', '20'])
         self.assertIsNotNone(entry.call_args.kwargs['door_sim_processor'])
+        self.assertEqual(entry.call_args.kwargs['door_sim_processor'].cfg.cv_execution, 'resident')
+        self.assertEqual((front.W, front.H), (640, 480))
 
     def test_launcher_passes_gpu_settings_and_closes_processor_on_front_failure(self):
         import front
@@ -259,13 +266,20 @@ class DoorSimTests(unittest.TestCase):
         self.assertFalse(closer.is_alive())
 
     @unittest.skipUnless(shutil.which('clang') and shutil.which('clang++'), 'GPU arithmetic harness requires clang')
-    def test_opencl_pipeline_shares_enhanced_input_and_releases_backend(self):
+    def test_opencl_resident_pipeline_shares_clean_input_and_releases_backend(self):
+        self._assert_resident_pipeline(correction=False)
+
+    @unittest.skipUnless(shutil.which('clang') and shutil.which('clang++'), 'GPU arithmetic harness requires clang')
+    def test_opencl_corrected_pipeline_keeps_cv_resident(self):
+        self._assert_resident_pipeline(correction=True)
+
+    def _assert_resident_pipeline(self, correction):
         sys.path.insert(0, str(ROOT/'quad_cv_kit'))
         sys.path.insert(0, str(ROOT/'quad_cv_kit/tests'))
         from opencl_host import HostRuntime
         from quad_cv_kit.src.opencl_backend import OpenCLBackend
         from quad_cv_kit.src.opencl_runtime import LocalMemory
-        cfg = replace(self.cfg, cv_backend='opencl')
+        cfg = replace(self.cfg, cv_backend='opencl', correction_enabled=correction)
         with patch('quad_cv_kit.src.opencl_backend.OpenCLRuntime', HostRuntime):
             gpu = OpenCLBackend(quality='fast', blur_mode='pyramid')
         processor = DoorSimFrameProcessor(FakeDetector(), cfg)
@@ -273,18 +287,45 @@ class DoorSimTests(unittest.TestCase):
         local_memory.start()
         try:
             with patch('to32.task_door_sim.perception.create_backend',
-                       return_value=(gpu, dict(requested='opencl', **gpu.runtime.info))) as factory:
+                       return_value=(gpu, dict(requested='opencl', **gpu.runtime.info))) as factory, \
+                 patch('quad_cv_kit.src.detect_red_gate.detect', side_effect=AssertionError('CPU CV forbidden')), \
+                 patch('to32.task_door_sim.perception.build_gate_guidance', side_effect=AssertionError('CPU guidance forbidden')):
                 display, detections, obs = processor.process(scene())
                 self.assertEqual(factory.call_args.args, ('opencl', 'Mali', 'opencl', 'pyramid', 'fast'))
                 self.assertIs(processor.tracker.cv.backend, gpu)
-                self.assertTrue(processor.tracker.cv.adaptive_search)
+                self.assertEqual(processor.tracker.cv_execution, 'resident')
                 self.assertIsNotNone(obs['geometry'])
-                self.assertEqual(obs['gpu']['cv_quality'], 'fast')
-                self.assertIn('hough_vote_compacted', obs['gpu']['kernel_ms'])
-                self.assertTrue(obs['yolo']['cv_profile']['line_extract_parallel'])
-                np.testing.assert_array_equal(processor.detector.detector.inputs[0], processor.tracker.last_cv_frame)
+                self.assertEqual(obs['gpu']['cv_quality'], 'resident')
+                self.assertEqual(obs['gpu']['pipeline_version'], 7)
+                self.assertIn('rg_hough_vote', obs['gpu']['kernel_ms'])
+                self.assertEqual(obs['yolo']['cv_profile']['intermediate_readbacks'], 0)
+                output_bytes = 640*480*3 if correction else 0
+                self.assertEqual(obs['gpu']['download_bytes'], output_bytes+800)
+                self.assertEqual(sum(value for key, value in obs['gpu']['transfer_bytes'].items()
+                                     if key.startswith('upload:resident_') and
+                                     key.endswith('_remap_source' if correction else '_preprocess_source')),
+                                 640*480*3)
+                self.assertEqual(obs['yolo']['ratio'], .75)
+                self.assertEqual(obs['yolo']['offset'], [80, 0])
+                if correction:
+                    # Device descriptors carry shape only, never host pixels.
+                    self.assertEqual(processor.tracker.last_cv_frame.shape, scene().shape)
+                    self.assertFalse(processor.tracker.last_cv_frame.flags.writeable)
+                    resident_pixels = next(array[:640*480*3].reshape(scene().shape)
+                                           for name, array in gpu.runtime.arrays.items()
+                                           if name.endswith('_remap_output'))
+                    np.testing.assert_array_equal(processor.detector.detector.inputs[0], resident_pixels)
+                else:
+                    np.testing.assert_array_equal(processor.detector.detector.inputs[0], processor.tracker.last_cv_frame)
                 self.assertEqual(display.shape, scene().shape)
                 self.assertTrue(detections[0]['selected'])
+                if correction:
+                    self.assertIsNotNone(obs['guidance'])
+                    np.testing.assert_array_equal(obs['camera_adaptation']['reference_to_processing'], np.eye(3))
+                _, _, steady = processor.process(scene())
+                self.assertEqual(steady['gpu']['upload_bytes'], 640*480*3+24)
+                self.assertEqual(steady['gpu']['download_bytes'], output_bytes+800)
+                self.assertEqual(steady['yolo']['cv_profile']['cpu_compute_stages'], [])
                 processor.process(cv2.resize(scene(), (1280, 720)))
                 self.assertEqual(factory.call_count, 1)
             with patch.object(gpu, 'close', wraps=gpu.close) as close:
@@ -309,7 +350,7 @@ class DoorSimTests(unittest.TestCase):
         processor = DoorSimFrameProcessor(FakeDetector(), self.cfg)
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory)/'momo_frame_front.bin')
-            fw = ShmFrameWriter(path, 640, 360)
+            fw = ShmFrameWriter(path, 1280, 720)  # Simulate a writer with legacy dimensions.
             dw = ShmJsonWriter(str(Path(directory)/'momo_det_front.json'))
             reader = ShmFrameReader(path)
             try:
@@ -319,6 +360,10 @@ class DoorSimTests(unittest.TestCase):
                 front.worker(0, q, queue.Queue(), False, threading.Event(), front.StageStats(),
                              False, None, fw, dw, processor, 'gate.hbm')
                 _, jpeg = reader.read_latest()
+                header = struct.unpack(front.MC.HDR_FMT, reader._mm[:front.MC.HDR_SIZE])
+                self.assertEqual(header[3], 640*480)
+                payload = ShmJsonReader(dw.path).read()
+                self.assertEqual((payload['img_w'], payload['img_h']), (640, 480))
                 _, raw_jpeg = cv2.imencode('.jpg', raw, [cv2.IMWRITE_JPEG_QUALITY, 100])
                 self.assertNotEqual(jpeg, raw_jpeg.tobytes())
                 generator = web_server.mjpeg_generator
@@ -361,6 +406,7 @@ class DoorSimTests(unittest.TestCase):
                 decoded = cv2.imdecode(np.frombuffer(http_jpeg, np.uint8), cv2.IMREAD_COLOR)
                 self.assertEqual(decoded.shape, raw.shape)
                 self.assertEqual(web_server.MC.WEB_PORT, 5000)
+                self.assertEqual(raw.shape, (480, 640, 3))
             finally:
                 reader.close()
                 dw.close()

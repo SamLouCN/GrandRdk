@@ -36,6 +36,7 @@ class DoorSimFrontPipeline:
             if det_writer is not None:
                 # 使用独立字段/阶段，避免穿门控制端把视觉实验当作正式门观测。
                 det_writer.write(dict(frame=frame_id, ts=time.time(), capture_ts=captured_at,
+                                      img_w=display.shape[1], img_h=display.shape[0],
                                       stage='DoorSim', status='done', dets=detections,
                                       door_sim=observation))
             return display, detections, observation

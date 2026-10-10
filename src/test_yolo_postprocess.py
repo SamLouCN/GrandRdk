@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,30 +69,34 @@ class YoloPostprocessTests(unittest.TestCase):
                 decode_boxes(np.zeros((1, 4, 4, 1), np.float32),
                              indices, 4, 8, self.weights)
 
-    def test_1280_hbm_model_through_door_sim_front_worker(self):
+    def test_640_nv12_hbm_model_through_door_sim_front_worker(self):
         import front
         from to32.task_door_sim.config import CONFIG
         from to32.task_door_sim.perception import DoorSimFrameProcessor
         from dataclasses import replace
 
         outputs = {}
-        for index, size in enumerate((160, 80, 40)):
+        for index, size in enumerate((80, 40, 20)):
             outputs[f'cls{index}'] = np.full((1, size, size, 1), -10, np.float32)
             outputs[f'box{index}'] = np.zeros((1, size, size, 4), np.float32)
-        outputs['cls0'][0, 85, 76, 0] = 4
-        outputs['box0'][0, 85, 76] = [24, 20.5, 23.5, 20.75]
+        outputs['cls0'][0, 35, 38, 0] = 4
+        outputs['box0'][0, 35, 38] = [12.25, 10.5, 11.5, 10.125]
+        submitted = []
+        def infer(tensor):
+            submitted.append(tensor)
+            return {'door': outputs}
         runtime = SimpleNamespace(
             model_names=['door'], input_names={'door': ['y', 'uv']},
-            input_shapes={'door': {'y': (1, 1280, 1280, 1)}},
+            input_shapes={'door': {'y': (1, 640, 640, 1), 'uv': (1, 320, 320, 2)}},
             output_names={'door': list(outputs)},
-            run=lambda tensor: {'door': outputs}, set_scheduling_params=lambda **kwargs: None)
+            run=infer, set_scheduling_params=lambda **kwargs: None)
         with patch.dict(sys.modules, {'hbm_runtime': SimpleNamespace(
                 HB_HBMRuntime=lambda path: runtime)}):
-            cfg = dict(front.YOLO_CFG, model_path=str(ROOT/'models/door_4_nashe_1280x1280_nv12.hbm'),
+            cfg = dict(front.YOLO_CFG, model_path=str(ROOT/'models/door_6_nashe_640x640_nv12.hbm'),
                        class_names=['door'], target_class_names=['door'], target_class_ids=[])
             detector = function.YoloDetector(cfg)
-        processor = DoorSimFrameProcessor(detector, replace(CONFIG, correction_enabled=False))
-        raw = np.full((360, 640, 3), (120, 90, 40), np.uint8)
+        processor = DoorSimFrameProcessor(detector, replace(CONFIG, correction_enabled=False, cv_backend='cpu'))
+        raw = np.full((480, 640, 3), (120, 90, 40), np.uint8)
         q = queue.Queue()
         q.put((8, raw, None, time.time()))
         q.put(None)
@@ -103,6 +108,16 @@ class YoloPostprocessTests(unittest.TestCase):
         self.assertTrue(published[0]['door_sim']['valid'])
         np.testing.assert_allclose(published[0]['dets'][0]['bbox'], [210, 120, 400, 285])
         self.assertAlmostEqual(published[0]['dets'][0]['score'], 1/(1+np.exp(-4)), places=6)
+        self.assertEqual(submitted[0]['door']['y'].shape, (1, 640, 640, 1))
+        self.assertEqual(submitted[0]['door']['uv'].shape, (1, 320, 320, 2))
+        from utils.py_utils.preprocess import resized_image, bgr_to_nv12_planes
+        letterboxed = resized_image(raw, 640, 640)
+        np.testing.assert_array_equal(letterboxed[80:560], raw)
+        self.assertTrue(np.all(letterboxed[:80] == 127))
+        self.assertTrue(np.all(letterboxed[560:] == 127))
+        y, uv = bgr_to_nv12_planes(letterboxed)
+        np.testing.assert_array_equal(submitted[0]['door']['y'], y)
+        np.testing.assert_array_equal(submitted[0]['door']['uv'], uv)
 
     def test_repeated_vision_errors_log_traceback_and_keep_publishing(self):
         import front

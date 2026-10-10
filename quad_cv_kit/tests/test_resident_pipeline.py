@@ -25,6 +25,15 @@ def scene(dx=0, dy=0, partial=False):
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('clang++'), 'Production kernel harness requires clang')
 class ResidentPipelineTests(unittest.TestCase):
+    def test_candidate_reports_measured_endpoints_separately_from_completed_sides(self):
+        row = np.zeros(128, np.float32)
+        row[0], row[2], row[3], row[7] = 1, 1, 1, 4
+        row[16:28] = [1, 0, 50, 120, 280, 5, 1, 0, 120, 280, 5, 1]
+        row[64:68] = [100, 50, 300, 50]
+        candidate = ResidentGatePipeline.candidate(row)
+        np.testing.assert_array_equal(candidate['segments'][0], [[100, 50], [300, 50]])
+        np.testing.assert_array_equal(candidate['lines'][0]['observed_segment'], [[120, 50], [280, 50]])
+
     @classmethod
     def setUpClass(cls):
         with patch('src.opencl_backend.OpenCLRuntime', HostRuntime):

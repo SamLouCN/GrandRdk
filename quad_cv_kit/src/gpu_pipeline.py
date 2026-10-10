@@ -242,12 +242,14 @@ class ResidentGatePipeline:
         for k in range(count):
             p = row[16+k*12:28+k*12].astype(float)
             d = p[:2].copy()
+            normal = np.array([-d[1], d[0]])
             segment = row[64+k*4:68+k*4].reshape(2, 2).astype(float)
             # Output formatting only: all measured values were computed on GPU.
-            lines.append(dict(d=d, n=np.array([-d[1], d[0]]), b=float(p[2]),
+            measured = normal*p[2]+np.array([p[3], p[4]])[:, None]*d
+            lines.append(dict(d=d, n=normal, b=float(p[2]),
                 lo=float(p[3]), hi=float(p[4]), width=float(p[5]), support=float(p[6]),
                 vertical=bool(p[7]), strong_lo=float(p[8]), strong_hi=float(p[9]),
-                observed_segment=segment.copy()))
+                observed_segment=measured))
             segments.append(segment)
         corners = row[8:8+int(row[7])*2].reshape(-1, 2).astype(float)
         return dict(lines=lines, segments=segments, corners=list(corners),
