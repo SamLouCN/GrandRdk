@@ -58,6 +58,10 @@ TASK4_TABLE = TC.TASK4_TABLE
 RETURN_TABLE = TC.RETURN_TABLE
 DOOR_TABLE = TC.DOOR_TABLE  # 单独测试门任务时设置 TEST_TABLE = DOOR_TABLE
 PASS_DOOR_V2_TABLE = TC.PASS_DOOR_V2_TABLE  # 过门 v2（task_config try-import；TEST_TABLE = PASS_DOOR_V2_TABLE 即单测）
+HIT_BALL_TABLE = TC.HIT_BALL_TABLE          # 撞球（子目录版 task_hit_ball/t_hit_ball.py，NAME=HitBall）
+HIT_BALL_V2_TABLE = TC.HIT_BALL_V2_TABLE    # 撞球 v2（task/ 根目录 t_hit_ball_v2.py，NAME=HitBall_v2）
+PICK_BALL_TABLE = TC.PICK_BALL_TABLE        # 捡球（当前为空表 = 进入即 DONE，任务未实现）
+PICK_RING_TABLE = TC.PICK_RING_TABLE        # 捡环（纯开环，可无视觉单测）
 
 # ---------------- 测试框架自身配置 ----------------
 TEST_MODE_ENABLED = True       # 总开关：True = 切 AUV 即进测试模式；False = 现状不变

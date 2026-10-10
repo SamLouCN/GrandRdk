@@ -221,6 +221,18 @@ try:
 except ImportError:
     PASS_DOOR_V2_TABLE = []
 
+try:
+    from task import t_pick_ring                    # 捡环（纯开环，不用视觉/不用 TC 参数；[2026-10-10] 补挂点）
+    PICK_RING_TABLE = t_pick_ring.PICK_RING_TABLE
+except ImportError:
+    PICK_RING_TABLE = []
+
+try:
+    from task import t_hit_ball_v2                  # 撞球 v2（task/ 根目录版，NAME=HitBall_v2；
+    HIT_BALL_V2_TABLE = t_hit_ball_v2.HIT_BALL_TABLE  # 与子目录版 t_hit_ball.HIT_BALL_TABLE 同名不同文件，故另立表名）
+except ImportError:
+    HIT_BALL_V2_TABLE = []
+
 # Task1 → SearchBall → HitBall → Task2 → Door → PickBall → Return。
 STAGE_TABLE = (TASK1_TABLE + HIT_BALL_TABLE + TASK2_TABLE + DOOR_TABLE
                + SEARCH_BALL_TABLE + PICK_BALL_TABLE + TASK4_TABLE + RETURN_TABLE)
