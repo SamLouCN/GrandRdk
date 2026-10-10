@@ -4,8 +4,12 @@
 Step1（2026-10-10 用户口径，唯一公式）：
         目标航向角 = 当前实测航向角 + Kp × z角
 
-    z角 = 前视 CV 输出的 pose['yaw_error_deg']
-          （机器人系 X右/Y下/Z前；门法线相对机头的偏角，右为正）
+    z角（★ 当前为**临时固定值 +50°**，先跑通转向链；置
+        AUV_PASS_DOOR_Z_FIXED_DEG=None 才回落到读前视 CV）：
+        固定模式 —— 直接取常数，不依赖视觉；
+        CV 模式 —— door.guidance.alignment.rotation_xyz_deg[Z_ANGLE_INDEX]
+                   （task_door 已纯视觉化，不再有 pose['yaw_error_deg']；
+                    相机 X右/Y下/Z前 ⇒ 索引 1(Y) 是竖直轴=偏航，2(Z) 是光轴=像面滚转）
     Kp  = AUV_PASS_DOOR_KP_Z_YAW（默认 1.0）
     算出的目标航向**锁存一次**，之后每拍交给 turn_step 下发，直到转到目标为止。
 
@@ -19,13 +23,16 @@ depth 显式换算为「离底高度」传入，保持当前实测深度（本�
 只用无偏的航向遥测判，不看 z 抖不抖）。Kp=1 时等价于 |z| ≤ YAW_TOL_DEG。
 
 异常口径（无兜底）：
-    无 pose / controllable=False / 观测过期 → 锁不到目标，本拍不下发（wait_cmd），不完成；
+    CV 模式下无姿态/过期 → 锁不到目标，本拍不下发（wait_cmd），不完成
+    （固定 z 角模式下不会有这种情况）；
     无 actual_yaw 或 actual_depth_cm 遥测 → wait_cmd（本拍不下发），不以 0 兜底。
 
 参数（可写在 task_config.py，缺项全部走本文件默认值，不改配置也能跑）：
     AUV_PASS_DOOR_STAGE      阶段名，默认 'PassGate'
                              （★ 与 stage_model 模型映射、前视发布口径一致；
                                改名要同步 stage_model，否则前视不发布本阶段观测）
+    AUV_PASS_DOOR_Z_FIXED_DEG  ★ 固定 z 角，默认 50.0；置 None 改为读前视 CV
+    AUV_PASS_DOOR_Z_ANGLE_INDEX CV 模式取 rotation_xyz_deg 的下标，默认 1(Y=竖直轴)
     AUV_PASS_DOOR_KP_Z_YAW   唯一增益 Kp，默认 1.0
     AUV_PASS_DOOR_YAW_TOL_DEG 转向到位容差，默认 1.5
     AUV_PASS_DOOR_TURN_HOLD_N 到位保持拍数，默认 5
@@ -63,7 +70,7 @@ def _num(key, default):
 
 
 class PassDoorStep1(Stage):
-    """Step1：用 CV 的 z 角把机头转正（目标航向 = 实测航向 + Kp × z角）。"""
+    """Step1：拿 z 角（当前为固定 +50°）把机头转正 —— 目标航向 = 实测航向 + Kp × z角。"""
 
     NAME = str(getattr(TC, 'AUV_PASS_DOOR_STAGE', 'PassGate'))
 
@@ -77,6 +84,16 @@ class PassDoorStep1(Stage):
             self.turn_hold_n = 5
         self.yaw_sign = _num('AUV_PASS_DOOR_YAW_SIGN', 1.0)    # 现场定号
         self.stale_s = _num('AUV_PASS_DOOR_STALE_S', 0.5)      # 观测超期秒
+        # ★ 临时：固定 z 角先跑通转向（默认 +50°）。置 None 才回落到读前视 CV。
+        self.z_fixed = getattr(TC, 'AUV_PASS_DOOR_Z_FIXED_DEG', 50.0)
+        try:
+            self.z_fixed = None if self.z_fixed is None else float(self.z_fixed)
+        except (TypeError, ValueError):
+            self.z_fixed = 50.0
+        try:
+            self.z_axis = int(getattr(TC, 'AUV_PASS_DOOR_Z_ANGLE_INDEX', 1))
+        except (TypeError, ValueError):
+            self.z_axis = 1
         shm = str(getattr(ctx.cfg, 'AUV_SHM_DIR', None)
                   or getattr(TC, 'AUV_SHM_DIR', '/dev/shm'))
         self.det_path = os.path.join(
@@ -84,10 +101,18 @@ class PassDoorStep1(Stage):
 
     # ---------------- 观测：只取 z 角 ----------------
     def _z_deg(self, now):
-        """读前视 door 观测里的 z 角 → (z_deg, frame)；任何异常/过期 → (None, None)
+        """z 角 → (z_deg, frame)；取不到 → (None, None)
 
-        只认 pose 存在且可控的帧；无 pose（四点不可用/跟踪帧）一律当无 z 角处理。
+        ① 固定值模式（AUV_PASS_DOOR_Z_FIXED_DEG，默认 +50°）：不读 CV，直接给常数
+           —— 先把"算目标航向 → turn_step 下发 → 转到目标"这条链跑通上水验证。
+        ② 固定值置 None 时读前视 CV：door.guidance.alignment.rotation_xyz_deg[Z_ANGLE_INDEX]。
+           ★ 新链路（task_door 已纯视觉化）不再输出 pose['yaw_error_deg']，只剩 PnP 的
+             相机系三轴旋转；哪一轴等于"偏航"必须现场确认：
+             相机 X右/Y下/Z前 ⇒ **Y(索引1) 才是绕竖直轴的偏航**，Z(索引2) 是光轴=像面滚转。
+             默认取索引 1；现场把船故意转 10° 看哪个分量跟着变即可定死。
         """
+        if self.z_fixed is not None:
+            return self.z_fixed, None                              # 固定值：不依赖视觉
         try:
             with open(self.det_path, encoding='utf-8') as f:
                 rec = json.load(f)
@@ -95,25 +120,25 @@ class PassDoorStep1(Stage):
             if not 0.0 <= now - ts <= self.stale_s:
                 return None, None                                  # 过期：写端没在更新
             door = rec.get('door') or {}
-            if not door.get('valid'):
-                return None, None
-            pose = door.get('pose') or {}
-            z = pose.get('yaw_error_deg')
-            if z is None or pose.get('controllable') is False:
-                return None, None                                  # 四点不可用/不可控
-            z = float(z)
+            align = ((door.get('guidance') or {}).get('alignment')) or {}
+            rot = align.get('rotation_xyz_deg')
+            if rot is None or len(rot) <= self.z_axis:
+                return None, None                                  # 姿态不可用/未解出
+            z = float(rot[self.z_axis])
             if z != z:                                             # NaN
                 return None, None
             return z, rec.get('frame')
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
             return None, None                                      # 读到半个 JSON / 文件不存在
 
     # ---------------- Stage 契约 ----------------
     def enter(self, now):
         self.st = {}                                               # 本步内部状态（锁存目标/计数器/帧号）
-        self.ctx.say('穿门 Step1 启动：目标航向 = 实测航向 + %.2f × z角 → turn_step 下发到板端；'
-                     '到位 |err| ≤ %.1f° 连续 %d 拍（z 取自 %s）'
-                     % (self.kp, self.yaw_tol, self.turn_hold_n, os.path.basename(self.det_path)))
+        src = ('固定 %.1f°' % self.z_fixed) if self.z_fixed is not None else \
+              ('前视 CV %s[轴%d]' % (os.path.basename(self.det_path), self.z_axis))
+        self.ctx.say('穿门 Step1 启动：目标航向 = 实测航向 + %.2f × z角（z 来源：%s）'
+                     ' → turn_step 下发到板端；到位 |err| ≤ %.1f° 连续 %d 拍'
+                     % (self.kp, src, self.yaw_tol, self.turn_hold_n))
 
     def _height_cm(self, depth_cm):
         """固件深度(cm，水面下) → turn_step 要的**离底高度**(cm)。
@@ -144,12 +169,13 @@ class PassDoorStep1(Stage):
             z, _ = self._z_deg(now)
             if z is None:
                 TF._say_throttled(self.ctx, st, now,
-                                  'Step1 无可用 z 角（无 pose／不可控／过期），等观测后锁存目标')
+                                  'Step1 CV 模式无可用 z 角（无姿态/不可控/过期），等观测后锁存目标')
                 return TF.wait_cmd(self.NAME, 'Step1 无 z 角，本拍不下发')
             st['yaw_tgt'] = _wrap180(yaw_now + self.kp * z * self.yaw_sign)
             st['z0'] = z
-            self.ctx.say('Step1 目标航向锁存：%.1f°（实测 %.1f° + %.2f×%+.2f°），交 turn_step 下发'
-                         % (st['yaw_tgt'], yaw_now, self.kp, z))
+            self.ctx.say('Step1 目标航向锁存：%.1f°（实测 %.1f° + %.2f×%+.2f°，z 来源 %s），交 turn_step 下发'
+                         % (st['yaw_tgt'], yaw_now, self.kp, z,
+                            '固定值' if self.z_fixed is not None else 'CV'))
 
         # ---- 转向：把锁存的目标 yaw 交给 turn_step 下发到板端（0x09 yaw=目标绝对角） ----
         turn_st = st.setdefault('turn', {})
