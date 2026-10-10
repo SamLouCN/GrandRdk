@@ -109,9 +109,20 @@ class Mission(object):
                     self.ctx.say('全部阶段完成')
                     return _StopCmd.make()
                 cls = self.table[self.idx]
-                self.current = cls(self.ctx)
                 self._set_stage(getattr(cls, 'NAME', cls.__name__))
-                self.current.enter(now)
+                # [2026-10-10 修] 构造 + enter 必须同样受保护：原实现只在 step 外包 try，
+                #   阶段 __init__/enter 抛异常会**冒泡出 mission.step** → 绕过下面的停推收尾，
+                #   直接打到 dispatcher（无兜底）——真机上表现为"任务静默挂死、连停推帧都没有"。
+                try:
+                    self.current = cls(self.ctx)
+                    self.current.enter(now)
+                except Exception as e:
+                    self.ctx.say('阶段 %s 初始化/进入异常: %r —— 立即停推收尾' % (self.stage, e))
+                    self.current = None
+                    self.done = True
+                    self._stop_sent = True       # 收尾帧随本拍返回，不再重发
+                    self._set_stage('DONE')
+                    return _StopCmd.make('ABORT')
                 self.ctx.say('→ 阶段 %d/%d: %s'
                              % (self.idx + 1, len(self.table), self.stage))
             try:

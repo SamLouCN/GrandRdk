@@ -49,6 +49,8 @@ class AuvMode(ModeBase):
         self.log_every = float(getattr(TC, 'AUV_LOG_EVERY_S', 1.0))
         self._last_log_ts = 0.0
         self._last_note_stage = ''
+        self._paused_since = None      # [2026-10-10] 连续 paused（本拍不发 0x09）起始时刻
+        self._paused_log_ts = 0.0      # paused 日志节流时间戳
 
     # ---------------- 生命周期 ----------------
     def on_enter(self, prev_id):
@@ -64,10 +66,14 @@ class AuvMode(ModeBase):
         self.depth_kalman = DepthKalmanLauncher(TC, log=self.log)
         self.depth_kalman.ensure_started()
         n = len(getattr(TC, 'STAGE_TABLE', []) or [])
+        self._paused_since = None
+        self._paused_log_ts = 0.0
         if n == 0:
             self.log("[AUV] 阶段表为空（v2.5 骨架）—— 状态机开机即 DONE，不会下发运动指令")
         else:
-            self.log("[AUV] 任务状态机已就绪（%d 个阶段）" % n)
+            self.log("[AUV] 任务状态机已就绪（%d 个阶段）：%s"
+                     % (n, ' → '.join(getattr(c, 'NAME', getattr(c, '__name__', str(c)))
+                                      for c in (getattr(TC, 'STAGE_TABLE', []) or []))))
 
     def on_exit(self, next_id):
         # 切走前先停推：退出时上一拍可能仍挂着任务最后一段推力（对齐 TestMode.on_exit 做法）
@@ -106,9 +112,12 @@ class AuvMode(ModeBase):
             return
         cmd = self.mission.step(now, dt, self.last_tel)
         if not cmd:                       # None = 任务已结束，不再下发
+            self._paused_since = None
             return
         if cmd.get('paused'):
+            self._note_paused(now, cmd)   # 本拍不发 0x09：留下可读原因（原来完全静默）
             return
+        self._paused_since = None
         self.state = "run" if cmd["stage"] not in ("DONE", "ABORT") else "idle"
         yaw = apply_yaw_mirror(cmd["yaw"], self.yaw_mirror)
         # 推力符号在**输出侧**统一施加（2026-10-08）：任务系 → 固件系的换算只在这一处，
@@ -126,6 +135,24 @@ class AuvMode(ModeBase):
                 sway=sway,
                 stick_stop=cmd["stop"]),  # 仅任务结束时置 1 停推
             self._note(now, cmd))
+
+    def _note_paused(self, now, cmd):
+        """paused = 本拍不下发 0x09（如等遥测/等判据）。首拍立即提示，之后按 log_every 重复。
+
+        [2026-10-10 增] 与 test_runner 同款修复：原来 paused 是裸 return —— 任务静默不动、
+        日志里没有任何线索。现在显式打出"本拍没发 0x09 + 原因 + 已持续多久"。
+        """
+        note = str(cmd.get('note') or '')
+        if self._paused_since is None:
+            self._paused_since = now
+            self._paused_log_ts = now
+            self.log("[AUV] 本拍不下发 0x09（paused）：%s —— 判据/遥测未就绪时会持续如此，"
+                     "属宁停勿猜，不是掉线" % (note or '无说明'))
+            return
+        if (now - self._paused_log_ts) >= max(1.0, self.log_every):
+            self._paused_log_ts = now
+            self.log("[AUV] 仍不下发 0x09（已持续 %.1fs）：%s"
+                     % (now - self._paused_since, note or '无说明'))
 
     def _note(self, now, cmd):
         """0x09 日志标注：阶段切换立即打，同阶段内按 AUV_LOG_EVERY_S 节流"""

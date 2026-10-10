@@ -65,12 +65,16 @@ class TestMode(ModeBase):
         self.log_every = float(getattr(TC, 'AUV_LOG_EVERY_S', 1.0))
         self._last_log_ts = 0.0
         self._last_note_stage = ''
+        self._paused_since = None       # [2026-10-10] 连续 paused（本拍不发 0x09）起始时刻
+        self._paused_log_ts = 0.0       # paused 日志节流时间戳
 
     # ---------------- 生命周期 ----------------
     def on_enter(self, prev_id):
         super().on_enter(prev_id)
         self._ignore_cnt = 0
         self._loop_wait_ts = None
+        self._paused_since = None
+        self._paused_log_ts = 0.0
         # 模式帧不被急停闩锁抑制：与固件配合，AUV 语义就位优先（协议 §12.3，同 AuvMode）
         self.send_downlink(S.frame_mode(S.MODE_AUV), "0x04 AUV(测试模式)")
         # 测试表直读 test_config.TEST_TABLE（Stage 类列表，写法同 STAGE_TABLE）；
@@ -85,6 +89,10 @@ class TestMode(ModeBase):
         self.depth_kalman.ensure_started()
         self.log("[TEST] 测试模式接管 AUV 位：test_config.TEST_TABLE 共 %d 项；"
                  "上位机切 ROV(mode=0) 即退出停推" % len(table))
+        if table:
+            # [2026-10-10] 明确打出即将执行的阶段类（填错表时一眼可见，不用等日志里找）
+            self.log("[TEST] 测试阶段：%s"
+                     % ' → '.join(getattr(c, 'NAME', getattr(c, '__name__', str(c))) for c in table))
         if not table:
             self.log("[TEST] 警告：TEST_TABLE 为空 —— 进入即 DONE，不下发运动指令"
                      "（去 test_mode/test_config.py 写 TEST_TABLE）")
@@ -127,10 +135,13 @@ class TestMode(ModeBase):
             return
         cmd = self.mission.step(now, dt, self.last_tel)
         if not cmd:                      # None = 测试表已跑完（收尾 stop 帧已发）
+            self._paused_since = None
             self._maybe_loop(now)        # 按 TEST_LOOP 决定是否重跑
             return
         if cmd.get('paused'):
+            self._note_paused(now, cmd)  # 本拍不发 0x09：必须留下可读原因（原来完全静默）
             return
+        self._paused_since = None
         yaw = apply_yaw_mirror(cmd["yaw"], self.yaw_mirror)
         # 推力符号在**输出侧**统一施加（2026-10-08）：任务系 → 固件系的换算只在这一处，
         # 覆盖 forward_step/sway_step/撞球 ram·back/过门 surge（它们各自的 cmd 都到这里）。
@@ -144,6 +155,24 @@ class TestMode(ModeBase):
                            sway=sway,
                            stick_stop=cmd["stop"]),  # 仅收尾停推时置 1
             self._note(now, cmd))
+
+    def _note_paused(self, now, cmd):
+        """paused = 本拍不下发 0x09（如等遥测/等判据）。首拍立即提示，之后按 log_every 重复。
+
+        [2026-10-10 增] 以前这里是裸 return：机器一动不动而日志里什么都没有，
+        排查只能靠猜。现在把"本拍没发 0x09 + 原因(note)"显式打出来，并给出累计时长。
+        """
+        note = str(cmd.get('note') or '')
+        if self._paused_since is None:
+            self._paused_since = now
+            self._paused_log_ts = now
+            self.log("[TEST] 本拍不下发 0x09（paused）：%s —— 判据/遥测未就绪时会持续如此，"
+                     "属宁停勿猜，不是掉线" % (note or '无说明'))
+            return
+        if (now - self._paused_log_ts) >= max(1.0, self.log_every):
+            self._paused_log_ts = now
+            self.log("[TEST] 仍不下发 0x09（已持续 %.1fs）：%s"
+                     % (now - self._paused_since, note or '无说明'))
 
     def _maybe_loop(self, now):
         """测试表跑完后的处理：TEST_LOOP=True → 等 0.5s 从头重跑；否则保持 DONE 静默。"""

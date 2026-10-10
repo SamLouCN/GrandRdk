@@ -81,6 +81,35 @@ class PassDoorV2(Stage):
         self.log('穿门 v2 启动：%d 门循环（%s）'
                  % (self.n_gates, ' → '.join('%s%+.0f°/%dcm' % ('门%d ' % (i + 1), g['turn'], g['height'])
                                               for i, g in enumerate(self.gates))))
+        self._enter_selfcheck(now)
+
+    def _enter_selfcheck(self, now):
+        """进入时的前置自检（[2026-10-10 增]）：把"为什么不动的先决条件"提前说清楚。
+
+        本阶段的每门 sub=0 是**相对转向**（目标角 = 当前 yaw + 门转角），所以**没有 yaw
+        遥测就没有目标角** —— 按设计本拍不下发 0x09（宁停勿猜）→ 现场表现为"机器一动不动，
+        又没有明显报错"。同理 sub=1 对中依赖前视检测帧、sub=0 的定深依赖融合深度。
+        这里一次性播报三条链路是否可用，缺哪条直接点名缺哪条。
+        """
+        y = t_function._tel_f(self.ctx, 'actual_yaw')
+        d = {}
+        try:
+            d = self.ctx.depth.read(now) or {}
+        except Exception:
+            d = {}
+        depth_ok = bool(d.get('ok'))
+        depth_v = d.get('clearance')
+        self.log('%s 前置自检：yaw遥测=%s 融合深度=%s(clearance=%s)'
+                 % (self.NAME,
+                    ('%.1f°' % y) if y is not None else '不可用',
+                    'ok' if depth_ok else ('超期/缺失' if d else '不可用'),
+                    ('%.3fm' % depth_v) if isinstance(depth_v, (int, float)) else 'N/A'))
+        if y is None:
+            self.log('%s [WARN] 无 yaw 遥测 → sub=0 无法锁存转向目标角：本阶段将一直等待、'
+                     '不下发任何 0x09（机器不会动）。先查下位机串口链路与 $TEL 是否正常。' % self.NAME)
+        if not depth_ok:
+            self.log('%s [WARN] 融合深度不可用 → sub=0 的定深判据永不满足，转到角度后会停在原地'
+                     '（需 depth_kalman 在跑）。' % self.NAME)
 
     def step(self, now, dt):
         self._now = now                       # 刷新时间戳缓存
@@ -121,7 +150,7 @@ class PassDoorV2(Stage):
         if not gst.get('turned'):
             tgt = t_function.lock_turn_target(self.ctx, tst, now, turn_deg, stage=self.NAME)
             if tgt is None:
-                return t_function.wait_cmd(self.NAME, '%s 无 yaw 遥测，等待(不以0兜底)' % self._gname())
+                return t_function.wait_cmd(self.NAME, '%s 无 yaw 遥测：本拍不下发 0x09（等遥测，不以 0° 兜底）' % self._gname())
             cmd = t_function.turn_step(self.ctx, tst, now, dt, target_yaw_deg=tgt,
                                        target_height_cm=height, stage=self.NAME)
             if cmd is not None:
@@ -150,7 +179,7 @@ class PassDoorV2(Stage):
         if gst.get('yaw_ref') is None:
             y = t_function._tel_f(self.ctx, 'actual_yaw')
             if y is None:
-                return t_function.wait_cmd(self.NAME, '%s 无 yaw 遥测，等待(不以0兜底)' % self._gname())
+                return t_function.wait_cmd(self.NAME, '%s 无 yaw 遥测：本拍不下发 0x09（等遥测，不以 0° 兜底）' % self._gname())
             gst['yaw_ref'] = float(y)
             gst['last_seen'] = None            # 最后见有效门帧时刻（None=从未见过门）
             gst['ok_cnt'] = 0
@@ -208,7 +237,7 @@ class PassDoorV2(Stage):
         if gst.get('t0') is None:                         # 起步：锁存航向 + 前冲计时 + 本门高度计基线容器
             y = t_function._tel_f(self.ctx, 'actual_yaw')
             if y is None:
-                return t_function.wait_cmd(self.NAME, '%s 无 yaw 遥测，等待(不以0兜底)' % self._gname())
+                return t_function.wait_cmd(self.NAME, '%s 无 yaw 遥测：本拍不下发 0x09（等遥测，不以 0° 兜底）' % self._gname())
             gst['yaw_ref'] = float(y)
             gst['t0'] = now
             gst['alt'] = dict(B=dict(buf=[], base=None, hit=0, done_at=None),
