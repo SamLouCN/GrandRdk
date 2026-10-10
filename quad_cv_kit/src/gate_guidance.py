@@ -10,8 +10,42 @@ from .detect_red_gate import project_gate_geometry
 AXES = 'camera: X right, Y down, Z forward; right-hand rotations Rz*Ry*Rx'
 
 
+def sharpen_frame(frame, amount=.6, valid_mask=None, backend=None):
+    """Brightness-only unsharp mask; no contrast, HSV or saturation change.
+
+    Blur max(B,G,R) with sigma=1.2 and a three-level noise threshold. Normalize
+    the Gaussian over valid nonblack pixels so correction borders cannot create
+    halos. Scale the original BGR channels together, retaining their ratios.
+    """
+    if not math.isfinite(amount) or not 0 <= amount <= 2:
+        raise ValueError('Sharpen amount must be finite and in [0, 2]')
+    if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError('Sharpen input must be uint8 BGR')
+    if valid_mask is not None and valid_mask.shape != frame.shape[:2]:
+        raise ValueError('Sharpen valid mask must match the frame')
+    if backend is not None:
+        return backend.sharpen(frame, amount, valid_mask)
+    if amount == 0:
+        return frame.copy()
+    value = frame.max(axis=2).astype(np.float32)
+    active = value > 0
+    if valid_mask is not None:
+        active &= np.asarray(valid_mask, bool)
+    weights = active.astype(np.float32)
+    numerator = cv2.GaussianBlur(value*weights, (11, 11), 1.2)
+    denominator = cv2.GaussianBlur(weights, (11, 11), 1.2)
+    blur = np.divide(numerator, denominator, out=value.copy(), where=denominator > 0)
+    detail = value-blur
+    detail[np.abs(detail) < 3] = 0
+    target = np.rint(np.clip(value+amount*detail, 0, 255))
+    scale = np.divide(target, value, out=np.ones_like(value), where=active)
+    result = np.rint(np.clip(frame.astype(np.float32)*scale[:, :, None], 0, 255)).astype(np.uint8)
+    result[~active] = frame[~active]
+    return result
+
+
 def enhance_cv_contrast(frame, gain=1.2, valid_mask=None, clahe_clip=2.0, clahe_blend=.6,
-                        sharpen_amount=.6, saturation_gain=1.25):
+                        sharpen_amount=.6, saturation_gain=1.25, backend=None):
     """CLAHE, global contrast, value-channel unsharp mask and HSV saturation.
 
     CLAHE limits local noise amplification. Invalid correction borders are filled
@@ -27,6 +61,8 @@ def enhance_cv_contrast(frame, gain=1.2, valid_mask=None, clahe_clip=2.0, clahe_
     if (not math.isfinite(sharpen_amount) or not 0 <= sharpen_amount <= 2
             or not math.isfinite(saturation_gain) or not 1 <= saturation_gain <= 2):
         raise ValueError('Sharpen amount must be in [0, 2], saturation gain in [1, 2]')
+    if backend is not None:
+        return backend.enhance(frame, gain, valid_mask, clahe_clip, clahe_blend, sharpen_amount, saturation_gain)
     if (gain == 1 and (clahe_clip == 0 or clahe_blend == 0)
             and sharpen_amount == 0 and saturation_gain == 1):
         return frame.copy()

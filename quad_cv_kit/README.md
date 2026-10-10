@@ -2,6 +2,280 @@
 
 视频：读取相机参数 → 校正帧 → 整门 YOLO 检测 → 选取当前画面面积最大的门框 → OpenCV 拟合 → 标注四边像素长度及水平线倾角。校正前、校正后视频共用这一次识别的结果。
 
+## S100 单视频预推演和性能日志
+
+`demo/demo_video.py` 保留原有双视频流程，默认 `--pipeline legacy`。
+使用 `--pipeline red-gate` 可验证当前优化后的 `detect_red_gate/gate_models`，
+支持 S100 HBM/BPU 推理，输出单个 `after.mp4` 和四阶段逐帧日志。
+
+在 **GrandRdk 工程根目录**执行：
+
+```bash
+python3 quad_cv_kit/demo/demo_video.py quad_cv_kit/res/test.mp4 \
+  --pipeline red-gate --backend hbm \
+  --weights models/door_4_nashe_1280x1280_nv12.hbm \
+  --class-names door \
+  --out quad_cv_kit/runs \
+  --perf-log quad_cv_kit/logs/perf.log
+```
+
+HBM 模型沿用当前穿门配置对应的单类整门模型；`--class-names` 顺序必须匹配模型。
+适配器只读取工程现有 `src/function.py` 的 HBM 检测器和解码工具，需要板端
+`hbm_runtime`。不启动相机、`front.py`、Web 或共享帧，不依赖任务阶段。
+默认是 **BPU YOLO + CPU OpenCV**；加 `--cv-backend opencl` 使用下面的显式 GPU 后端。
+HBM 输入尺寸从编译模型读取，`--imgsz/--device` 仅适用于 Ultralytics。
+
+### S100 GPU Hough、拟合和图像处理
+
+S100 的 Mali GPU 使用 OpenCL；本实现直接通过 `ctypes` 调用板端 OpenCL ICD，
+编译 `src/kernels/red_gate.cl`，无需 PyOpenCL、CUDA 或替换整个 OpenCV 安装。
+系统需提供可加载的 `libOpenCL.so.1` 和匹配的 Mali 驱动/设备权限；
+若厂商库使用其他路径，可设置 `GRDK_OPENCL_LIBRARY=/实际路径/libOpenCL.so`。
+
+视频入口和板端自检默认 `--cv-quality fast`；旧命令自动使用快速算法。
+加 `--cv-quality precise` 可对照原来的 Hough、三次 LSD 和逐像素裁剪。
+`--cv-blur` 单独控制大尺度模糊，与质量选项独立。
+
+默认 `--cv-search adaptive` 增加预测四边搜索带和按需 LSD，不再降低采样精度。
+`--cv-search full` 使用此前每次搜索完整 YOLO ROI 的行为，供同一视频对照。
+两种搜索策略均支持 `fast/precise`；质量选项控制原有 Hough 和批量采样算法。
+
+局部搜索只用于完整、经过几何验证的当前门框：光流内点比例至少 80%，
+运动拟合 RMS 不超过 1.5px，帧间位移不超过 20px。搜索带按杆宽、运动量和
+拟合误差扩大，四个裁剪区域保持 640×360 画布坐标和 LSD 缩放网格。
+颜色证据和有效像素检查仍覆盖完整 ROI；搜索带外存在可能形成杆线的红色
+证据（包括断续小片段）就直接完整搜索。首帧、目标切换、跟踪失败、残缺门框
+均完整搜索；每约 0.5 秒在下一个搜索帧强制完整搜索，不延长 `--cv-every`。
+
+局部搜索先运行掩码 LSD 和 Hough，仅在唯一完整模型的四边均有至少 90% 支持、
+四角与预测偏差不超过 4px、杆宽连续且没有未解释杆线证据时考虑接受。
+最终四条杆用原像素密度重新 CPU 拟合、裁剪并执行原来的几何/八段支持检查，
+不直接接受 GPU 粗采样端点。弱颜色证据或第一轮不满足条件会补跑色度 LSD
+（`precise` 也补灰度 LSD），复用当前帧掩码/Hough 种子；仍失败则同一帧
+恢复完整 ROI 和原有全部 LSD。不能用上一帧的四边补造当前帧缺失杆线。
+
+新增日志 `search_scope=full/bands`、`lsd_policy=all/mask-only/supplemented`、
+`band_fallback_reason`、`line_extraction_regions`、`band_extraction_pixels`，
+计数包含成功、回退及种子复用。回退帧计时包含局部尝试和完整搜索的全部开销，
+不会只报告最后一次搜索。保守回退可能使复杂场景搜索更慢；精度和板端耗时
+仍应以真实录像对照为准。
+
+快速模式针对 Mali 日志中 `hough_runs=105ms`、`trim_extract=28ms` 的热点：
+
+- Hough 从 720 降到 360 个角度（0.5°），前景按棋盘格取一半像素投票，
+  投票阈值相应减半；原分辨率掩码仍用于线段支持及拟合。
+- 按票数保留方向多样的峰值，2°/4px 邻域抑制重复峰；每类方向最多 128 个，
+  总计最多 256 个。只保留下游杆线拟合允许的水平/垂直倾角范围。
+- 每个峰值使用一个 64 线程工作组，将直线裁到图像边界后每 2px 并行采样。
+  连续段从本地命中标志提取，快速模式不再运行全局串行贪心像素消耗。
+- 杆段裁剪每约 2px 采样；`trim_sections` 并行计算宽度和强颜色，
+  `trim_extract_fast` 只聚合已有数据，避免每条线内部的串行截面探测。
+- LSD 保留掩码和色度两次，省去灰度一次，保留弱红杆的色度证据。
+  分段和对比度采样密度减半，模型搜索每类最多取 8 条线（原为 10 条）。
+
+精度取舍：Hough 种子角度更粗、候选数受限，可能漏掉杂波中的弱杆或相近平行杆；
+裁剪端点通常有约 2px 的采样误差，但这不是实际视频的误差保证。
+支持率、真实缺边和几何有效性检查仍执行。自检增加快速 Hough、断口、裁剪与
+几何检查，真实录像应同时比较画面与 `rows.jsonl`。尚未在 S100 上复测，
+不能将运算量降低直接换算为实际提速或 100ms 达标。
+
+先在板端运行自检，再执行视频：
+
+```bash
+python3 quad_cv_kit/demo/check_opencl.py --gpu-device Mali \
+  --cv-blur pyramid --benchmark-frames 12 \
+  --report quad_cv_kit/logs/opencl_check.json
+
+python3 quad_cv_kit/demo/demo_video.py quad_cv_kit/res/test.mp4 \
+  --pipeline red-gate --backend hbm \
+  --weights models/door_4_nashe_1280x1280_nv12.hbm \
+  --class-names door --cv-backend opencl --gpu-device Mali --cv-blur pyramid \
+  --out quad_cv_kit/runs --perf-log quad_cv_kit/logs/perf.log
+```
+
+`check_opencl.py` 要求真实 GPU，编译并执行高斯模糊、颜色掩码、增强、校正、
+Hough、批量拟合及完整/缺边/残缺门的检测对照；通过返回 0，设备、编译、数值或
+几何检查失败返回 1。不要在自检失败时把运行结果作为加速验证。
+
+GPU 执行的阶段：
+
+- 相机映射表的双线性重采样。
+- 融合亮度锐化：直接从 BGR 提取 V，在工作组内完成高斯模糊和通道同比例缩放。
+- 三尺度可分离高斯模糊、颜色阈值、形态学和红绿对数比。
+- Hough 前景压缩、360/720 个角度的投票、峰值及连续杆段。
+- 全部候选段的截面采样、L2 协方差拟合、宽度/残差排序和支持度过滤。
+- 完整/残缺杆段的扩展采样、断口恢复、宽度中位数和强颜色端点。
+- 多个候选四边模型的八段颜色支持检查。
+- 有序线段合并、批量断口拆分与对比度中位数。
+- 完整模型的交点、凸性、面积、边长与有效区域验证；只读回通过验证的模型。
+- 残缺门框的竖横交点、端点距离和逐线颜色证据。
+
+最新的搜索阶段使用连续数组和驻留 GPU 中间结果，详细执行范围、BPU 替代路线
+及旧 CPU 搜索/GPU 搜索对照命令见 [GPU_SEARCH.md](GPU_SEARCH.md)。
+
+第二轮流水线改造把颜色证据 HSV/LAB a 融合到 GPU，LAB 使用本机 OpenCV
+生成的 16 MiB 精确字节表，首次生成后缓存于 `runs/color_cache`。小核高斯融合
+两遍卷积，颜色模糊末遍融合局部对比度计算；跟踪支持度批量采样也在 GPU 执行。
+帧内最终输出直接驻留，只读副本共享设备输入；不再逐操作强制完成队列。
+日志 `pipeline_version=2`、`synchronization`、`dispatch` 与 `profiling_cpu_ms`
+用于核对执行路径、等待和调度开销。延后收集 GPU 事件的时间仍纳入 CV 计时。
+残缺图选择、LSD/CLAHE、连通域和光流/RANSAC 仍在 CPU；裁剪后合并可自动编译
+原生双精度实现，无编译器时在日志明确报告 Python 路径。
+
+针对 Mali 性能日志，卷积已改为 `gaussian_tiled`：64 个线程共享加载
+256 个输出像素及边界邻域，水平条带和垂直 16×16 分块减少重复全局读取，
+利用对称权重减少乘法；`--cv-blur exact` 仍使用 25/73/145 宽的原高斯核和 REFLECT_101 边界。
+精确模式的 `hough_select_parallel` 用 64 个线程共同采样、归约和清除像素，
+保留贪心候选顺序及支持率规则；候选之间仍依次处理，避免改变重叠杆归属。
+自检会比较新旧筛选内核的输出。ROI 改为矩形拷贝，CPU 截面采样改为
+预先按 float64 取整后使用 OpenCV remap；小规模交点改为显式二阶求解。
+上传改为非阻塞排队，主机数组保留至传输完成。
+
+后续 Mali 日志显示，即使分块，精确大核仍占跟踪帧约 80ms。因此 GPU 视频入口
+和板端自检默认使用 `--cv-blur pyramid`：sigma=3 与锐化 sigma=1.2 保持精确，
+sigma=9/18 使用 4×4 面积平均后在小图上卷积，再线性插值回原尺寸；缩小后的
+sigma 扣除面积平均引入的方差。大尺度卷积像素数降至约 1/16，核也缩小。
+这是一种数值近似，不能保证阈值附近掩码与精确模式完全一致；日志记录
+`blur_mode` 与 `gaussian_algorithm`。加 `--cv-blur exact` 可对照原高斯算法。
+库直接构造 `OpenCLBackend()` 仍默认精确模式，工厂和视频参数默认快速模式。
+
+自检先验证精确内核，再单独报告快速模式的合成样例掩码/颜色分数漂移及几何检查。
+测试覆盖褪色杆、白角、短断口、缺边、重叠门、白支撑腿和残缺近门；实际录像
+仍需比较 `rows.jsonl` 和画面，不能把合成样例的漂移阈值当作真实视频准确率。
+
+`red-gate` 和 DoorSim 预处理现在仅做亮度锐化，已移除 `--contrast`。
+`--sharpen 0.6` 为默认强度，0 关闭。单个 `sharpen_only` 内核直接读取 BGR，
+用 16×16 输出分块和局部内存完成 sigma=1.2 的 11×11 高斯模糊、低于 3 级
+细节抑制及锐化，再同比例缩放 BGR；不再执行 HSV、直方图、中位数和全局对比度，
+不创建整图浮点模糊中间数组。模糊按有效非黑邻域归一化，保持无效边界原样。
+校正输出留在 GPU 上供锐化使用，有效掩码与权重跨帧缓存；增强 BGR 下载给
+YOLO、CPU 光流和输出后仍保留设备副本。CPU 参考实现采用相同规则。
+日志 `enhancement_mode=sharpen-only`、`sharpening_algorithm=normalized-value-fused-tile16`
+标记该路径；用 `details_ms.enhancement` 与 `gpu.kernel_ms.sharpen_only` 区分含读回
+的总耗时和内核耗时。原通用增强函数仍供独立对照 demo 使用。
+
+OpenCV 首次 LAB 调用的查表初始化移到显式 `warmup`，连同 GPU 预处理/颜色内核
+预热计入 `initialized.init_ms`，同时记录 `warmup.warmup_ms`；不推进跟踪器、不跑
+YOLO，也不丢弃视频帧。这里减少的是首帧初始化尖峰，启动总开销仍有完整记录。
+GPU 杆段裁剪记录 `operation_ms.trim_lines`，支持验证记录 `model_side_support`；
+支持验证改为批量检查四边，因此 `model_side_checks` 包含实际执行的全部边，
+与 CPU 遇到无效边提前停止的计数可能不同。
+
+`--benchmark-frames 12` 在自检后，用含弱杆、白角和杂波的合成场景测量完整
+CV 跟踪器，分别比较 GPU Hough 与 CPU Hough＋GPU 拟合。每种配置预热 6 帧，
+报告搜索/跟踪帧均值、P95、100ms 内比例；预处理和 YOLO 不在这个 CV 预算内。
+实际录像才是最终验收依据。视频完成后终端和 `run_summary.cv_modes` 同样报告
+100ms 内比例，可用 `--cv-budget-ms` 调整报告预算；预算不会跳过检测或减少帧数。
+
+如板端 GPU Hough 仍较慢，使用 `--cv-hough cpu` 保留 GPU 拟合与图像处理，
+把 Hough 明确放回 OpenCV CPU，日志会记录 `hough_backend=cpu`。例如做同一输入对照：
+
+```bash
+python3 quad_cv_kit/demo/demo_video.py quad_cv_kit/res/test.mp4 \
+  --pipeline red-gate --backend hbm \
+  --weights models/door_4_nashe_1280x1280_nv12.hbm \
+  --class-names door --cv-backend opencl --gpu-device Mali --cv-hough cpu \
+  --out quad_cv_kit/runs/hybrid --perf-log quad_cv_kit/logs/perf_hybrid.log
+```
+
+这些改动以搜索帧 CV 低于 100ms 为优化目标，尚无新版本 S100 实测，
+不能把共享缓存读取量减少或本地测试速度当作达标证明。
+
+检测颜色证据的 LAB a 使用 GPU 精确查表，HSV 使用 GPU 整数查表转换。
+LSD 输入的 LAB/CLAHE、
+连通域、光流/RANSAC、Hough 峰值排序、裁剪后去重和残缺模型图选择也仍在 CPU。
+完整门框几何、有效区检查和拟合线的合并/拆分/对比度采样已迁至批量 OpenCL 搜索。
+这是现有 `red-gate` 流程的混合后端，`legacy` 流程未接入这些内核。
+
+`--cv-backend opencl` 找不到 GPU、编译失败或运行出错会明确停止，不会悄悄改跑 CPU。
+`--cv-backend auto` 只允许初始化时回退，`cv_backend.fallback_reason` 记录原因；
+`--cv-backend cpu` 用于同一视频的 CPU 对照。避免用 `--device 0` 选择 Mali CV 后端。
+
+精确模式 GPU Hough 使用确定性极坐标投票和连续像素支持，按票数消耗已解释的像素，
+没有固定候选数量截断。快速模式使用上述有界候选；两者均与 `HoughLinesP` 的随机处理顺序不同。
+批量拟合保留原截面、支持率、P90 残差和宽长比规则，使用 float32；
+边界阈值附近可能出现不同候选。校正采用 OpenCV 的 1/32 插值表，
+与某些使用更高精度浮点映射的 SIMD OpenCV 构建有少量像素差异。
+迁移后应核对真实视频的检测结果，合成自检不能替代准确率评估。
+
+每帧日志新增 `cv_backend` 和 `gpu`：设备名、厂商、驱动、实际选定后端、
+`operation_ms`（含传输和同步）、`kernel_ms`（OpenCL 事件测得的设备执行时间）、
+`upload_bytes/download_bytes`。`cv_profile` 中的 Hough/拟合计时仍包含完整调用耗时。
+`cv_quality`、`hough_angles`、`hough_peak_limit` 和 `line_sample_step` 记录精度配置，
+`gpu.work_counts` 记录采样前景点数、原始峰值数和实际扫描峰值数，便于判断限额影响。
+快速 Hough 的峰值抑制优先使用 `src/native/hough_peaks.c` 的 CPU float64 循环，
+保留排序、方向配额、2°/4px 阈值和候选数量。首次启动用系统 `cc` 编译，关闭
+fast-math/FMA 合并；编译产物按源码哈希存放在 `quad_cv_kit/runs/native_cache`，
+初始化计时包含编译。没有编译器时显式记录原因，使用同规则的 Python 角度索引实现。
+`gpu.peak_selector` 记录实际选择；`operation_ms` 中的
+`hough.compact_vote_peaks/hough.peak_select/hough.runs_readback` 分别拆出前半段、
+CPU 峰值筛选和连续段读回耗时，这些子项已经包含在 `hough` 总耗时中。
+快速模式的前景计数留在 GPU，直接供投票读取；计数/线段读回成批提交后只等待一次。
+颜色计算连续提交三个高斯尺度、阈值和组合，mask/score 批量读回，避免每个
+profiling 检查点强制等待 GPU。`enqueue_*` 记录 CPU 提交时间，`readback`
+包含剩余等待；完整颜色耗时看 `gpu.operation_ms.color_evidence`。
+视频及 DoorSim 使用整帧驻留范围：GPU 上的颜色结果、ROI 变换和图像副本保留至
+该帧处理结束，CPU 读取后不触发后续重复上传。`gpu.transfer_bytes/transfer_calls`
+按缓冲区统计实际主机传输，执行范围和录像命令见 `GPU_SEARCH.md`。
+ROI 颜色保留 84px 高斯/形态学上下文，4px 对齐金字塔网格；光流跟踪先计算实际
+运动，再扩展颜色范围到所有边支持探针，不截断越出 YOLO ROI 的门杆。
+部分门框的严格红色掩膜保留 48px 上下文，避免在无关的全画布上重复计算。
+`cv_profile.color_processing_size` 记录实际颜色计算尺寸。
+OpenCL Hough 与 CPU LSD 重叠执行；每次拟合前汇合，候选顺序、LSD 通道/阈值不变。
+多个 LSD 通道使用最多两个 CPU 工作线程和独立检测器，按原通道顺序收集结果；
+`lsd_worker_ms` 记录各通道完整耗时，阶段检查点记录主线程等待。
+`line_extract_parallel=true` 时 `lines.hough_join` 只记录剩余等待，完整 Hough
+耗时仍看 `gpu.operation_ms.hough`，不要与并行 LSD 耗时直接相加。
+`thread_cpu_ms` 仅计调用线程，工作线程的 CPU 使用不包含在此字段。
+几何验证在同一调用内复用交点、有效区域探针和完全相同的边支持，保留全部组合；
+`unique_model_side_checks` 记录去重后的 GPU 边验证数量。
+同一内核被多个阶段调用时，`kernel_ms` 按帧累加；不要与四阶段时间再相加。
+比较同一输入的 `search` 帧 P95、`lines.hough`、`lines.fit_filter` 和总耗时，
+才能确认加速是否抵消数据传输及调度成本。本地开发机的内核 CPU 执行测试只验证
+代码算术和屏障，未测得 S100 Mali 的速度。
+
+输出路径：
+
+- `quad_cv_kit/runs/after.mp4`：增强的校正画面、黄色 YOLO 框、绿色 CV 门边及视觉提示。
+- `quad_cv_kit/runs/rows.jsonl`：逐帧检测、几何、跟踪状态和 CV 内部诊断。
+- `quad_cv_kit/runs/camera_used.json`：实际模型、内参适配、尺寸、帧率和处理配置。
+- `quad_cv_kit/logs/perf.log`：追加写入的 JSONL；每次运行包含 `run_start`、`warmup`、
+  `initialized`、逐帧 `frame`、`encoder_finalized`、`run_summary`，失败时记录 `error`。
+
+`frame.timing_ms` 含四个可相加的阶段，单位毫秒：
+
+| 阶段 | 统计范围 |
+| --- | --- |
+| `preprocess` | 读取/解码、可选旋转、相机校正、仅亮度锐化 0.6 |
+| `yolo` | 模型输入转换、推理、检测头解码/NMS 和检测框整理 |
+| `opencv` | YOLO 目标关联、ROI 红杆检测或当前帧图像跟踪 |
+| `postprocess` | 几何换算、视觉提示、绘制、结果 JSON 序列化和视频写入 |
+
+`details_ms` 进一步拆分解码、校正、增强、绘制/结果写入和视频写入；HBM 额外记录
+`yolo_input/bpu_inference/yolo_decode_nms`。`cv_profile` 记录 CV 内部阶段和候选数，
+`cv_mode` 区分 `search/track/idle`。初始化、性能日志写入、可选预览和编码器最终收尾
+单独处理，不计入四阶段；FFmpeg 异步编码的排队/背压体现在 `video_write`，
+尾部编码等待记录在 `encoder_finalized`。汇总提供四阶段及各 CV 模式的均值、P95、最大值。
+
+视频逐帧顺序处理，保持源帧率和帧数（`--max-frames` 或预览手动停止除外）；
+输出只包含视频，不复制音轨。编码时仅给奇数宽/高补 1px 黑边。
+FFmpeg 提供 libx264 时输出 H.264，否则使用 OpenCV MPEG-4 编码。
+正常结束且编码器成功收尾后才报告完成。首次 YOLO 推理及尚未预热的检测内核初始化仍可能体现在首帧日志。
+
+默认 `--cv-every 3 --opencv-threads 3`；加 `--cv-every 1` 可逐帧完整搜索，
+加 `--max-frames 300` 可短测。录像若已校正，使用 `--no-correction`，避免再次校正。
+OpenCV 解码提前结束时可加 `--reader ffmpeg`（需要 ffmpeg/ffprobe）。
+重复运行覆盖同名视频和结果 JSON，性能日志按运行块追加。
+`--pipeline red-gate --help` 查看全部参数。
+
+开发机可切换到 PT 后端验证同一 CV/导出流程：
+
+```bash
+python3 quad_cv_kit/demo/demo_video.py quad_cv_kit/res/test.mp4 \
+  --pipeline red-gate --backend ultralytics \
+  --weights quad_cv_kit/model/best.pt --device cpu
+```
+
 ## YOLO 与改进 CV 联动的最近门视频实验
 
 `src/detect_red_gate.py` 提取红管中心线，并使用 `src/gate_models.py` 的四线交点模型容忍白色弯头缺口，支持只有部分边可见的门框。`demo/demo_video_cv_improved.py` 默认批量处理 `E:/TEST` 中的视频，使用 `model/best.pt` 和 CPU 推理。`src/yolo_red_gate.py` 负责 YOLO 目标选择、搜索区域和短时跟踪的联动。

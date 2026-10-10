@@ -3,11 +3,19 @@
 独立的纯视觉实验，参考 `move_test/task/task_door` 的前视处理和共享帧发布方式，
 复用工程根目录 `quad_cv_kit`。`sim` 表示视觉实验，不生成假检测，不控制推进器。
 
-流程：相机/视频 BGR → 相机校正 → 对比度增强 1.2 + 亮度锐化 0.6 →
+流程：相机/视频 BGR → 相机校正 → 仅亮度锐化 0.6 →
 整门 YOLO → 最大门/贴边目标连续性选择 → ROI 内 OpenCV 红杆拟合和短时跟踪 →
 增强图叠加黄色 YOLO 框、绿色 CV 边及校正坐标下的视觉回正提示 → JPEG 共享帧。
 YOLO 和 CV 使用同一张增强图，干净校正图保留为 CV 颜色/白角验证依据。
-CLAHE 和额外饱和度增强默认关闭，参数集中在 `config.py`。
+预处理不再做对比度、CLAHE 或饱和度增强，锐化强度集中在 `config.py`。
+OpenCL 用单个融合内核完成亮度提取、sigma=1.2 的高斯模糊和锐化；有效邻域
+加权避免校正黑边产生亮边，原 BGR 通道同比例缩放。`--sharpen 0` 关闭锐化。
+默认 `cv_backend=auto` 优先选择 Mali GPU，接入当前 `quad_cv_kit` 的 OpenCL 校正、
+增强、颜色、Hough、线拟合/修剪与边支持；不可用时在日志和同帧 JSON 中明确记录 CPU 回退。
+板端默认参数为 `--gpu-device Mali --cv-hough opencl --cv-blur pyramid --cv-quality fast`
+及 `--cv-search adaptive --opencv-threads 3`，与优化后的录像入口一致。
+颜色 ROI 保留高斯上下文，LSD 双通道与 GPU Hough 并行，几何验证复用交点和重复边支持。
+自适应搜索使用当前图像光流及四边搜索带，失败同帧回退，周期性完整搜索；没有卡尔曼路径。
 CV 完整搜索默认每 3 个处理帧运行一次，间隔帧使用当前图像跟踪并验证边线；
 跟踪失败立即重新搜索。YOLO 仍逐处理帧运行，JPEG 默认质量为 85。
 姿态与像素等效位移仅供显示，不发送控制指令。
@@ -27,6 +35,9 @@ CV 完整搜索默认每 3 个处理帧运行一次，间隔帧使用当前图�
 实时相机只保留最新一张待处理帧，CV 变慢时覆盖旧帧，不让 12 帧队列积压画面；
 录像仍按顺序处理。`door_sim.timing_ms` 分列校正、增强、YOLO、CV、绘制耗时，
 `door_sim.stream` 记录 JPEG 大小、编码、共享写入及采集到发布的延迟。
+`door_sim.cv_backend` 记录实际后端/回退原因；OpenCL 模式增加 `door_sim.gpu`，
+包括设备、内核与操作耗时、传输字节及 Hough 工作量。GPU 校正图和增强图与录像入口相同，
+增强图输入 YOLO/CV，干净校正图提供颜色证据。退出时等待算法线程并释放 OpenCL。
 启用时间统计时每 2 秒打印一条 DoorSim 处理统计；原简化 fps 仍是采集帧率。
 
 ### OpenCV 内部性能定位
@@ -50,7 +61,7 @@ DoorSim 默认开启内部诊断；颜色、几何和跟踪判定阈值沿用原
 | 子阶段或计数 | 用于定位 |
 | --- | --- |
 | `detect.color.*` / `track.color.*` | 颜色转换、三尺度高斯模糊、阈值及颜色证据合并 |
-| `lines.lsd_*` / `lines.hough` | 三路 LSD 和 Hough 线段提取 |
+| `lines.lsd_*` / `lines.hough_join` | 快速 GPU 配置运行 mask/chroma 两路 LSD；汇合阶段仅记录剩余等待 |
 | `lines.prefilter` / `lines.fit_filter` / `lines.merge` | 廉价预筛选、保留线段的拟合、嵌套合并 |
 | `lines.contrast_full_image` | 每次搜索构造干净图/增强图的红绿对数比缓存，最多两次 |
 | `models.geometry` / `models.valid_mask` / `models.color_support` | 四边组合几何、有效区和逐边颜色证据检查 |
@@ -61,6 +72,17 @@ DoorSim 默认开启内部诊断；颜色、几何和跟踪判定阈值沿用原
 | `model_side_checks` | 实际执行的逐边验证次数；遇到不支持的边立即淘汰该组合 |
 | `contrast_full_image_calls` / `color_evidence_calls` / `color_evidence_reuses` | 对比度缓存构造、颜色证据计算及同帧复用次数 |
 | `line_extraction_size` | LSD/Hough 实际处理尺寸；输出坐标仍属于 640×360 画布 |
+| `color_processing_size` / `line_extract_parallel` / `lsd_worker_ms` | 颜色实际尺寸、线提取并行状态和各 LSD 通道完整时间 |
+
+OpenCL 模式 `enqueue_*` 只记录 CPU 提交时间，`readback` 包含剩余 GPU 等待；
+Hough 完整耗时看 `door_sim.gpu.operation_ms.hough`。并行工作线程时间不能相加作为帧耗时，
+`thread_cpu_ms` 不包含这些工作线程，实际性能以当前相机画面测量为准。
+
+OpenCL 搜索现在将有序合线、断口拆分、对比度采样和完整模型几何/有效区检查
+批量放在 GPU；残缺门框的交点与逐线颜色证据也使用 GPU。日志通过
+`search_execution/model_execution/partial_execution` 标识实际执行，完整几何计时
+合并为 `models.gpu_batch`。CPU 仍保留 LSD、连通域、图选择和跟踪。
+实现边界、BPU 适用性及板端对照命令见 [GPU_SEARCH.md](../../../quad_cv_kit/GPU_SEARCH.md)。
 
 诊断仍随原启动命令运行；需要关闭时使用 `--door-sim-args "--no-cv-profile"`。
 离线诊断入口不需要模型/BPU，可以用固定原图 ROI 检查慢帧或录像：
@@ -83,8 +105,8 @@ python3 quad_cv_kit/demo/profile_red_gate.py --synthetic clutter --frames 8 --op
   保留弱红、断续红杆进入原有采样验证。减少采样坐标张量和合并循环内的重复分配。
 - LSD/Hough 实际裁剪到搜索区域及 16px 邻域，并将线段坐标还原到原画布。
   边界向外对齐到 5px 网格，保持 LSD 默认 0.8 缩放的采样位置。
-  LAB/CLAHE 和颜色模糊保留完整画布上下文，原图尺度、管宽、校正有效区不变。
-  三路 LSD 和 Hough 均保留，支持贴边、缺边和弱色门框。
+  CLAHE 保留完整画布上下文，颜色 ROI 保留高斯邻域，原图尺度、管宽、校正有效区不变。
+  `precise` 保留三路 LSD，`fast` 使用 mask/chroma 两路，支持贴边、缺边和弱色门框。
 - 三尺度高斯模糊使用连续的 LAB a 通道，逐次原位取最大值，减少通道复制和临时数组；
   跟踪与重新搜索复用同一次 `update` 的颜色证据和预处理图，不跨帧缓存。
 - 四边模型发现一条边缺乏颜色支持就立即淘汰，避免继续采样其余三边；通过条件不变。
@@ -113,9 +135,13 @@ python3 quad_cv_kit/demo/profile_red_gate.py --synthetic clutter --frames 8 --op
 # 同时将中位机以 ROV 模式启动：
 ./run.sh --door-sim --to32-args "--mode rov"
 # 可选：增强参数透传
-./run.sh --door-sim --door-sim-args "--contrast 1.3 --sharpen 0.8"
+./run.sh --door-sim --door-sim-args "--sharpen 0.8"
 # 调整 CV 搜索频率与推流压缩：
 ./run.sh --door-sim --door-sim-args "--cv-every 3 --jpeg-quality 85"
+# 显式要求 Mali OpenCL，不可用则报错：
+./run.sh --door-sim --door-sim-args "--cv-backend opencl --gpu-device Mali --cv-quality fast --cv-blur pyramid --cv-hough opencl"
+# CPU 对照：
+./run.sh --door-sim --door-sim-args "--cv-backend cpu"
 ```
 
 加 `--door-sim` 后，启动链路为 `task_door_sim/run.py → front.main()`，
@@ -148,7 +174,7 @@ python3 src/web_server.py
 python3 src/to32/task_door_sim/run.py --backend ultralytics --source /path/door.mp4 --frames 100
 ```
 
-可用 `--model` 指定整门模型，`--contrast/--sharpen` 调整增强。
+可用 `--model` 指定整门模型，`--sharpen` 调整锐化（0 关闭）；已移除 `--contrast`。
 `--no-correction` 直接在原图检测，不提供依赖校正内参的姿态提示。
 `--shm-dir` 可指定测试输出目录；读端须使用相同目录（`GRDK_SHM_DIR`）。
 正常退出、Ctrl+C 或 SIGTERM 会释放输入和共享写端。

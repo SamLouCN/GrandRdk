@@ -76,9 +76,11 @@ class YoloRedGateTracker:
     def __init__(self, detector, fps=30, detect_every=3, hold_seconds=.2,
                  valid_mask=None, roi_padding=.08, cv_contrast=1.2,
                  cv_clahe_clip=2.0, cv_clahe_blend=.6,
-                 cv_sharpen=.6, cv_saturation=1.25, profile_cv=False):
+                 cv_sharpen=.6, cv_saturation=1.25, profile_cv=False, cv_backend=None, adaptive_search=True):
         self.detector = detector
-        self.cv = RedGateTracker(fps, detect_every, hold_seconds, profile=profile_cv)
+        self.cv = RedGateTracker(fps, detect_every, hold_seconds, profile=profile_cv, backend=cv_backend,
+                                 adaptive_search=adaptive_search)
+        self.cv_backend = cv_backend
         self.valid_mask = valid_mask
         self.roi_padding = roi_padding
         self.cv_contrast = cv_contrast
@@ -148,7 +150,7 @@ class YoloRedGateTracker:
         if cv_frame is None:
             cv_frame = enhance_cv_contrast(frame, self.cv_contrast, self.valid_mask,
                                            self.cv_clahe_clip, self.cv_clahe_blend,
-                                           self.cv_sharpen, self.cv_saturation)
+                                           self.cv_sharpen, self.cv_saturation, backend=self.cv_backend)
         self.last_cv_frame = cv_frame
         selected, lines = self.cv.update(cv_frame, region,
                                          self.target['bbox'] if self.target else None,

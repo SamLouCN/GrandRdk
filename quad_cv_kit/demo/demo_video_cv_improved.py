@@ -14,8 +14,6 @@ Both videos share detections from the corrected frame; raw edges are mapped curv
 import argparse
 import json
 from pathlib import Path
-import shutil
-import subprocess
 import sys
 import time
 
@@ -33,55 +31,9 @@ from src.yolo_quad import (DEFAULT_CLASSES, DEFAULT_WEIGHTS, YoloQuadDetector,
 from src.yolo_red_gate import YoloRedGateTracker
 from src.gate_guidance import (enhance_cv_contrast, build_gate_guidance, draw_gate_guidance)
 from src.video_input import FFmpegVideoInput
+from src.video_output import VideoOutput
 
 VIDEO_SUFFIXES = {'.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv', '.mts'}
-
-
-class VideoOutput:
-    """H.264 with FFmpeg when available; otherwise OpenCV MPEG-4."""
-
-    def __init__(self, path, fps, size):
-        self.encoder = None
-        self.writer = None
-        self.size = size
-        ffmpeg = shutil.which('ffmpeg')
-        if ffmpeg:
-            self.encoder = subprocess.Popen([
-                ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
-                '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{size[0]}x{size[1]}',
-                '-r', str(fps), '-i', 'pipe:0', '-an', '-c:v', 'libx264',
-                '-preset', 'fast', '-threads', '2', '-crf', '20',
-                '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', '-pix_fmt', 'yuv420p',
-                '-movflags', '+faststart', str(path)], stdin=subprocess.PIPE)
-        else:
-            self.writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'),
-                                          fps, (size[0] + size[0] % 2,
-                                                size[1] + size[1] % 2))
-            if not self.writer.isOpened():
-                raise RuntimeError(f'Cannot create video: {path}')
-
-    def write(self, frame):
-        if (frame.shape[1], frame.shape[0]) != self.size:
-            raise ValueError('Source dimensions changed within a video')
-        if self.encoder is not None:
-            self.encoder.stdin.write(np.ascontiguousarray(frame).tobytes())
-        else:
-            padded = cv2.copyMakeBorder(frame, 0, frame.shape[0] % 2,
-                                        0, frame.shape[1] % 2, cv2.BORDER_CONSTANT)
-            self.writer.write(padded)
-
-    def close(self):
-        if self.encoder is not None:
-            encoder, self.encoder = self.encoder, None
-            try:
-                encoder.stdin.close()
-            finally:
-                code = encoder.wait()
-            if code != 0:
-                raise RuntimeError(f'FFmpeg encoding failed (exit {code})')
-        if self.writer is not None:
-            self.writer.release()
-            self.writer = None
 
 
 def save_image(path, frame):

@@ -34,8 +34,40 @@ def tube_evidence(frame, profile=None, prefix='color'):
     return mask, np.float32(score)
 
 
-def combined_evidence(enhanced, reference, profile=None, prefix='color'):
+def combined_evidence(enhanced, reference, profile=None, prefix='color', backend=None, bounds=None):
     """Enhanced pixels can strengthen only locally supported reference colors."""
+    if bounds is not None:
+        # sigma=18: exact support 72px; pyramid interpolation + morphology
+        # need additional context. Multiple-of-four origins preserve its grid.
+        h, w = reference.shape[:2]
+        x0, y0, x1, y1 = map(int, bounds)
+        x0, x1 = np.clip([x0, x1], 0, w)
+        y0, y1 = np.clip([y0, y1], 0, h)
+        mask, score = np.zeros((h, w), np.uint8), np.zeros((h, w), np.float32)
+        if x1 <= x0 or y1 <= y0:
+            return mask, score
+        cx0, cy0 = max(0, (x0-84)//4*4), max(0, (y0-84)//4*4)
+        cx1, cy1 = min(w, (x1+87)//4*4), min(h, (y1+87)//4*4)
+        clean = np.ascontiguousarray(reference[cy0:cy1, cx0:cx1])
+        extra = clean if enhanced is reference else np.ascontiguousarray(enhanced[cy0:cy1, cx0:cx1])
+        if backend is not None and hasattr(backend, 'register_roi'):
+            backend.register_roi(clean, reference, (cx0, cy0, cx1, cy1))
+            if extra is not clean:
+                backend.register_roi(extra, enhanced, (cx0, cy0, cx1, cy1))
+        local_mask, local_score = combined_evidence(extra, clean, profile, prefix, backend)
+        ys, xs = slice(y0-cy0, y1-cy0), slice(x0-cx0, x1-cx0)
+        mask[y0:y1, x0:x1] = local_mask[ys, xs]
+        score[y0:y1, x0:x1] = local_score[ys, xs]
+        if backend is not None and hasattr(backend, 'register_roi'):
+            copied = (x0-cx0, y0-cy0, x1-cx0, y1-cy0)
+            backend.register_roi(mask, local_mask, copied, (x0, y0))
+            backend.register_roi(score, local_score, copied, (x0, y0))
+        if profile is not None:
+            profile.meta['color_processing_size'] = [int(cx1-cx0), int(cy1-cy0)]
+            profile.mark(prefix+'.roi_copy')
+        return mask, score
+    if backend is not None:
+        return backend.combined_evidence(enhanced, reference, profile, prefix)
     mask, score = tube_evidence(reference, profile, prefix+'.reference')
     if enhanced is not reference:
         additional, _ = tube_evidence(enhanced, profile, prefix+'.enhanced')
@@ -46,9 +78,11 @@ def combined_evidence(enhanced, reference, profile=None, prefix='color'):
     return mask, score
 
 
-def trim_lines(lines, mask, score, bounds=(0, 0, 640, 360)):
+def trim_lines(lines, mask, score, bounds=(0, 0, 640, 360), backend=None):
     """Search along the seed line; join short holes and split persistent non-red spans."""
-    result = []
+    if backend is not None:
+        return backend.trim_lines(lines, mask, score, bounds)
+    items = []
     x0, y0, x1, y1 = bounds
     corners = np.array([[x0, y0], [x1-1, y0], [x1-1, y1-1], [x0, y1-1]], float)
     for line in lines:
@@ -73,30 +107,39 @@ def trim_lines(lines, mask, score, bounds=(0, 0, 640, 360)):
             xs, ys = np.rint(pixels).astype(int).T
             values = score[np.clip(ys, 0, mask.shape[0]-1), np.clip(xs, 0, mask.shape[1]-1)]
             strong = pixels[values > .30]@line['d']
-            item['strong_lo'] = float(np.percentile(strong, 2)) if len(strong) > 10 else float(low)
-            item['strong_hi'] = float(np.percentile(strong, 98)) if len(strong) > 10 else float(high)
+            strong_limits = np.percentile(strong, [2, 98]) if len(strong) > 10 else (low, high)
+            item['strong_lo'], item['strong_hi'] = map(float, strong_limits)
             _, cross_sections, _ = samples(mask, *endpoints(item), min(16, max(4, int(line['width']))))
             widths = cross_sections.sum(axis=1)
             widths = widths[widths > 0]
             item['width'] = max(2., float(np.median(widths)) if len(widths) else line['width'])
-            duplicate = None
-            for old in result:
-                if old['vertical'] != item['vertical'] or old['d']@item['d'] < .995:
-                    continue
-                distance = abs(endpoints(item).mean(axis=0)@old['n']-old['b'])
-                projected = endpoints(item)@old['d']
-                gap = max(projected.min()-old['hi'], old['lo']-projected.max(), 0)
-                if distance < max(2, .45*min(old['width'], item['width'])) and gap < 20:
-                    duplicate = old
-                    break
-            if duplicate is None:
-                result.append(item)
-            else:
-                projected = endpoints(item)@duplicate['d']
-                duplicate['lo'] = min(duplicate['lo'], float(projected.min()))
-                duplicate['hi'] = max(duplicate['hi'], float(projected.max()))
-                duplicate['strong_lo'] = min(duplicate['strong_lo'], item['strong_lo'])
-                duplicate['strong_hi'] = max(duplicate['strong_hi'], item['strong_hi'])
+            items.append(item)
+    return merge_trimmed(items)
+
+
+def merge_trimmed(items):
+    result = []
+    for item in items:
+        duplicate = None
+        item_ends = endpoints(item)
+        midpoint = item_ends.mean(axis=0)
+        for old in result:
+            if old['vertical'] != item['vertical'] or old['d']@item['d'] < .995:
+                continue
+            distance = abs(midpoint@old['n']-old['b'])
+            projected = item_ends@old['d']
+            gap = max(projected.min()-old['hi'], old['lo']-projected.max(), 0)
+            if distance < max(2, .45*min(old['width'], item['width'])) and gap < 20:
+                duplicate = old
+                break
+        if duplicate is None:
+            result.append(item)
+        else:
+            projected = item_ends@duplicate['d']
+            duplicate['lo'] = min(duplicate['lo'], float(projected.min()))
+            duplicate['hi'] = max(duplicate['hi'], float(projected.max()))
+            duplicate['strong_lo'] = min(duplicate['strong_lo'], item['strong_lo'])
+            duplicate['strong_hi'] = max(duplicate['strong_hi'], item['strong_hi'])
     return sorted(result, key=lambda line: (line['hi']-line['lo'])*np.sqrt(line['width'])*line['support'],
                    reverse=True)
 
@@ -124,30 +167,48 @@ def side_evidence(mask, line, segment):
     return float(occupancy.mean())
 
 
-def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_mask=None, profile=None):
+def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_mask=None, profile=None, backend=None):
     """Enumerate four independent lines, not transitively connected pipe groups."""
+    if backend is not None and hasattr(backend, 'complete_models_gpu'):
+        return backend.complete_models_gpu(vertical, horizontal, mask, bounds, valid_mask, profile)
     candidates = []
+    pending = []
+    # Each line participates in many four-line combinations. Its midpoint is
+    # constant during enumeration, so avoid allocating endpoints repeatedly.
+    midpoints = {id(line): endpoints(line).mean(axis=0) for line in vertical+horizontal}
+    crossings = {}
+    valid_sides = {}
+    side_results = {}
+    horizontal_pairs = []
+    for hs in combinations(horizontal, 2):
+        top, bottom = sorted(hs, key=lambda line: midpoints[id(line)][1])
+        horizontal_pairs.append((top, bottom, top['d']@bottom['d'] >= .90))
     for vs in combinations(vertical, 2):
-        left, right = sorted(vs, key=lambda line: endpoints(line).mean(axis=0)[0])
+        left, right = sorted(vs, key=lambda line: midpoints[id(line)][0])
         if left['d']@right['d'] < .90:
             continue
-        for hs in combinations(horizontal, 2):
+        for top, bottom, parallel in horizontal_pairs:
             if profile is not None:
                 profile.count('quad_combinations')
-            top, bottom = sorted(hs, key=lambda line: endpoints(line).mean(axis=0)[1])
-            if top['d']@bottom['d'] < .90:
+            if not parallel:
                 if profile is not None:
                     profile.mark('models.precheck')
                 continue
             lines = [top, right, bottom, left]
-            widths = np.array([line['width'] for line in lines])
-            if widths.max()/widths.min() > 2.4:
+            widths = [line['width'] for line in lines]
+            if max(widths)/min(widths) > 2.4:
                 if profile is not None:
                     profile.mark('models.precheck')
                 continue
             if profile is not None:
                 profile.mark('models.precheck')
-            corners = [intersection(lines[index-1], line) for index, line in enumerate(lines)]
+            corners = []
+            for index, line in enumerate(lines):
+                other = lines[index-1]
+                key = (id(other), id(line))
+                if key not in crossings:
+                    crossings[key] = intersection(other, line)
+                corners.append(crossings[key])
             if any(corner is None for corner in corners):
                 if profile is not None:
                     profile.mark('models.geometry')
@@ -168,16 +229,30 @@ def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_m
             if profile is not None:
                 profile.mark('models.geometry')
             if valid_mask is not None:
-                probes = np.rint(np.vstack([np.linspace(a, b, 33) for a, b in segments])).astype(int)
-                if not valid_mask[probes[:, 1], probes[:, 0]].all():
+                visible = True
+                for line, segment in zip(lines, segments):
+                    key = (id(line), segment.tobytes())
+                    if key not in valid_sides:
+                        probes = np.rint(np.linspace(*segment, 33)).astype(int)
+                        valid_sides[key] = valid_mask[probes[:, 1], probes[:, 0]].all()
+                    if not valid_sides[key]:
+                        visible = False
+                        break
+                if not visible:
                     if profile is not None:
                         profile.mark('models.valid_mask')
                     continue
             if profile is not None:
                 profile.mark('models.valid_mask')
+            if backend is not None:
+                pending.append((lines, segments, widths, corners, quad))
+                continue
             supports = []
             for line, segment in zip(lines, segments):
-                support = side_evidence(mask, line, segment)
+                key = (id(line), segment.tobytes())
+                if key not in side_results:
+                    side_results[key] = side_evidence(mask, line, segment)
+                support = side_results[key]
                 if profile is not None:
                     profile.count('model_side_checks')
                 if support is None:
@@ -188,19 +263,44 @@ def complete_models(vertical, horizontal, mask, bounds=(0, 0, 640, 360), valid_m
                 profile.count('quad_color_checks')
             if len(supports) != 4 or np.mean(supports) < .73:
                 continue
-            measured_lines = []
-            for line, segment in zip(lines, segments):
-                low, high = np.sort(segment@line['d'])
-                observed = endpoints(dict(line, lo=max(low, line['lo']), hi=min(high, line['hi'])))
-                measured_lines.append(dict(line, observed_segment=observed))
-            width = float(np.median(widths))
-            area = float(cv2.contourArea(quad))
-            candidates.append(dict(lines=measured_lines, segments=segments, corners=list(corners), quad=quad,
-                complete=True, width=width, score=float(np.sqrt(area)*width**.7*np.mean(supports)),
-                geometry_validated=True, model='four-line-color-validated', side_support=list(supports)))
+            candidates.append(_measured_model(lines, segments, widths, corners, quad, supports))
             if profile is not None:
                 profile.mark('models.accept')
+    if pending:
+        unique, lookup, indices = [], {}, []
+        for item in pending:
+            for line, segment in zip(item[0], item[1]):
+                key = (id(line), segment.tobytes())
+                if key not in lookup:
+                    lookup[key] = len(unique)
+                    unique.append((line, segment))
+                indices.append(lookup[key])
+        measured = backend.side_support(mask, [item[0] for item in unique], [item[1] for item in unique])
+        supports = measured[indices].reshape(-1, 4)
+        if profile is not None:
+            profile.mark('models.color_support')
+            profile.count('model_side_checks', 4*len(pending))
+            profile.count('quad_color_checks', len(pending))
+            profile.count('unique_model_side_checks', len(unique))
+        for item, evidence in zip(pending, supports):
+            if np.all(evidence >= 0) and np.mean(evidence) >= .73:
+                candidates.append(_measured_model(*item, evidence.tolist()))
+        if profile is not None:
+            profile.mark('models.accept')
     result = sorted(candidates, key=lambda candidate: candidate['score'], reverse=True)
     if profile is not None:
         profile.mark('models.finish')
     return result
+
+
+def _measured_model(lines, segments, widths, corners, quad, supports):
+    measured_lines = []
+    for line, segment in zip(lines, segments):
+        low, high = np.sort(segment@line['d'])
+        observed = endpoints(dict(line, lo=max(low, line['lo']), hi=min(high, line['hi'])))
+        measured_lines.append(dict(line, observed_segment=observed))
+    width = float(np.median(widths))
+    area = float(cv2.contourArea(quad))
+    return dict(lines=measured_lines, segments=segments, corners=list(corners), quad=quad,
+        complete=True, width=width, score=float(np.sqrt(area)*width**.7*np.mean(supports)),
+        geometry_validated=True, model='four-line-color-validated', side_support=list(supports))

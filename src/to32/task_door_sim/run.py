@@ -21,19 +21,28 @@ def main(argv=None):
     parser.add_argument('--model', help='整门模型路径；默认使用 config/stage_model.py 的 gate 配置')
     parser.add_argument('--shm-dir', help='共享帧目录，前视与 web_server 必须一致')
     parser.add_argument('--no-correction', action='store_true')
-    parser.add_argument('--contrast', type=float, default=CONFIG.contrast_gain)
     parser.add_argument('--sharpen', type=float, default=CONFIG.sharpen_amount)
     parser.add_argument('--cv-every', type=int, default=CONFIG.cv_every_frames,
                         help='CV 完整搜索间隔；其余帧按当前图像跟踪，默认 3')
     parser.add_argument('--jpeg-quality', type=int, default=CONFIG.jpeg_quality,
                         help='共享 JPEG 质量，默认 85')
     parser.add_argument('--no-cv-profile', action='store_true', help='关闭 CV 内部性能诊断')
+    parser.add_argument('--cv-backend', choices=('auto', 'opencl', 'cpu'), default=CONFIG.cv_backend)
+    parser.add_argument('--gpu-device', default=CONFIG.gpu_device)
+    parser.add_argument('--cv-hough', choices=('opencl', 'cpu'), default=CONFIG.cv_hough)
+    parser.add_argument('--cv-blur', choices=('pyramid', 'exact'), default=CONFIG.cv_blur)
+    parser.add_argument('--cv-quality', choices=('fast', 'precise'), default=CONFIG.cv_quality)
+    parser.add_argument('--cv-search', choices=('adaptive', 'full'), default=CONFIG.cv_search)
+    parser.add_argument('--opencv-threads', type=int, default=CONFIG.opencv_threads)
     # front.py 的 --frames/--device/--index/--timing/--log 等原样传给它。
     args, front_args = parser.parse_known_args(argv)
     cfg = replace(CONFIG, correction_enabled=not args.no_correction,
-                  contrast_gain=args.contrast, sharpen_amount=args.sharpen,
+                  sharpen_amount=args.sharpen,
                   cv_every_frames=args.cv_every, jpeg_quality=args.jpeg_quality,
-                  cv_profile=not args.no_cv_profile).validate()
+                  cv_profile=not args.no_cv_profile, cv_backend=args.cv_backend,
+                  gpu_device=args.gpu_device, cv_hough=args.cv_hough, cv_blur=args.cv_blur,
+                  cv_quality=args.cv_quality, cv_search=args.cv_search,
+                  opencv_threads=args.opencv_threads).validate()
     if args.shm_dir:
         shm_dir = Path(args.shm_dir).resolve()
         shm_dir.mkdir(parents=True, exist_ok=True)
@@ -63,8 +72,11 @@ def main(argv=None):
             video_source = args.source
     print('[DoorSim] 启动 front.py：前视采集 -> 增强/YOLO/CV -> 前视共享帧；model=%s'
           % model_cfg['model_path'], flush=True)
-    return front.main(['--no-show', *front_args], door_sim_processor=processor,
-                      door_sim_model_path=model_cfg['model_path'], video_source=video_source)
+    try:
+        return front.main(['--no-show', *front_args], door_sim_processor=processor,
+                          door_sim_model_path=model_cfg['model_path'], video_source=video_source)
+    finally:
+        processor.close()
 
 
 if __name__ == '__main__':

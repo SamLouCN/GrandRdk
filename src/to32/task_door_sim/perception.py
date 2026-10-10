@@ -1,8 +1,12 @@
 """干净校正图保留颜色证据；增强图同时进入 YOLO 和 OpenCV。"""
 import sys
 import time
+import json
+import threading
+from contextlib import nullcontext
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from .config import CONFIG
@@ -13,9 +17,10 @@ if _ROOT not in sys.path:
 
 from quad_cv_kit.src.camera_correction import load_camera_params, adapt_camera_params, create_corrector
 from quad_cv_kit.src.detect_red_gate import original_geometry, draw_gate_geometry
-from quad_cv_kit.src.gate_guidance import enhance_cv_contrast, build_gate_guidance, draw_gate_guidance
+from quad_cv_kit.src.gate_guidance import sharpen_frame, build_gate_guidance, draw_gate_guidance
 from quad_cv_kit.src.yolo_quad import draw_detections
 from quad_cv_kit.src.yolo_red_gate import YoloRedGateTracker
+from quad_cv_kit.src.opencl_backend import create_backend
 
 
 class DoorDetectorAdapter:
@@ -48,10 +53,18 @@ class DoorSimFrameProcessor:
         self.size = None
         self.corrector = None
         self.tracker = None
+        self.cv_backend = None
+        self.cv_backend_info = None
+        self.closed = False
+        self.lock = threading.Lock()
 
     def _prepare(self, width, height):
-        self.size = (width, height)
         cfg = self.cfg
+        if self.cv_backend_info is None:
+            cv2.setNumThreads(cfg.opencv_threads)
+            self.cv_backend, self.cv_backend_info = create_backend(
+                cfg.cv_backend, cfg.gpu_device, cfg.cv_hough, cfg.cv_blur, cfg.cv_quality)
+            print('[DoorSim] CV backend: '+json.dumps(self.cv_backend_info, ensure_ascii=False), flush=True)
         if cfg.correction_enabled:
             camera, _ = adapt_camera_params(load_camera_params(cfg.camera_params_path),
                                             width, height, cfg.camera_fit)
@@ -64,22 +77,43 @@ class DoorSimFrameProcessor:
                                           detect_every=cfg.cv_every_frames,
                                           hold_seconds=cfg.hold_seconds,
                                           valid_mask=self.valid_mask,
-                                          roi_padding=cfg.roi_padding, profile_cv=cfg.cv_profile)
+                                          roi_padding=cfg.roi_padding, profile_cv=cfg.cv_profile,
+                                          cv_backend=self.cv_backend,
+                                          adaptive_search=cfg.cv_search == 'adaptive')
+        self.size = (width, height)
 
     def process(self, frame):
+        with self.lock:
+            return self._process(frame)
+
+    def _process(self, frame):
+        if self.closed:
+            raise RuntimeError('DoorSim processor 已关闭')
         if frame is None or frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
             raise ValueError('输入必须为 uint8 BGR 图像')
         height, width = frame.shape[:2]
         if self.size != (width, height):
             self._prepare(width, height)
+        with (self.cv_backend.frame_batch() if self.cv_backend is not None else nullcontext()):
+            return self._process_prepared(frame)
+
+    def _process_prepared(self, frame):
+        height, width = frame.shape[:2]
         cfg = self.cfg
+        if self.cv_backend is not None:
+            self.cv_backend.reset_stats()
         started = time.perf_counter()
-        fixed = (self.corrector.undistort(frame, cfg.correction_plane_distance_m)
-                 if self.corrector else frame.copy())
-        corrected_at = time.perf_counter()
-        enhanced = enhance_cv_contrast(fixed, cfg.contrast_gain, self.valid_mask,
-                                       cfg.clahe_clip, cfg.clahe_blend,
-                                       cfg.sharpen_amount, cfg.saturation_gain)
+        maps = self.corrector.maps(cfg.correction_plane_distance_m) if self.corrector else None
+        if self.cv_backend is not None:
+            preprocess_started = time.perf_counter()
+            fixed, enhanced, correction_ms, _ = self.cv_backend.preprocess(
+                frame, self.valid_mask, cfg.sharpen_amount, maps)
+            corrected_at = preprocess_started+correction_ms/1000
+        else:
+            fixed = (self.cv_backend.remap(frame, *maps) if self.cv_backend is not None and maps is not None else
+                     self.corrector.undistort(frame, cfg.correction_plane_distance_m) if self.corrector else frame.copy())
+            corrected_at = time.perf_counter()
+            enhanced = sharpen_frame(fixed, cfg.sharpen_amount, self.valid_mask)
         enhanced_at = time.perf_counter()
         candidate, _ = self.tracker.update(fixed, yolo_frame=enhanced, cv_frame=enhanced)
         tracked_at = time.perf_counter()
@@ -99,11 +133,22 @@ class DoorSimFrameProcessor:
                            coordinate_space='corrected' if self.corrector else 'raw',
                            img_w=width, img_h=height, geometry=geometry, yolo=status,
                            guidance=guidance,
-                           input='enhanced', contrast_gain=cfg.contrast_gain,
+                           input='enhanced', enhancement_mode='sharpen-only',
                            sharpen_amount=cfg.sharpen_amount,
+                           cv_backend=dict(self.cv_backend_info),
                            timing_ms=dict(correction=round((corrected_at-started)*1000, 2),
                                           enhancement=round((enhanced_at-corrected_at)*1000, 2),
                                           yolo=round(self.detector.last_detect_ms, 2),
                                           cv=round((tracked_at-enhanced_at)*1000-self.detector.last_detect_ms, 2),
                                           overlay=round((time.perf_counter()-tracked_at)*1000, 2)))
+        if self.cv_backend is not None:
+            observation['gpu'] = self.cv_backend.diagnostics()
         return display, detections, observation
+
+    def close(self):
+        """Wait for line workers and release OpenCL when front exits."""
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                if self.cv_backend is not None:
+                    self.cv_backend.close()

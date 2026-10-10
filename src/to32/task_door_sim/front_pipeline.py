@@ -39,3 +39,7 @@ class DoorSimFrontPipeline:
                                       stage='DoorSim', status='done', dets=detections,
                                       door_sim=observation))
             return display, detections, observation
+
+    def close(self):
+        with self.lock:
+            self.processor.close()
