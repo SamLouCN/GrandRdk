@@ -268,26 +268,55 @@ class DoorTask(Stage):
         self.search_index = 0
         self.search_angles = [-self.cfg.search_angle_deg, self.cfg.search_angle_deg]
         self.search_step_target = None
+        self.search_turn_goal = None
+        self.search_turn_state = {}
+        self.search_ramp_finished_at = None
         self.search_next_step_at = now
-        self.search_step_started = now
         if reset:
             self.vision.reset_target()
         self.target_id = None
         self.filtered_center = self.filtered_frame = None
         self._go('SEARCH_TURN', now)
-        return self._command('无门，以相对小步左右扫视')
+        left = (self.search_base-self.cfg.search_angle_deg+180) % 360-180
+        right = (self.search_base+self.cfg.search_angle_deg+180) % 360-180
+        self.ctx.say('PassGate 扫视基准 %.1f°；左目标 %.1f°；右目标 %.1f°；保持深度 %.1fcm'
+                     % (self.search_base, left, right, self.depth))
+        return self._command('以相对小步左右扫视', require_depth=False)
 
-    def _search_turn(self, target, now):
-        """协议为绝对角：相对当前实测角锁存小步，未到位不累加目标。"""
-        if self.search_step_target is not None:
-            self.yaw = self.search_step_target
-            if abs(angle_error(self.yaw, self.actual_yaw)) > self.cfg.yaw_command_tolerance_deg:
-                if now-self.search_step_started > self.cfg.motion_timeout_s:
-                    return self._fault(now, '搜索相对转向到位超时')
-                return self._command('等待搜索相对小步到位')
-            self.search_step_target = None
-        error = angle_error(target, self.actual_yaw)
-        if abs(error) <= self.cfg.yaw_command_tolerance_deg:
+    def _search_turn(self, target, now, dt=0.):
+        """复用v2的锁目标/转向原语；缓慢推进下发角，仅对最终观察角判到位。"""
+        from task import t_function as TF
+        cfg = self.cfg
+        if self.search_turn_goal != target:
+            self.search_turn_goal = target
+            self.search_turn_state = {}
+            self.search_step_target = self.actual_yaw
+            self.search_next_step_at = now
+            self.search_ramp_finished_at = None
+            relative = angle_error(target, self.actual_yaw)
+            TF.lock_turn_target(self.ctx, self.search_turn_state, now, relative, stage=self.NAME)
+            # turn_step 的深度参数是距底高度；反算后沿用当前固件深度，避免误用默认26cm。
+            body = float(getattr(TF.TC, 'AUV_BODY_HEIGHT_CM', TF.BODY_HEIGHT_CM))
+            self.search_turn_state['last_height_cm'] = float(TF.TC.AUV_POOL_DEPTH_CM)-body-self.depth
+        locked = self.search_turn_state.get('turn_tgt')
+        if locked is None:
+            return TF.wait_cmd(self.NAME, '扫视等待航向遥测，不能锁存相对目标')
+        error = angle_error(locked, self.search_step_target)
+        if abs(error) > 1e-6 and now >= self.search_next_step_at:
+            delta = clamp(error, -cfg.search_step_deg, cfg.search_step_deg)
+            self.search_step_target = (self.search_step_target+delta+180) % 360-180
+            self.search_next_step_at = now+cfg.search_step_interval_s
+        self.yaw = self.search_step_target
+        ramp_done = abs(angle_error(locked, self.yaw)) <= 1e-6
+        if not ramp_done:
+            self.search_turn_state['ok_cnt'] = 0
+        elif self.search_ramp_finished_at is None:
+            self.search_ramp_finished_at = now
+        # v2同样只在输出壳镜像一次；任务内保持actual_yaw同系绝对角。
+        cmd = TF.turn_step(self.ctx, self.search_turn_state, now, dt, locked,
+                           tol_deg=cfg.search_yaw_tolerance_deg,
+                           hold_n=cfg.search_hold_frames, stage=self.NAME)
+        if ramp_done and cmd is None:
             self.yaw = self.actual_yaw
             if self.phase == 'RETURN_HEADING':
                 # 无门不等于结束赛段；返回同一基准后重新扫视，不输出平移推力。
@@ -296,15 +325,44 @@ class DoorTask(Stage):
                 self.search_valid_frames = 0
                 self._go('SEARCH_OBSERVE', now)
                 self.settle_until = now+self.cfg.settle_s
-            return self._command('搜索观察角到位')
-        if now < self.search_next_step_at:
-            return self._command('搜索小步间隔保持')
-        delta = clamp(error, -self.cfg.search_step_deg, self.cfg.search_step_deg)
-        self.search_step_target = (self.actual_yaw+delta+180) % 360-180
-        self.yaw = self.search_step_target
-        self.search_step_started = now
-        self.search_next_step_at = now+self.cfg.search_step_interval_s
-        return self._command('搜索相对转向 %+.2f°' % delta)
+            return self._command('搜索观察角到位', require_depth=False)
+        if (self.search_ramp_finished_at is not None
+                and now-self.search_ramp_finished_at > cfg.motion_timeout_s):
+            return self._fault(now, '扫视最终航向未到位：目标 %.1f°／实测 %.1f°' % (target, self.actual_yaw))
+        note = ('扫视终点 %.1f°／本拍任务系目标 %.1f°／实测 %.1f°'
+                % (target, self.yaw, self.actual_yaw))
+        if cmd is None:
+            return self._command(note, require_depth=False)
+        cmd.update(yaw=self.yaw, depth=self.depth, note=self.phase+': '+note)
+        return cmd
+
+    def _search_tick(self, obs, now, dt):
+        """纯转向不依赖融合定深或视觉初始化；有效新帧用于发现门和到位观察。"""
+        cfg = self.cfg
+        if now-self.search_started > cfg.search_timeout_s:
+            return self._fault(now, '扫视未完成有效观察／航向到位超时')
+        usable = (obs.get('valid') and now >= self.settle_until
+                  and obs.get('capture_ts', now) >= self.settle_until)
+        if usable and obs.get('has_target') and obs.get('fresh'):
+            self.yaw = self.actual_yaw
+            self.search_step_target = None
+            self.target_id, self.filtered_center = obs['target_id'], None
+            self.filtered_frame, self.episode_started = None, now
+            self._go('YOLO_ALIGN', now)
+            return self._command('扫视发现门，锁定当前航向；对中／接近仍需卡尔曼定深')
+        if self.phase in ('SEARCH_TURN', 'RETURN_HEADING'):
+            target = (self.search_base+self.search_angles[self.search_index]
+                      if self.phase == 'SEARCH_TURN' else self.search_base)
+            return self._search_turn((target+180) % 360-180, now, dt)
+        if not usable:
+            return self._command('观察角到位，等待稳定后的有效视觉帧', require_depth=False)
+        if obs.get('fresh'):
+            self.search_valid_frames += 1
+        if (now-self.phase_start >= cfg.search_observe_s
+                and self.search_valid_frames >= cfg.observe_frames):
+            self.search_index += 1
+            self._go('SEARCH_TURN' if self.search_index < len(self.search_angles) else 'RETURN_HEADING', now)
+        return self._command('观察有效无门帧', require_depth=False)
 
     def _commit_blind(self, obs, now):
         distance = self.cfg.blind_distance_m
@@ -367,6 +425,15 @@ class DoorTask(Stage):
         if self.yaw is None:
             self.yaw = self.actual_yaw
             self.depth = self._depth_target(self.actual_depth)
+        if self.depth_valid and self.fused_target_cm is None:
+            self._lock_depth_target(self.depth)
+        # 启动纯转向必须在视觉/融合到位门槛之前，避免一直停在 ACQUIRE。
+        # 仍需有效固件航向/深度遥测；搜索始终不输出前进或横移推力。
+        if self.phase == 'ACQUIRE':
+            self._start_search(now, self.entry_yaw, reset=False)
+        if self.phase.startswith('SEARCH') or self.phase == 'RETURN_HEADING':
+            return self._search_tick(self.vision.poll(now), now, dt)
+
         if not self.depth_valid:
             self.counts = {}
             if self.motion is not None and now-self.motion['start'] > cfg.motion_timeout_s:
@@ -376,8 +443,6 @@ class DoorTask(Stage):
                 self.counts = {}
                 self.settle_until = now+cfg.settle_s
             return self._command('融合深度不可用，保持目标并停止水平运动')
-        if self.fused_target_cm is None:
-            self._lock_depth_target(self.depth)
         obs = self.vision.poll(now)
         if self.motion is not None:
             if self.motion['kind'] == 'sway' and (not self.depth_confirmed or not obs.get('valid')
@@ -398,33 +463,6 @@ class DoorTask(Stage):
             return self._command('视觉未就绪／过期，保持零水平推力')
         if obs.get('capture_ts', now) < self.settle_until:
             return self._command('等待运动后采集的新帧')
-
-        if self.phase == 'ACQUIRE':
-            self._start_search(now, self.entry_yaw, reset=False)
-
-        # 搜索转向：只有在目标角到位后的有效新帧，才开始计无门观察。
-        if self.phase.startswith('SEARCH') or self.phase == 'RETURN_HEADING':
-            if now-self.search_started > cfg.search_timeout_s:
-                return self._fault(now, '扫视未完成有效观察／航向到位超时')
-            if obs.get('has_target') and obs.get('fresh'):
-                # 停止扫视并锁住当前实测角，避免继续追逐旧搜索小步目标。
-                self.yaw = self.actual_yaw
-                self.search_step_target = None
-                self.target_id, self.filtered_center = obs['target_id'], None
-                self.filtered_frame, self.episode_started = None, now
-                self._go('YOLO_ALIGN', now)
-                return self._command('扫视发现门')
-            if self.phase in ('SEARCH_TURN', 'RETURN_HEADING'):
-                target = (self.search_base+self.search_angles[self.search_index]
-                          if self.phase == 'SEARCH_TURN' else self.search_base)
-                return self._search_turn((target+180) % 360-180, now)
-            if obs['fresh']:
-                self.search_valid_frames += 1
-            if (now-self.phase_start >= cfg.search_observe_s
-                    and self.search_valid_frames >= cfg.observe_frames):
-                self.search_index += 1
-                self._go('SEARCH_TURN' if self.search_index < len(self.search_angles) else 'RETURN_HEADING', now)
-            return self._command('观察有效无门帧')
 
         if not obs.get('has_target'):
             self.counts = {}

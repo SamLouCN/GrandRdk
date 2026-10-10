@@ -94,8 +94,10 @@ class DoorConfig:
     probe_max_s: float = 15.
     width_trend_min_fraction: float = .03
     search_angle_deg: float = 45.
-    search_step_deg: float = 2.  # 相对当前航向锁存的小步目标
+    search_step_deg: float = 2.  # 下发目标每次最多推进2°，不等待中间小角到位
     search_step_interval_s: float = .5  # 小步间最短间隔，限制目标推进速度
+    search_yaw_tolerance_deg: float = 3.  # 扫视到位口径沿用 door_v2/turn_step
+    search_hold_frames: int = 10  # 到最终观察角后连续到位；不用于2°中间目标
     search_observe_s: float = .6
     search_timeout_s: float = 90.  # 慢速扫视左45°、右45°、回基准需要更长时间
 
@@ -115,6 +117,7 @@ class DoorConfig:
                     'align_timeout_s', 'search_timeout_s', 'cv_every_frames',
                     'normal_yaw_tolerance_deg', 'approach_timeout_s', 'target_episode_timeout_s',
                     'depth_tolerance_cm', 'depth_hold_tolerance_cm', 'depth_hold_samples', 'depth_velocity_max_mps',
+                    'search_yaw_tolerance_deg', 'search_hold_frames',
                     'search_angle_deg', 'search_step_deg', 'search_step_interval_s')
         if any(not math.isfinite(float(getattr(self, k))) or getattr(self, k) <= 0
                for k in positive):
@@ -125,6 +128,9 @@ class DoorConfig:
             raise ValueError('depth_hold_samples 必须为正整数')
         if self.depth_hold_tolerance_cm < self.depth_tolerance_cm:
             raise ValueError('定深保持带不能小于到位容差')
+        if (not isinstance(self.search_hold_frames, int) or self.search_hold_frames < 1
+                or self.search_yaw_tolerance_deg >= self.search_angle_deg):
+            raise ValueError('扫视到位计数或航向容差无效')
         if (not math.isfinite(self.blind_extra_s) or self.blind_extra_s < 0
                 or self.blind_distance_m > self.blind_max_distance_m):
             raise ValueError('盲冲补偿时间或固定距离无效')

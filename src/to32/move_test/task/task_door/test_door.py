@@ -354,7 +354,7 @@ class StateTests(unittest.TestCase):
             self.assertFalse(self.task.depth_confirmed)
             self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
 
-    def test_search_step_is_latched_and_interval_limits_progress(self):
+    def test_search_command_ramps_even_when_initial_small_step_is_not_executed(self):
         self.task.actual_yaw = 179.
         self.task._start_search(self.now)
         self.ctx.tel['actual_yaw'] = 179.
@@ -362,13 +362,12 @@ class StateTests(unittest.TestCase):
         self.assertEqual(cmd['yaw'], 177.)
         self.tick()
         self.assertEqual(self.task.yaw, 177.)
-        self.ctx.tel['actual_yaw'] = 177.
         self.tick()
-        self.assertEqual(self.task.yaw, 177.)
+        self.assertEqual(self.task.yaw, 177.)  # 未满0.5s，保持下发值
         self.tick(seconds=.5)
-        self.assertEqual(self.task.yaw, 175.)
+        self.assertEqual(self.task.yaw, 175.)  # 实测仍179°也继续缓慢推进，而不锁死在177°
         cmd = self.tick(target())
-        self.assertEqual((self.task.phase, cmd['yaw']), ('YOLO_ALIGN', 177.))
+        self.assertEqual((self.task.phase, cmd['yaw']), ('YOLO_ALIGN', 179.))
 
     def test_search_shortest_relative_step_wraps_at_180(self):
         self.task.actual_yaw = 179.
@@ -385,11 +384,16 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.task.depth, self.cfg.max_depth_cm)
         self.assertAlmostEqual(self.task.fused_target_cm, self.cfg.max_depth_cm+18.)
 
-    def test_search_stalled_step_has_timeout(self):
+    def test_search_stalled_final_heading_has_timeout(self):
         self.task.actual_yaw = 10.
         self.task._start_search(self.now)
         self.tick({'valid': True, 'fresh': True, 'has_target': False})
-        cmd = self.tick(seconds=self.cfg.motion_timeout_s+1)
+        empty = {'valid': True, 'fresh': True, 'has_target': False}
+        for _ in range(22):
+            self.tick(empty, seconds=.5)
+        self.assertAlmostEqual(self.task.search_step_target, -35.)
+        self.assertIsNotNone(self.task.search_ramp_finished_at)
+        cmd = self.tick(empty, seconds=self.cfg.motion_timeout_s+1)
         self.assertEqual(self.task.phase, 'HOLD_FAULT')
         self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
 
@@ -422,7 +426,7 @@ class WorkflowTests(unittest.TestCase):
         self.vision.obs = dict(obs or {'valid': False}, frame=self.frame)
         return self.task.step(self.now, seconds)
 
-    def test_startup_waits_for_actual_heading_and_fused_depth_then_rotates_only(self):
+    def test_startup_waits_for_telemetry_then_rotates_without_fusion_or_vision(self):
         self.ctx.tel = {}
         cmd = self.tick()
         self.assertTrue(cmd['paused'])
@@ -431,12 +435,142 @@ class WorkflowTests(unittest.TestCase):
         self.ctx.depth.value['ok'] = False
         cmd = self.tick()
         self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
-        self.assertEqual(self.task.phase, 'ACQUIRE')
-        self.ctx.depth.value['ok'] = True
-        for _ in range(3):
-            cmd = self.tick(dict(valid=True, fresh=True, has_target=False))
+        self.assertEqual(self.task.phase, 'SEARCH_TURN')
         self.assertEqual(self.task.search_base, 179.)
         self.assertEqual(self.task.yaw, 177.)
+        self.assertEqual(cmd['depth'], 40.)
+        self.assertFalse(cmd.get('paused'))
+        self.assertFalse(self.task.depth_confirmed)
+        self.ctx.tel['actual_yaw'] = cmd['yaw']
+        cmd = self.tick(seconds=.5)
+        self.assertEqual(cmd['yaw'], 175.)
+        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+
+    def test_startup_valid_fusion_does_not_wait_for_stable_samples(self):
+        cmd = self.tick()
+        self.assertEqual(self.task.phase, 'SEARCH_TURN')
+        self.assertEqual(cmd['yaw'], 177.)
+        self.assertFalse(self.task.depth_confirmed)
+        self.assertIsNotNone(self.task.fused_target_cm)
+
+    def test_full_left_right_scan_runs_with_unavailable_fused_depth(self):
+        self.ctx.depth.value['ok'] = False
+        empty = dict(valid=True, fresh=True, has_target=False)
+        cmd = self.tick(empty)
+        angles = []
+        for _ in range(200):
+            previous = self.task.phase
+            self.ctx.tel['actual_yaw'] = cmd['yaw']
+            cmd = self.tick(empty, seconds=.5)
+            self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+            self.assertFalse(self.task.depth_confirmed)
+            if previous != 'SEARCH_OBSERVE' and self.task.phase == 'SEARCH_OBSERVE':
+                angles.append(self.ctx.tel['actual_yaw'])
+            if previous == 'RETURN_HEADING' and self.task.phase == 'SEARCH_TURN':
+                break
+        self.assertEqual(angles, [134., -136.])  # 179°的左45°和右45°
+        self.assertEqual(self.ctx.tel['actual_yaw'], 179.)
+        self.assertEqual(self.task.phase, 'SEARCH_TURN')
+
+    def test_scan_tolerates_small_heading_deadband_and_holds_only_at_endpoints(self):
+        from task.task_door.t_door import angle_error
+        self.ctx.depth.value['ok'] = False
+        empty = dict(valid=True, fresh=True, has_target=False)
+        cmd = self.tick(empty)
+        self.assertEqual(cmd['yaw'], 177.)
+        angles = []
+        for _ in range(200):
+            previous = self.task.phase
+            # 仅模拟小误差不响应的控制器，不代表实车固件死区测量值。
+            if abs(angle_error(cmd['yaw'], self.ctx.tel['actual_yaw'])) > 3.:
+                self.ctx.tel['actual_yaw'] = cmd['yaw']
+            cmd = self.tick(empty, seconds=.5)
+            self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+            self.assertNotEqual(self.task.phase, 'HOLD_FAULT')
+            if previous != 'SEARCH_OBSERVE' and self.task.phase == 'SEARCH_OBSERVE':
+                angles.append(self.ctx.tel['actual_yaw'])
+            if previous == 'RETURN_HEADING' and self.task.phase == 'SEARCH_TURN':
+                break
+        self.assertEqual(len(angles), 2)
+        for measured, expected in zip(angles, [134., -136.]):
+            self.assertLessEqual(abs(angle_error(expected, measured)), self.cfg.search_yaw_tolerance_deg)
+
+    def test_search_reuses_v2_turn_primitives_and_reaches_actual_motion_frames(self):
+        import struct
+        from task import t_function as TF
+        from mission import Mission
+        from test_mode.test_runner import TestMode
+        import link_stm32 as S
+        for mirror in (True, False):
+            with self.subTest(mirror=mirror), tempfile.TemporaryDirectory() as directory:
+                frames = []
+                mode_ctx = SimpleNamespace(cfg=SimpleNamespace(STM32_POLL_HZ=0), log=lambda _: None,
+                                           estop_latch=False, task_pids=None,
+                                           link_stm32=SimpleNamespace(send=lambda frame, note: frames.append(frame)))
+                mode = TestMode(mode_ctx)
+                mode.yaw_mirror = mirror
+                cfg, vision = self.cfg, FakeVision()
+                class InjectedDoorTask(DoorTask):
+                    def __init__(self, ctx):
+                        super().__init__(ctx, cfg=cfg, vision=vision)
+                depth = FakeDepth()
+                depth.value['ok'] = False
+                mode.mission = Mission(SimpleNamespace(STAGE_TABLE=[InjectedDoorTask], AUV_SHM_DIR=directory),
+                                       depth=depth)
+                # 真正的遥测解码 -> TestMode -> Mission -> DoorTask -> 0x09组帧，串口为记录桩。
+                tel_data = struct.pack('<12h8hHH', 0, 0, 0, 0, 1000, 0, *([0]*14), 4000, 4000)
+                mode.on_downlink(S.parse_telemetry(tel_data))
+                with patch.object(TF, 'lock_turn_target', wraps=TF.lock_turn_target) as lock, \
+                     patch.object(TF, 'turn_step', wraps=TF.turn_step) as turn:
+                    for now in (.1, .7, 1.3):
+                        mode.tick(now, .1)
+                    self.assertEqual(lock.call_count, 1)
+                    self.assertEqual(turn.call_count, 3)
+                    self.assertEqual(turn.call_args.args[4], -35.)
+                targets = []
+                for frame in frames:
+                    func, data = S.FrameParser().feed(frame)[0]
+                    self.assertEqual(func, S.FUNC_MOTION)
+                    pitch, yaw, roll, depth_cm, surge, sway, flag = struct.unpack('<hhhHbbB', data)
+                    targets.append(yaw/100.)
+                    self.assertEqual((pitch, roll, depth_cm, surge, sway, flag), (0, 0, 4000, 0, 0, 0))
+                self.assertEqual(targets, [-8., -6., -4.] if mirror else [8., 6., 4.])
+
+    def test_valid_door_stops_scan_but_cannot_approach_without_fused_depth(self):
+        self.ctx.depth.value['ok'] = False
+        cmd = self.tick()
+        self.ctx.tel['actual_yaw'] = cmd['yaw']
+        cmd = self.tick(target())
+        self.assertEqual(self.task.phase, 'YOLO_ALIGN')
+        self.assertEqual(cmd['yaw'], self.ctx.tel['actual_yaw'])
+        for _ in range(10):
+            cmd = self.tick(target())
+            self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+        self.assertEqual(self.task.phase, 'YOLO_ALIGN')
+        self.ctx.depth.value['ok'] = True
+        for _ in range(5):
+            cmd = self.tick(target())
+        self.assertEqual(self.task.phase, 'APPROACH_40')
+        self.assertGreater(cmd['surge'], 0)
+
+    def test_invalid_vision_cannot_interrupt_scan_or_count_endpoint_observations(self):
+        self.ctx.depth.value['ok'] = False
+        self.tick(dict(valid=False, fresh=True, has_target=True, target_id=1))
+        self.assertEqual(self.task.phase, 'SEARCH_TURN')
+        # 跟随缓慢推进的指令直到左观察角到位；无有效图像不能声称已经观察完这一侧。
+        for _ in range(60):
+            self.ctx.tel['actual_yaw'] = self.task.yaw
+            self.tick(seconds=.5)
+            if self.task.phase == 'SEARCH_OBSERVE':
+                break
+        self.assertEqual(self.task.phase, 'SEARCH_OBSERVE')
+        for _ in range(3):
+            cmd = self.tick(dict(valid=False, fresh=True, has_target=False))
+        self.assertEqual(self.task.search_valid_frames, 0)
+        self.assertEqual(self.task.phase, 'SEARCH_OBSERVE')
+        self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
+        cmd = self.tick(seconds=self.cfg.search_timeout_s+1)
+        self.assertEqual(self.task.phase, 'HOLD_FAULT')
         self.assertEqual((cmd['surge'], cmd['sway']), (0, 0))
 
     def test_four_gate_workflow_runs_to_done_without_preset_turns_or_80_percent(self):
