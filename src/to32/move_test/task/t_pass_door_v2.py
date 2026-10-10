@@ -9,9 +9,11 @@
         每门 sub=0 转向定深：相对当前航向转 turn（右正左负，lock_turn_target 每次
             重新锁存，门间误差不累积）+ 下发定深目标；转到位后定深（dive_step 判融合
             clearance ≈ height 到位）。
-        每门 sub=1 横移对中：起步锁存航向；无门帧按固定方向横移找门（永不超时，
-            60s→HOLD_FAULT 已按 2026-10-11 要求移除）；见门帧走比例伺服
-            （sway_align_step），门中心 x 距画面中心 ≤ PX_TOL 且稳定 HOLD_N 帧 → 对准。
+        每门 sub=1 横移对中：起步锁存航向；无有效目标帧分三级——从未见过门/超过
+            LOST_S 视为真丢门 → 固定方向横移找门（永不超时，60s→HOLD_FAULT 已移除）；
+            见过门且短暂丢帧（≤ LOST_S）→ 保持上一帧运动状态（sway=last_sway，
+            ok_cnt 不清零），用下一有效帧修复；见门帧走比例伺服（sway_align_step），
+            门中心 x 距画面中心 ≤ PX_TOL 且稳定 HOLD_N 帧 → 对准。
         每门 sub=2 前冲判完成：锁存航向纯前进（恒 surge，sway=0）；高度计 B、C
             （obs.AltIF 读 momo_alt.json 原始 mm）均出现一次突变（读数 < 本门起步锁定
             的基线 − ALT_DROP_MM，连续 ALT_HIT_N 拍）后的 DONE_DELAY_S（1s）→ 过门；
@@ -189,22 +191,36 @@ class PassDoorV2(Stage):
             if y is None:
                 return t_function.wait_cmd(self.NAME, '%s 无 yaw 遥测，等待(不以0兜底)' % self._gname())
             gst['yaw_ref'] = float(y)
-            gst['last_seen'] = None
+            gst['last_seen'] = None            # 最后见有效门帧时刻（None=从未见过门）
             gst['ok_cnt'] = 0
+            gst['last_sway'] = 0.0             # 上一有效帧的伺服输出（丢帧保持用）
             self.log('%s 锁存航向 %.1f°，横移对中（%s，%.0fpx/%.0f帧）'
                      % (self._gname(), gst['yaw_ref'], '右' if dirn > 0 else '左',
                         float(getattr(TC, 'AUV_PASS_DOOR_V2_PX_TOL', 20.0)),
                         float(getattr(TC, 'AUV_PASS_DOOR_V2_HOLD_N', 10))))
 
+        lost_s = float(getattr(TC, 'AUV_PASS_DOOR_V2_LOST_S', 0.5))
         obs = self.ctx.vision.poll(cam, want, now)
-        if obs is None:                                   # 无门帧：固定方向横移找门（对准计数清零，永不超时）
-            if gst.get('last_seen') is None:
-                gst['last_seen'] = now
-            gst['ok_cnt'] = 0
+        if obs is None:                                   # 无新有效目标帧：丢帧 / 丢门 分级处理
+            if gst.get('last_seen') is None:              # 从未见过门：无可保持的"上一帧状态" → 直接找门横移
+                note = '%s 找门(未见门)' % self._gname()
+                self._say(gst, note)
+                return t_function._cmd(self.NAME, note, gst['yaw_ref'],
+                                       t_function._depth_out(gst, height),
+                                       sway=dirn * sway_thr)
             lost = now - gst['last_seen']
-            self._say(gst, '%s 横移找门（无门帧 %.1fs）' % (self._gname(), lost))
-            return t_function._cmd(self.NAME, '%s 横移找门(无门) %.1fs' % (self._gname(), lost),
-                                   gst['yaw_ref'], t_function._depth_out(gst, height),
+            if lost <= lost_s:                            # 短暂丢帧：保持上一帧运动状态（ok_cnt 不清零），下一有效帧修复
+                keep = float(gst.get('last_sway') or 0.0)
+                note = '%s 丢帧保持 %.2fs sway=%.2f' % (self._gname(), lost, keep)
+                self._say(gst, note)
+                return t_function._cmd(self.NAME, note, gst['yaw_ref'],
+                                       t_function._depth_out(gst, height),
+                                       sway=keep)
+            gst['ok_cnt'] = 0                             # 长时间丢门：固定方向横移找门（计数清零，永不超时）
+            note = '%s 丢门%.1fs→找门' % (self._gname(), lost)
+            self._say(gst, note)
+            return t_function._cmd(self.NAME, note, gst['yaw_ref'],
+                                   t_function._depth_out(gst, height),
                                    sway=dirn * sway_thr)
         gst['last_seen'] = now                             # 见门：刷新丢门计时
         ex_px = obs['cx'] - center                        # 门中心 x 距画面中心像素误差（右正）

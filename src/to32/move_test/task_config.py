@@ -144,6 +144,8 @@ AUV_PASS_DOOR_V2_CAM = 'front'             # 前视相机（YOLO 检测 door →
 AUV_PASS_DOOR_V2_WANT = 'gate'             # 检测目标 canonical 名
 AUV_PASS_DOOR_V2_SWAY_DIR = 1.0            # 无门帧横移方向：+1 右移 / -1 左移（找门）
 AUV_PASS_DOOR_V2_SWAY_THRUST = 0.3         # 无门帧横移推力幅度（找门速度档，-1~1）
+AUV_PASS_DOOR_V2_LOST_S = 0.5              # 丢帧窗口(s)：见过门后短暂无有效目标帧(≤此值)保持上一帧 sway 输出，
+                                           #   用下一有效帧修复；超过此值视为真丢门 → 固定方向横移找门（ok_cnt 清零）
 AUV_PASS_DOOR_V2_PX_TOL = 20.0             # 对准容差(px)：门中心 x 距画面中心 ≤ 此值
 AUV_PASS_DOOR_V2_HOLD_N = 10               # 对准稳定帧数（带内连续 N 个新检测帧）
 AUV_PASS_DOOR_V2_SURGE = 0.5               # 前冲推力幅度（-1~1）
