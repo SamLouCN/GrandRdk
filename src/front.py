@@ -54,7 +54,7 @@ def door_pipeline():
     with _door_pipeline_lock:
         if _door_pipeline is None:
             from to32.move_test.task.task_door.front_pipeline import DoorFrontPipeline
-            _door_pipeline = DoorFrontPipeline(MC.SHM_DIR)
+            _door_pipeline = DoorFrontPipeline()
         return _door_pipeline
 
 
@@ -361,9 +361,13 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
 
 
 def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检测 worker：推理并把帧与结果写进共享内存
-           frame_w, det_w, door_sim_processor=None, door_sim_model_path=None):
+           frame_w, det_w, door_sim_processor=None, door_sim_model_path=None, door_vision=False):
     """检测 worker：检测 -> 写帧/检测结果到共享内存。"""
-    detector = (StageDetector(YOLO_CFG, YoloDetector, shm_dir=MC.SHM_DIR)
+    detector_class = StageDetector
+    if door_vision:
+        from to32.move_test.task.task_door.front_pipeline import DoorDetector
+        detector_class = DoorDetector
+    detector = (detector_class(YOLO_CFG, YoloDetector, shm_dir=MC.SHM_DIR)
                 if YOLO_ENABLED and door_sim_processor is None else None)
     idx = 0  # 本 worker 的检测序号，用于终端输出计数
     next_vision_error_log = 0.0
@@ -546,6 +550,8 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
     ap.add_argument('--device', type=str, default=None)  # 指定相机设备路径，缺省取配置文件
     ap.add_argument('--index', type=int, default=None)  # 指定相机索引号，与 --device 二选一
     ap.add_argument('--no-show', action='store_true')  # 关闭画面显示，无屏环境必带
+    ap.add_argument('--door-vision', action='store_true',
+                    help='仅运行 task_door 门视觉：固定门模型，YOLO/CV 结果回传 /cam1，无运动控制')
     ap.add_argument('--workers', type=int, default=N_WORKERS)  # 覆盖配置里的 worker 数量
     ap.add_argument('--frames', type=int, default=0)  # 限制采集帧数，0 表示不限制
     ap.add_argument('--timing', action='store_true')  # 强制开启耗时统计
@@ -553,7 +559,11 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
     ap.add_argument('--log', action='store_true')  # 强制开启逐帧日志
     ap.add_argument('--no-log', action='store_true')  # 强制关闭逐帧日志
     args = ap.parse_args(argv)  # 解析命令行参数
-    if door_sim_processor is not None:
+    if args.door_vision and door_sim_processor is not None:
+        ap.error('--door-vision 不能与 DoorSim 注入模式同时使用')
+    if args.door_vision and not YOLO_ENABLED:
+        ap.error('--door-vision 需要启用前摄 YOLO')
+    if door_sim_processor is not None or args.door_vision:
         args.workers = 1  # 一个跟踪器按采集顺序处理，共享帧也只有一个写入者。
 
     enable_timing = TIMING  # 默认取配置文件里的统计开关
@@ -618,11 +628,12 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
         return 1  # 返回非零退出码，供看门狗判定启动失败
 
     src_is_hw = cap is not None and hasattr(cap, 'grab_raw_nv12') and hasattr(cap, 'read_both')  # 用鸭子类型判断是不是硬解相机对象
-    prefer_nv12 = bool(src_is_hw and door_sim_processor is None and PRE_MODE in ('auto', 'nv12'))
-    # DoorSim 校正后重新生成模型 NV12，只采集 BGR，避免缓存未校正 NV12。
+    prefer_nv12 = bool(src_is_hw and door_sim_processor is None and not args.door_vision
+                       and PRE_MODE in ('auto', 'nv12'))
+    # 门视觉校正后重新生成模型 NV12，只采集 BGR，避免缓存未校正 NV12。
     want_bgr = True   # 需要写共享内存，必须能拿到 BGR
 
-    latest_only = door_sim_processor is not None and video_source is None
+    latest_only = (door_sim_processor is not None or args.door_vision) and video_source is None
     q = queue.Queue(maxsize=1 if latest_only else Q_SIZE)
     disp_q = queue.Queue(maxsize=2)  # 显示队列很小，最差情况丢旧帧保实时性
     stop = threading.Event()  # 全局停止事件，所有线程靠它统一收尾
@@ -637,14 +648,14 @@ def main(argv=None, *, door_sim_processor=None, door_sim_model_path=None, video_
         threads.append(threading.Thread(  # 追加一个 worker 线程
             target=worker,  # 线程入口为 worker
             args=(i, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 第 i 个 worker 的全部入参
-                  frame_w, det_w, door_sim_processor, door_sim_model_path),
+                  frame_w, det_w, door_sim_processor, door_sim_model_path, args.door_vision),
             daemon=True))  # 守护线程属性
     if show:  # 需要显示才起显示线程
         threads.append(threading.Thread(  # 追加显示线程
             target=display_loop, args=(disp_q, stop), daemon=True))  # 显示线程只需要显示队列和停止事件
 
     old_handlers = {}
-    if door_sim_processor is not None:
+    if door_sim_processor is not None or args.door_vision:
         for sig in (signal.SIGINT, signal.SIGTERM):
             old_handlers[sig] = signal.signal(sig, lambda *_: stop.set())
     for th in threads:  # 遍历所有线程

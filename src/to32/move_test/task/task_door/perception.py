@@ -1,12 +1,10 @@
 """前视进程里的纯视觉处理；无需 PyTorch，复用板端已有 HBM 检测器。
 
-process(raw_bgr, detector, now, reset_token) -> (corrected_bgr, detections, observation)
-YOLO 与 CV 的几何全部位于同一张校正图，交点外推沿用算法库的质量限制。
+process(raw_bgr, detector, now) -> (corrected_bgr, detections, observation)
+YOLO 与 CV 的几何全部位于同一张校正图，姿态仅用于 UI 显示。
 """
-import math
 import sys
 import json
-import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -21,7 +19,7 @@ if _ROOT not in sys.path:
 
 from quad_cv_kit.src.camera_correction import load_camera_params, adapt_camera_params, create_corrector
 from quad_cv_kit.src.detect_red_gate import RedGateTracker, original_geometry
-from quad_cv_kit.src.gate_guidance import complete_gate_edges, estimate_alignment
+from quad_cv_kit.src.gate_guidance import build_gate_guidance
 from quad_cv_kit.src.yolo_red_gate import boundary_sides, search_region, box_area, box_iou
 from quad_cv_kit.src.opencl_backend import create_backend
 from quad_cv_kit.src.gpu_pipeline import ResidentGatePipeline
@@ -31,7 +29,6 @@ class DoorFrameProcessor:
     def __init__(self, cfg=CONFIG):
         self.cfg = cfg.validate()
         self.corrector = None
-        self.reset_token = None
         self.serial = 0
         self.cv_backend = None
         self.cv_backend_info = None
@@ -61,6 +58,8 @@ class DoorFrameProcessor:
             self.corrector = create_corrector(camera)
             self.valid_mask = self.corrector.valid_mask(cfg.correction_plane_distance_m)
         self.valid_mask.setflags(write=False)
+        if self.cv_backend is not None and self.cv.camera is None:
+            self.cv.set_camera(self.corrector.output_matrix)
 
     def close(self):
         if not self.closed:
@@ -102,26 +101,25 @@ class DoorFrameProcessor:
             self.target, self.last_seen = chosen, now
         return chosen
 
-    def process(self, frame, detector, now, reset_token=None):
+    def process(self, frame, detector, now):
         if self.closed:
             raise RuntimeError('DoorFrameProcessor 已关闭')
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
+            raise ValueError('输入必须为 uint8 BGR 图像')
         cfg = self.cfg
         h, w = frame.shape[:2]
         if (w, h) != (cfg.image_width, cfg.image_height):
-            raise ValueError('穿门要求输入 %d×%d，实际 %d×%d' %
+            raise ValueError('门视觉要求输入 %d×%d，实际 %d×%d' %
                              (cfg.image_width, cfg.image_height, w, h))
         self._prepare()
         with (self.cv_backend.frame_batch() if self.cv_backend else nullcontext()):
-            return self._process(frame, detector, now, reset_token)
+            return self._process(frame, detector, now)
 
-    def _process(self, frame, detector, now, reset_token):
+    def _process(self, frame, detector, now):
         cfg = self.cfg
         h, w = frame.shape[:2]
         if self.cv_backend is not None:
             self.cv_backend.reset_stats()
-        if reset_token != self.reset_token:
-            self.reset()
-            self.reset_token = reset_token
         if self.cv_backend is not None:
             reference, fixed, _, _ = self.cv_backend.preprocess(
                 frame, self.valid_mask, maps=self.corrector.maps(cfg.correction_plane_distance_m),
@@ -132,13 +130,12 @@ class DoorFrameProcessor:
         # 校正后必须重新转模型输入，不能复用原始相机 NV12。
         detections = detector.detect(fixed, nv12=None)
         chosen = self._select(detections, now)
-        obs = dict(valid=True, has_target=chosen is not None, reset_token=reset_token,
+        obs = dict(valid=True, has_target=chosen is not None,
                    coordinate_space='corrected', img_w=w, img_h=h,
-                   target_id=self.serial if chosen else None, pose=None, corners=None,
-                   geometry=None, inferred_segments=[], pose_reason='no-target',
+                   target_id=self.serial if chosen else None, geometry=None, guidance=None,
                    cv_backend=dict(self.cv_backend_info), enhancement_mode='none')
         if chosen is None:
-            self.cv.reset()  # A YOLO gap never carries old geometry into control.
+            self.cv.reset()
             if self.cv_backend is not None:
                 obs['gpu'] = self.cv_backend.diagnostics()
             return fixed, detections, obs
@@ -150,7 +147,7 @@ class DoorFrameProcessor:
                    area_ratio=(x2-x1)*(y2-y1)/(cfg.image_width*cfg.image_height),
                    center_px=[(x1+x2)/2, (y1+y2)/2],
                    aim_px=matrix[:2, 2].tolist(), focal_px=[matrix[0, 0], matrix[1, 1]],
-                   clipped=bool(sides), boundary_sides=sides, pose_reason='no-current-four-edges')
+                   clipped=bool(sides), boundary_sides=sides)
         if self.cv_backend is not None:
             # Preserve formal target IDs/IoU rules; the selected YOLO record is
             # external input to the resident detector, never a host image ROI.
@@ -163,38 +160,13 @@ class DoorFrameProcessor:
         obs['cv_profile'] = self.cv.last_status.get('cv_profile')
         geometry = original_geometry(fixed, candidate)
         obs['geometry'] = geometry
-        pose_started = time.perf_counter()
-        # 跟踪旧四点不计入有效姿态；补端交点可用，但必须来自四条当前实测边。
-        if geometry is not None and geometry['observation'] == 'detected':
-            completed, reason = complete_gate_edges(geometry, box, (w, h), self.valid_mask)
-            obs['pose_reason'] = reason
-            if completed is not None:
-                obs.update(corners=completed['corners'], inferred_segments=completed['segments'])
-                pose, reason = estimate_alignment(completed['corners'], matrix,
-                                                  (cfg.gate_width_m, cfg.gate_height_m))
-                obs['pose_reason'] = reason
-                if pose is not None:
-                    rotation = np.asarray(cfg.camera_to_robot_rotation, float)
-                    if (rotation.shape != (3, 3) or not np.allclose(rotation.T@rotation, np.eye(3), atol=1e-5)
-                            or not np.isclose(np.linalg.det(rotation), 1)):
-                        raise ValueError('camera_to_robot_rotation 必须是旋转矩阵')
-                    center = rotation@np.asarray(pose['gate_center_model_units']) + cfg.camera_position_robot_m
-                    normal = rotation@np.asarray(pose['gate_normal_camera'])
-                    movement = center-float(center@normal)*normal
-                    tilt = math.degrees(math.atan2(abs(normal[1]), math.hypot(normal[0], normal[2])))
-                    gate_x = rotation@np.asarray(pose['rotation_matrix'])[:, 0]
-                    roll = abs(math.degrees(math.atan2(gate_x[1], gate_x[0])))
-                    pose.update(metric_distance_available=True, gate_dimensions_measured_m=[cfg.gate_width_m, cfg.gate_height_m],
-                                center_robot_m=center.tolist(), normal_robot=normal.tolist(),
-                                alignment_robot_m=movement.tolist(),
-                                center_offset_robot_px=[matrix[0, 0]*center[0]/center[2],
-                                                        matrix[1, 1]*center[1]/center[2]],
-                                yaw_error_deg=math.degrees(math.atan2(normal[0], normal[2])),
-                                unactuated_tilt_deg=max(tilt, roll),
-                                controllable=normal[2] > 0 and max(tilt, roll) <= cfg.unactuated_tilt_max_deg)
-                    obs['pose'] = pose
-                    obs['pose_execution'] = 'cpu-four-point-IPPE'
-        obs['control_pose_ms'] = round((time.perf_counter()-pose_started)*1000, 3)
+        if self.cv_backend is not None:
+            obs['guidance'] = self.cv.last_guidance
+        else:
+            status = dict(self.cv.last_status, target_bbox=box, yolo_age_frames=0,
+                          target_clipped=bool(sides), target_boundary_sides=sides)
+            obs['guidance'] = build_gate_guidance(status, geometry, matrix, (w, h),
+                                                 self.valid_mask, (cfg.gate_width_m, cfg.gate_height_m))
         if self.cv_backend is not None:
             obs['gpu'] = self.cv_backend.diagnostics()
         return fixed, detections, obs

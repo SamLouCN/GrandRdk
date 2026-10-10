@@ -34,7 +34,7 @@ MODELS = {
 }
 
 # 键对应 Stage.NAME；同一赛段的多个 stage 指向同一份配置，不重复加载。
-# PassGate / PassDoorV2 / PickBall 都是预留/新流程名称：当前正式序列走 PassGate，
+# PassGate 供独立门视觉使用，task_door 已不提供运动控制阶段。
 # PassDoorV2（t_pass_door_v2.py）是"对中→前冲+高度计突变"新过门流程，同用 gate 模型。
 # 未列出的 stage（含 IDLE / DONE）使用原 quick_config 配置。
 STAGE_MODELS = {

@@ -344,11 +344,16 @@ except ImportError:
 #   GATE×N=（穿门段待重写, 2026-10-08 旧 task_pass_door 已整体清理）
 #   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
+<<<<<<< HEAD
 # 穿门参数单独集中于 task/task_door/config.py，不在此复制。
 #   ★ 这是本文件唯一的例外：旧版 PassGate（DOOR_TABLE）用的是 dataclass DoorConfig
 #     （frozen + validate() 自校验，60+ 字段、与 quad_cv_kit 标定强耦合），
 #     搬进本文件会破坏它的自校验与模块边界，故保持独立。改旧穿门参数去那个文件。
 from task.task_door.t_door import DOOR_TABLE
+=======
+# task_door 仅保留视觉后端；空表兼容已有配置引用，不注册运动阶段。
+DOOR_TABLE = []
+>>>>>>> e00ad0e (</> Removed control from task_door)
 
 try:
     from task import t_pass_door_v2                 # 新过门 v2（对中→前冲+高度计突变判完成）
@@ -368,8 +373,8 @@ try:
 except ImportError:
     HIT_BALL_V2_TABLE = []
 
-# Task1 → SearchBall → HitBall → Task2 → Door → PickBall → Return。
-STAGE_TABLE = (TASK1_TABLE + HIT_BALL_TABLE + TASK2_TABLE + DOOR_TABLE
+# task_door 的控制阶段已删除，其视觉链路由 front.py 独立启用。
+STAGE_TABLE = (TASK1_TABLE + HIT_BALL_TABLE + TASK2_TABLE
                + SEARCH_BALL_TABLE + PICK_BALL_TABLE + TASK4_TABLE + RETURN_TABLE)
 
 # 注：测试模式（test_mode/）的测试表在 test_mode/test_config.py 的 TEST_TABLE 配置，

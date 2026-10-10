@@ -1,4 +1,4 @@
-"""穿门回传标注：仅绘制校正帧副本，观测和控制数据保持原值。"""
+"""门视觉回传标注：仅绘制校正帧副本，不产生控制数据。"""
 import cv2
 import numpy as np
 
@@ -32,11 +32,13 @@ def draw_door_overlay(frame, detections, observation, cfg=CONFIG):
         text(label, box[0, 0], box[0, 1]-6, (0, 255, 255))
 
     geometry = observation.get('geometry') or {}
+    guidance = observation.get('guidance') or {}
+    completion = guidance.get('completion') or {}
     for segment in geometry.get('observed_segments', geometry.get('segments', [])):
         cv2.polylines(vis, [points(segment)], False, (0, 255, 0), 2, cv2.LINE_AA)
-    for segment in observation.get('inferred_segments', []):
+    for segment in completion.get('segments', []):
         cv2.polylines(vis, [points(segment)], False, (150, 255, 150), 1, cv2.LINE_AA)
-    corners = observation.get('corners') or geometry.get('corners') or []
+    corners = completion.get('corners') or geometry.get('corners') or []
     for corner in corners:
         cv2.circle(vis, tuple(points(corner)), 3, (0, 0, 255), -1, cv2.LINE_AA)
 
@@ -47,16 +49,15 @@ def draw_door_overlay(frame, detections, observation, cfg=CONFIG):
     else:
         state = geometry.get('observation', 'missing')
         lines = ['PassGate | area {:.1%} | CV {}'.format(observation.get('area_ratio', 0), state)]
-        pose = observation.get('pose')
+        pose = guidance.get('alignment')
         if pose is None:
-            lines.append('Pose unavailable: ' + observation.get('pose_reason', 'need four edges'))
+            lines.append('UI ONLY | ' + guidance.get('reason', 'need four edges'))
         else:
-            lines[0] += ' | ' + ('OK' if pose['controllable'] else 'TILT LIMIT')
             lines += [
-                'Yaw err {:+.2f} deg | Tilt {:.1f} deg | RMS {:.2f} px'.format(
-                    pose['yaw_error_deg'], pose['unactuated_tilt_deg'], pose['reprojection_rms_px']),
-                'Center m: X {:+.3f}  Y {:+.3f}  Z {:.3f}'.format(*pose['center_robot_m']),
-                'Align m:  X {:+.3f}  Y {:+.3f}  Z {:+.3f}'.format(*pose['alignment_robot_m']),
+                'UI ONLY | X right, Y down, Z forward',
+                'Rotate deg: X {:+.1f}  Y {:+.1f}  Z {:+.1f}'.format(*pose['rotation_xyz_deg']),
+                'Shift px-equiv: X {:+.1f}  Y {:+.1f}  Z {:+.1f}'.format(*pose['translation_scaled_xyz']),
+                'Z shift virtual | RMS {:.2f} px'.format(pose['reprojection_rms_px']),
             ]
 
     # 只按文字大小铺设左下角背景，不覆盖整条画面；默认面板约占 2%～4%。

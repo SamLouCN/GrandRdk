@@ -1,17 +1,22 @@
-"""前视接线：共享跟踪器串行处理，发布同帧检测和姿态，不依赖 JPEG 序号。"""
-import json
-import os
+"""前视接线：共享跟踪器串行处理，发布同帧视觉结果和 JPEG。"""
 import threading
 import time
 
 from .perception import DoorFrameProcessor
 from .config import CONFIG
 from .overlay import draw_door_overlay
+from stage_model import StageDetector
+
+
+class DoorDetector(StageDetector):
+    """纯视觉模式固定使用门模型，不读取或写入运动任务阶段。"""
+
+    def _stage(self):
+        return 'PassGate'
 
 
 class DoorFrontPipeline:
-    def __init__(self, shm_dir):
-        self.reset_path = os.path.join(shm_dir, 'momo_door_reset.json')
+    def __init__(self):
         self.lock = threading.Lock()
         self.processor = None
         self.last_frame = -1
@@ -23,19 +28,14 @@ class DoorFrontPipeline:
                 return None
             self.last_frame = frame_id
             if time.time()-captured_at > CONFIG.vision_stale_s:
-                return None  # 排空积压帧，避免花时间推理已无法控制的旧图
+                return None  # 排空积压帧，避免回传延迟不断增长
             if self.processor is None:
                 self.processor = DoorFrameProcessor()
-            try:
-                with open(self.reset_path, encoding='utf-8') as f:
-                    token = json.load(f).get('token')
-            except (OSError, ValueError, TypeError):
-                token = None
-            fixed, dets, observation = self.processor.process(frame, detector, time.time(), token)
+            fixed, dets, observation = self.processor.process(frame, detector, time.time())
             if not detector.is_current() or detector.stage != 'PassGate':
                 return None
             if not detector.ready:
-                observation = dict(valid=False, has_target=False, reason='model-not-ready', reset_token=token)
+                observation = dict(valid=False, has_target=False, reason='model-not-ready')
             if frame_writer is not None:
                 display = draw_door_overlay(fixed, dets, observation)
                 ok, encoded = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, quality])

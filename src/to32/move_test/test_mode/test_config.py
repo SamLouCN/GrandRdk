@@ -56,7 +56,7 @@ TASK2_TABLE = TC.TASK2_TABLE
 SEARCH_BALL_TABLE = TC.SEARCH_BALL_TABLE
 TASK4_TABLE = TC.TASK4_TABLE
 RETURN_TABLE = TC.RETURN_TABLE
-DOOR_TABLE = TC.DOOR_TABLE  # 单独测试门任务时设置 TEST_TABLE = DOOR_TABLE
+DOOR_TABLE = TC.DOOR_TABLE  # 兼容空表；task_door 已改为纯视觉，不再提供控制任务
 PASS_DOOR_V2_TABLE = TC.PASS_DOOR_V2_TABLE  # 过门 v2（task_config try-import；TEST_TABLE = PASS_DOOR_V2_TABLE 即单测）
 HIT_BALL_TABLE = TC.HIT_BALL_TABLE          # 撞球（子目录版 task_hit_ball/t_hit_ball.py，NAME=HitBall）
 HIT_BALL_V2_TABLE = TC.HIT_BALL_V2_TABLE    # 撞球 v2（task/ 根目录 t_hit_ball_v2.py，NAME=HitBall_v2）

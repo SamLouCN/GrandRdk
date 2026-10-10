@@ -1,177 +1,83 @@
-# 穿门任务
+# 门视觉链路
 
-入口 `t_door.DoorTask`，导出 `DOOR_TABLE=[DoorTask]`。阶段名为 `PassGate`，
-沿用 `config/stage_model.py` 的门模型选择。已加入正式 `STAGE_TABLE`，位于
-Task2 后、PickBall 前。当前测试开关为 True、测试表为 `PASS_DOOR_V2_TABLE`；
-单独运行门任务时，在 `test_mode/test_config.py` 设置 `TEST_TABLE = DOOR_TABLE`。
-普通 `./run.sh` 启动前视，再由上位机切 AUV（或 `--to32-args "--mode auv"` 指定启动模式）。
-该控制使用 `PassGate` 发布的正式 `door` 观测；`--door-sim` 仍是独立视觉实验，不能直接驱动此任务。
+本目录只包含相机校正、YOLO/OpenCV 后端、UI 标注和共享发布。
+运动状态机、扫视、定深、对中、接近、盲冲、机器人坐标变换和控制观测握手已删除。
+`task_config.DOOR_TABLE=[]` 仅为旧配置的兼容空表；不会注册门运动阶段。
+其他任务（包括 `t_pass_door_v2`）独立保留。
 
-当前代码仍默认待命（`START_MODE=MODE_IDLE`），且测试表仍为 `PASS_DOOR_V2_TABLE`。
-本次只改门控制算法，未替用户切换启动模式或活动任务表。要上电进入 AUV 并只运行此任务，手动修改：
+## 启动
 
-```python
-# config/to32_config.py
-START_MODE = MODE_AUV
-DEFAULT_MODE = MODE_AUV  # START_MODE存在时，此项仅为兼容别名
-MODE_PERSIST = False
+从工程根目录运行前摄纯视觉入口：
 
-# src/to32/move_test/test_mode/test_config.py
-TEST_MODE_ENABLED = True
-TEST_LOOP = False
-TEST_TABLE = DOOR_TABLE
+```bash
+python3 src/front.py --door-vision --no-show
 ```
 
-修改后重启，在工程根运行 `./run.sh`。保留待命配置时也可用
-`./run.sh --to32-args "--mode auv"` 指定本次启动模式，但仍须先选择 `TEST_TABLE = DOOR_TABLE`。
-模式优先级为命令行 `--mode` > 模式记忆（若启用）> `START_MODE`；
-上位机后续发送 `mode=0` 会切回ROV，运行AUV时应保持 `mode=1`。
-关闭 `TEST_MODE_ENABLED` 后运行的是 `task_config.STAGE_TABLE` 的整套任务，不是单独门任务。
+该参数固定选择 `config/stage_model.py` 中的门模型
+`door_6_nashe_640x640_nv12.hbm`，不依赖或改写 `momo_stage.json`，不启动 to32。
+摄像头仍由 `front.py` 采集，输入为 640×480 BGR，校正后重新生成模型 NV12。
+单 worker 按顺序处理；实时采集只保留最新待处理帧。
+不要同时运行另一个占用前摄或前视共享写端的进程。
 
-| 配置文件 | 实际作用 |
-| --- | --- |
-| `config/to32_config.py` | 中位机启动模式、模式记忆、通信和输出协议 |
-| `move_test/test_mode/test_config.py` | AUV测试开关及活动测试任务表 |
-| `move_test/task_config.py` | 正式任务表、106cm池深、水面限位、卡尔曼启动目录及控制方向符号 |
-| `move_test/task/task_door/config.py` | 新门任务的40%阈值、8px中心、小步航向/深度、盲冲和门数量 |
-| `config/depth_config.py` | 深度卡尔曼传感器、安装偏移和底深基准 |
-| `config/quick_config.py` / `main_config.py` / `stage_model.py` | 相机、共享帧/Web、门模型选择 |
-| `config/auv_config.py` / `viskf_config.py` | 旧AUV参数／独立视觉滤波；新门状态机不从这里取控制参数 |
+在另一个终端启动 Web 服务（已运行时无需再启动）：
 
-新门任务不再读取 `AUV_PASS_DOOR_V2_GATES` 的预设转角/门高，也不使用v2的右移找门参数。
-旧表中的右移搜索逻辑仍保留给 `PASS_DOOR_V2_TABLE`；因此必须选对任务表。
-默认 `gates_to_pass=4`，单门调试在门任务 `config.py` 设为1。
+```bash
+python3 src/web_server.py
+```
 
-## 文件职责
+通过 `http://<RDK-IP>:5000/cam1` 查看带 YOLO/CV 标注的画面。
+前视与 Web 使用相同的 `main_config.SHM_DIR` / `GRDK_SHM_DIR`。
+
+## 数据链路与输出
+
+```text
+front.py 采集
+  → DoorFrontPipeline
+  → DoorFrameProcessor：校正 → BPU YOLO → GPU resident CV
+  → original_geometry：还原校正图像坐标
+  → draw_door_overlay
+  → momo_frame_front.bin → web_server.py → /cam1
+  → momo_det_front.json（同帧结构化结果）
+```
 
 | 文件 | 职责 |
 | --- | --- |
-| `config.py` | 门任务所有标定值、控制增益、容差、推力、阈值及超时 |
-| `perception.py` | GPU 校正/常驻 CV，正式选门连续性，四点 IPPE 和机器人坐标姿态 |
-| `front_pipeline.py` | 前视多个 worker 共用一个门跟踪器，同帧 JSON 发布 |
-| `overlay.py` | 共享 JPEG 的 YOLO/CV 标注和左下角紧凑姿态数据面板 |
-| `observation.py` | 读取观测，区分新帧、重复帧、无门、过期及错误；重置目标握手 |
-| `t_door.py` | 非阻塞任务状态机，返回 Mission 控制字典 |
-| `test_door.py` | 无相机、无串口的合成几何和状态机测试 |
+| `config.py` | 图像尺寸、标定、后端、选门连续性和 UI 参数 |
+| `perception.py` | 调用 YOLO/CV，构造并返回 OpenCV 几何与 UI 姿态结果 |
+| `front_pipeline.py` | 串行处理、丢弃积压/乱序帧、写共享 JPEG 和 JSON |
+| `overlay.py` | 黄色 YOLO 框、绿色实测边、浅绿延长线、红色角点和姿态文字 |
+| `test_vision.py` | 无相机、无串口的后端及共享数据链路测试 |
 
-任务不直接读取 JPEG、不加载 YOLO、不写串口。CV 放在前视进程，避免拖慢
-20 Hz 控制循环。`mission.Stage` 继续兼容旧任务，其实现移入无配置依赖的
-`stage_base.py`，避免任务注册循环导入。
+`DoorFrameProcessor.process(frame, detector, now)` 返回
+`(corrected_bgr, detections, observation)`。OpenCV 对外输出位于 `observation`：
 
-## 视觉输入和观测契约
+- `geometry`：框、实测边线、模型边线、角点、完整性、检测/跟踪状态和边支持度；
+  坐标已从内部 640×360 画布还原为校正后的 640×480 图像像素。
+- `guidance`：UI 模式、缺边方向、角点/延长线及 `alignment` 姿态估计。
+- `guidance.alignment.rotation_xyz_deg`：三轴旋转，单位度。
+- `guidance.alignment.translation_scaled_xyz`：三轴像素等效位移，Z 为虚拟尺度，非米制距离。
+- `cv_profile` / `gpu`：阶段耗时和 GPU 传输诊断。
 
-使用 `quad_cv_kit` v7：640×480 干净 BGR -> GPU 相机校正 ->
-新 `door_6_nashe_640x640_nv12.hbm` YOLO 和常驻 GPU CV。关闭锐化、对比度、CLAHE 和饱和度增强。
-GPU 校正图直接供颜色、位压缩形态学、行游程八连通区域、稳定峰值排序、Hough、线拟合/合并、
-光流/RANSAC 和完整/残缺模型使用；标准画布仍为640×360，保持4:3比例并还原源图坐标。
-默认 `cv_backend=auto`、`gpu_device=Mali`；GPU 不可用明确记录 CPU 回退。
-需要强制板端 GPU 时将 `config.py` 的 `cv_backend` 改为 `opencl`。
-YOLO 框贴边时允许 CV ROI 超出框，但不能超出有效图像区域。
+无当前目标时 `geometry` / `guidance` 为 `None`；几何或姿态不可用时按状态/原因显示。
+姿态明确标记 `ui_only=True`，不产生运动指令。坐标约定为相机 X右/Y下/Z前。
+GPU 路径使用算法库的平面单应姿态；CPU 回退使用算法库的四点 IPPE 显示。
+GPU 算法库的门框参考尺寸为 0.70×0.50，UI 不把其输出声明为可靠米制距离。
+`config.py` 的门尺寸字段用于 CPU 姿态显示。
 
-稳态每帧仅上传一次921,600字节输入图；回读921,600字节校正 BGR 供 BPU 和绘制，
-CV 只回读800字节最终状态，不回读中间图像。当前门的 IoU/尺度连续性、目标 ID 和重置握手沿用正式任务规则。
-GPU 显示位姿未保留 IPPE 的双解歧义检查，因此正式控制仍在 CPU 对四条实测边作端点延长限制、
-交点和四点 IPPE 验证，沿用重投影/歧义/倾斜判据；这部分不重新运行图像 CV 或迁移图像。
-`door.cv_profile` 和 `door.gpu` 记录设备/阶段/传输数据，`door.control_pose_ms` 单独记录控制姿态检查时间。
-GPU输出的实测端点与延长后的模型边分别发布，缺边不会冒充实测完整边。
+`front_pipeline.py` 将观测写入 `/dev/shm/momo_det_front.json` 的 `door` 字段，
+与顶层 `frame` / `capture_ts` / `dets` 一起发布（路径可由共享目录配置覆盖）。
+例如 `door.geometry.corners` 和 `door.guidance.alignment.rotation_xyz_deg`。
+共享 JPEG 在校正图副本上绘制，不污染后端输入或结构化数据。
 
-前视 `momo_det_front.json` 的 `door` 字段提供目标框、面积占比、四点、
-真实红边、浅绿色延长段、PnP 姿态、机器人坐标下的中心及法线。
-`capture_ts` 为采集时间，`frame` 为原始采集帧号；这些数据在同一次处理
-中生成，不用共享 JPEG 的写序号匹配。识别使用干净校正图；共享 JPEG 在副本上叠加
-黄色 YOLO 框、绿色实测边、浅绿色延长线及红色交点，沿用 `/cam1` 回传上位机。
-左下角小面板显示屏占比、CV 状态、航向误差（非绝对航向）、不可控倾斜、重投影误差、
-门中心与法线对齐位移（米，机器人 X右/Y下/Z前）；无有效姿态时显示不可用原因。
-默认字号0.42、行距18px，前摄画面为640×480；面板不铺满整条画面。
-显示参数 `overlay_font_scale / overlay_line_height_px / overlay_background_alpha` 在
-`config.py` 调整。姿态 JSON 和返回的干净图像不受绘制影响。
+稳态 GPU 路径只上传一次 921,600 字节输入图，回读校正 BGR 供 BPU/绘制，
+CV 核心仅回读 800 字节最终状态，不回读中间图像。
+不做锐化、对比度或其他图像增强。
 
-面积计算严格为 `(x2-x1)*(y2-y1)/(640*480)`，输入尺寸不一致拒绝控制。
-选门先按面积，其后用 IoU 和尺度保持同一目标，不按最高置信度频繁换门。
-只有当前四条实测边支持的交点才有效，允许算法库限制内的端部延长交点；
-不从三条边补造第四条边，不以旧跟踪四点通过40%阶段的CV回正判据。
+## 验证
 
-门尺寸固定 0.70×0.50 m，因此 PnP 平移量按米解释；估计精度仍依赖内参、
-折射近似及四点质量。尺寸应对应所选管中心线交点间矩形，而非外沿尺寸。
-相机坐标为 X右/Y下/Z前，配置的旋转矩阵和安装偏移换算到同约定的机器人坐标。
-航向指令采用任务系右转为正，固件镜像只由 mode_auv/test_runner 施加一次。
-命令用 `task/t_function.py` 的 `_cmd` 契约，航向误差用 `yaw_err_deg`。
-图像修正产生的深度目标已经是固件深度厘米，直接按任务限值和 `clamp_depth_cm` 的水面/池底限值钳位，
-不再作为距底高度重复换算；前进/横移保持锁定航向，输出侧才应用固件方向符号。
-
-入段收到有效航向/深度遥测后即保留当前深度并开始扫视，不等待融合定深或视觉初始化。
-搜索仅输出航向目标、零前进/横移推力；发现门后，对中/接近仍须通过卡尔曼定深检查。
-不先执行预设转角或门高。
-`task_config.AUV_POOL_DEPTH_CM=106` 是控制限位口径；
-`config/depth_config.py` 当前 `H_MODE='known'`、`H_M=1.3` 是卡尔曼底深基准，仍需按水面处锚探头读数核对。
-两者存在不同数值，不能直接把物理池深抄入探头基准，也不能把融合D直接当固件绝对深度。
-本次未改这些实测/标定配置。
-
-视觉小步调深判据读取 `ctx.depth.read()`（深度卡尔曼 `momo_depth.json`），不再用单次固件深度读数判完成。
-融合 D 与固件深度计可能有固定参考点偏差；每次调深开始时锁定
-`融合目标cm = 当前融合D×100 + (钳位后的固件目标cm − 当前固件实测cm)`，同一动作内不重算目标。
-入段保持目标也按此公式映射。该方式检查相对调深是否到位，不等同于对融合绝对深度或传感器偏置完成标定。
-视觉小步默认要求连续5个不同输出样本满足深度误差≤1cm、垂速≤0.02m/s；重复样本不累计，
-失效／超期／不确定度超限及非有限值不能通过定深。已完成定深的保持阶段使用8cm带，
-小于保持带的波动不反复阻断水平控制；超期、样本时间回退、垂速超限或离开保持带则停止水平运动并重新确认。
-固件仍执行目标深度闭环；卡尔曼用于上层到位和保持判断，不替代固件PID。
-AUV 正式／测试模式都按 `task_config.AUV_KALMAN_AUTOSTART` 自动启动或复用卡尔曼，
-启动目录跟随当前工程位置。误差、垂速、保持样本数在门任务 `config.py` 调整。
-
-## 流程
-
-1. 读取当前航向/固件深度，锁住当前深度；无需等待卡尔曼到位或视觉就绪即可启动纯转向搜索。
-   缺航向/深度遥测时等待，不猜测零航向；卡尔曼在后台持续确认定深，前进和横移仍需定深有效。
-2. 以入段当前航向为基准，先左45°、再右45°，无门则回基准并继续扫视。
-   搜索仅改变航向，`surge=sway=0`；任意位置发现新门即停止扫视。
-   复用 `door_v2` 的 `lock_turn_target → turn_step`，最终观察角锁存一次。
-   下发的任务系目标角每0.5s最多推进2°，相对上一目标推进；不等待每个2°中间目标进入0.3°带，
-   避免小误差不响应／遥测噪声导致一直卡在第一步。跨±180°按最短角差处理。
-   仅最终观察角用 `search_yaw_tolerance_deg=3°`、`search_hold_frames=10` 个连续控制tick确认到位，
-   与v2转向口径一致；YOLO/CV精细回正的容差独立。
-   目标推进完后仍未到位6s、单轮超时90s保持；实际转速仍受STM32航向PID/惯性影响。
-   `turn_step` 沿用当前深度，航向只在输出壳镜像一次，再由 `frame_motion` 写入 `0x09`。
-   无有效图像也可开始转向；观察角到位后等待有效新帧，不能把视觉故障算成“已观察无门”。
-   超时检查独立于视觉/卡尔曼状态。启动帧已经检测到门时，直接停止扫视进入对中等待。
-   日志输出 `PassGate -> SEARCH_TURN`、基准/左右目标角及“扫视终点／本拍任务系目标／实测航向”，
-   便于区分未启动、目标不变和固件未响应。
-3. YOLO水平偏差用航向小步调整（最多3°），垂直偏差用深度小步调整（最多2cm）。
-   每次调整停止前后移动，待到位和稳定后读取新帧；中心须连续5个新帧落在 `(320,240)` 各轴±8px内。
-4. 对中后前后调距离：框面积低于37%前进，高于43%后退，37%～43%停止并确认。
-   面积为框宽×框高÷640×480；偏离8px先停推纠偏。
-   框过大/多侧裁切时先后退恢复可观察距离，不凭裁切框继续前进。
-5. 约40%处开始使用四点控制，沿用真实四边交点、四点IPPE及机器人坐标反算。
-   回正依次小步调整航向、深度和必要的横移，不改几何求解器。
-   四点不完整时保留有次数/累计距离/时间上限的左移优先试探，失败则保持。
-   回正改变面积或出现裁切时，先重新调到40%附近。
-6. 同一门连续5个新帧满足当前实测四点、法线航向≤0.3°、平移误差≤1cm、投影中心各轴≤8px后，
-   直接锁住当前航向与深度进入盲冲。没有接近80%或二次CV检查阶段。
-7. 默认盲冲距离为最后有效四点姿态的 `center_robot_m[2] + blind_clearance_m`，
-   即机器人参考点到门的前向距离，加80cm过门余量；按 `blind_speed_mps` 标定速度定时执行。
-   非度量/非有限/非正距离，或总距离超过 `blind_max_distance_m=4m` 时保持，不截短距离或猜测。
-   `blind_use_pose_distance=False` 可改用固定 `blind_distance_m=0.80m`。
-   盲冲不消费视觉或门底梁污染的融合净空，外层急停/模式退出仍生效。
-8. 过门停推、重置视觉目标，再以新的当前航向搜索下一门；达到 `gates_to_pass` 后停推并交接任务。
-   无门本身不会触发右移、尾部直行或提前结束。
-
-重复帧不重复计数；视觉/融合深度失效清零确认计数并停止水平平移。
-`HOLD_FAULT` 是零水平推力并保持已锁定航向和深度；不以 `paused` 留下上一帧前进推力。
-盲冲距离、速度和过门余量依赖水下内参、门实际尺寸及机体/推力标定。
-
-部署须包含工程根的 `quad_cv_kit/src` 和内参文件；推理复用当前赛段的板端 HBM，
-不在控制进程加载桌面 best.pt。要使用与新 best.pt 相同的模型，需准备对应 HBM
-并配置 `config/stage_model.py` 的 gate 模型路径和类别。
-
-## 无硬件测试
-
-在项目根运行：
-
-```powershell
-python -m unittest discover -s src/to32/move_test/task/task_door -p test_door.py -v
+```bash
+python3 -m unittest discover -s src/to32/move_test/task/task_door -p test_vision.py -v
+python3 -m unittest discover -s src -p test_front_stream.py -v
 ```
 
-测试不会打开相机或串口；OpenCL C 内核由 CPU 正确性测试执行，不测试/优化 M4 GPU。
-覆盖常驻链路到正式共享观测、真实四点IPPE、目标重置、无中间图像迁移、
-启动±45°纯转向搜索、小误差不响应时继续推进目标、真实TestMode/Mission/0x09航向字段及镜像、
-40%前后调距/回正直接盲冲、四门完整流程、重复/过期帧、
-融合定深、任务坐标符号和公共深度限值。不能替代Mali板端性能与水下运动验证。
+OpenCL host harness 只检查内核正确性，不用于 M4 性能测试或 Mali 耗时估计。
