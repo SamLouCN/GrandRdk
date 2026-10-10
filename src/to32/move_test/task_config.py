@@ -9,8 +9,7 @@
   3. 占位值（标 TODO 的）上车前必须实测标定。
   4. ★ 2026-10-11 整理：**所有任务的参数一律收敛到本文件** —— 任务脚本里
      不许再留"只有 getattr 兜底、配置里没有"的数值（改参只改这里）。
-     task/task_door/config.py 是唯一例外（旧版 PassGate 的 dataclass 配置，
-     带 validate() 自校验且与 CV 标定强耦合，单独维护，见文末说明）。
+     task/task_door/config.py 只包含独立视觉参数，不包含任务控制参数。
 
 分区索引（按 Ctrl+F 搜"===== 区"跳转；编号即文件中的阅读顺序）：
   区1  观测源（共享内存 JSON / 画面尺寸 / 检测门槛）
@@ -344,16 +343,8 @@ except ImportError:
 #   GATE×N=（穿门段待重写, 2026-10-08 旧 task_pass_door 已整体清理）
 #   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
-<<<<<<< HEAD
-# 穿门参数单独集中于 task/task_door/config.py，不在此复制。
-#   ★ 这是本文件唯一的例外：旧版 PassGate（DOOR_TABLE）用的是 dataclass DoorConfig
-#     （frozen + validate() 自校验，60+ 字段、与 quad_cv_kit 标定强耦合），
-#     搬进本文件会破坏它的自校验与模块边界，故保持独立。改旧穿门参数去那个文件。
-from task.task_door.t_door import DOOR_TABLE
-=======
 # task_door 仅保留视觉后端；空表兼容已有配置引用，不注册运动阶段。
 DOOR_TABLE = []
->>>>>>> e00ad0e (</> Removed control from task_door)
 
 try:
     from task import t_pass_door_v2                 # 新过门 v2（对中→前冲+高度计突变判完成）
