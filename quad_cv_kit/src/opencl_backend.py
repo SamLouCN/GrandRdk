@@ -100,7 +100,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             transfer_bytes=dict(getattr(self.runtime, 'transfer_bytes', {})),
             transfer_calls=dict(getattr(self.runtime, 'transfer_calls', {})),
             residency='frame' if getattr(self, '_resident_frame', None) is not None else 'operation',
-            pipeline_version=6 if getattr(self, '_resident_core_active', False) else 2,
+            pipeline_version=7 if getattr(self, '_resident_core_active', False) else 2,
             cv_execution='resident' if getattr(self, '_resident_core_active', False) else 'hybrid',
             residency_strategy='direct-outputs-readonly-aliases',
             synchronization=dict(finish_calls=getattr(self.runtime, 'finish_calls', 0),
@@ -115,21 +115,26 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             hough_algorithm=('resident-color-top8-per-angle' if resident else 'opencv-HoughLinesP' if self.hough_backend == 'cpu' else
                 'bounded-peaks-cooperative-runs' if self.quality == 'fast' else 'polar-votes-cooperative-greedy-consumption'),
             cv_quality='resident' if resident else self.quality, work_counts=dict(self.work_counts),
-            peak_selector=dict(selected='device-parallel-rank-mask-greedy-nms', neighbors_per_peak=72,
+            peak_selector=dict(selected='device-tiled-stable-sort-mask-greedy-nms', neighbors_per_peak=72,
                 suppression_words_per_peak=3, suppression_record_bytes=16,
-                kernel_names=['rg_peak_prepare', 'rg_peak_order', 'rg_peak_select'],
+                sort_capacity=2880, sort_tile_slots=256,
+                kernel_names=['rg_peak_prepare', 'rg_peak_sort_tiles', 'rg_peak_sort_merge', 'rg_peak_sort_order', 'rg_peak_select'],
                 total_gpu_ms=round(sum(self.runtime.kernel_ms.get(k, 0.) for k in
-                    ('rg_peak_prepare', 'rg_peak_order', 'rg_peak_select')), 3)) if resident else dict(self.peak_selector_info),
+                    ('rg_peak_prepare', 'rg_peak_sort_tiles', 'rg_peak_sort_merge', 'rg_peak_sort_order', 'rg_peak_select')), 3)) if resident else dict(self.peak_selector_info),
             line_ranker=dict(selected='device-tiled-stable-topk', tile_slots=256,
                 kernel_names=['rg_rank_tiles', 'rg_rank_merge', 'rg_rank_gather', 'rg_rank'],
                 total_gpu_ms=round(sum(self.runtime.kernel_ms.get(k, 0.) for k in
                     ('rg_rank_tiles', 'rg_rank_merge', 'rg_rank_gather', 'rg_rank')), 3)) if resident else None,
-            morphology=dict(selected='exact-tiled-pass-fusion', tile_size=[16, 16],
-                total_gpu_ms=round(self.runtime.kernel_ms.get('morph3_fused', 0.), 3)),
-            components=dict(selected='exact-tile-union-boundary-merge-local-hash', connectivity=8,
-                kernel_names=['rg_cc_tile', 'rg_cc_boundary', 'rg_cc_stats_hash', 'rg_cc_filter', 'rg_white_open2'],
+            morphology=dict(selected='exact-binary-packed-pass-fusion', pixels_per_word=32,
+                tile_size=[256, 8], grayscale_fallback='morph3_fused/morph3',
+                kernel_names=['morph_pack', 'morph_packed1', 'morph_packed2', 'morph_packed3', 'morph_packed4'],
                 total_gpu_ms=round(sum(self.runtime.kernel_ms.get(k, 0.) for k in
-                    ('rg_cc_tile', 'rg_cc_boundary', 'rg_cc_stats_hash', 'rg_cc_filter', 'rg_white_open2')), 3)) if resident else None,
+                    ('morph_pack', 'morph_packed1', 'morph_packed2', 'morph_packed3', 'morph_packed4', 'morph3_fused', 'morph3')), 3)),
+            components=dict(selected='exact-row-run-union-statistics', connectivity=8,
+                capacity_policy='ceil(width/2)-per-row-no-truncation',
+                kernel_names=['rg_cc_runs', 'rg_cc_run_link', 'rg_cc_run_stats', 'rg_cc_run_filter', 'rg_white_open2'],
+                total_gpu_ms=round(sum(self.runtime.kernel_ms.get(k, 0.) for k in
+                    ('rg_cc_runs', 'rg_cc_run_link', 'rg_cc_run_stats', 'rg_cc_run_filter', 'rg_white_open2')), 3)) if resident else None,
             angle_peak_top=dict(selected='exact-lane-top8-merge',
                 total_gpu_ms=round(self.runtime.kernel_ms.get('rg_peak_top_tiled', 0.), 3)) if resident else None,
             trimmed_line_merge=dict(selected='device-ordered-merge-and-validation') if resident else dict(self.postprocess_info),
@@ -138,7 +143,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             line_sample_step=2 if resident or self.quality == 'fast' else 1,
             blur_mode=self.blur_mode,
             gpu_stages=(['target association and ROI', 'area canvas and grayscale pyramids',
-                        'HSV/LAB and multiscale color', 'atomic connected components',
+                        'HSV/LAB and multiscale color', 'row-run eight-connected components',
                         'corner ranking and pyramidal LK', 'similarity RANSAC',
                         'color Hough and device peak selection', 'sampled fitting and ordered merge',
                         'line validation', 'complete/partial model selection', 'planar homography pose'] if resident else
@@ -204,8 +209,19 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
                [temp, result, weights, w, h, radius, 0, LocalMemory(16*(16+2*radius)*4), taps], local=64)
         return result
 
-    def _morph(self, source, w, h, steps, prefix):
+    def _morph(self, source, w, h, steps, prefix, *, binary=False):
         rt = self.runtime
+        if binary and 1 <= len(steps) <= 4:
+            words = (w+31)//32
+            packed = rt.buffer(prefix+'_packed', words*h*4)
+            target = self.device_output(prefix+'_result', w*h)
+            operations = sum(int(bool(dilate)) << i for i, dilate in enumerate(steps))
+            rt.run('morph_pack', words*h, [source, packed, w, h])
+            groups = ((words+7)//8)*((h+7)//8)
+            scratch = 10*(8+2*len(steps))*4
+            rt.run('morph_packed'+str(len(steps)), groups*64, [packed, target, w, h, operations,
+                   LocalMemory(scratch), LocalMemory(scratch)], local=64)
+            return target
         if 1 < len(steps) <= 4:
             target = self.device_output(prefix+'_result', w*h)
             extent = 16+2*len(steps)
@@ -261,7 +277,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             profile.mark(stage+'.enqueue_blur')
         mask, score = rt.buffer(prefix+'_mask', w*h), self.device_output(prefix+'_score', w*h*4)
         rt.run('tube_threshold', w*h, [hsv, chroma, local, mask, score, w*h])
-        mask = self._morph(mask, w, h, [True, False], prefix+'_close')
+        mask = self._morph(mask, w, h, [True, False], prefix+'_close', binary=True)
         if profile is not None:
             profile.mark(stage+'.enqueue_threshold')
         return mask, score
@@ -277,7 +293,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             clean, score = self._tube(reference, 'reference', profile, prefix+'.reference')
             if enhanced is not reference:
                 extra, _ = self._tube(enhanced, 'enhanced', profile, prefix+'.enhanced')
-                near = self._morph(clean, w, h, [True], 'near')
+                near = self._morph(clean, w, h, [True], 'near', binary=True)
                 combined = self.device_output('combined_mask', w*h)
                 rt.run('combine_masks', w*h, [clean, near, extra, combined, w*h])
                 clean = combined
@@ -313,7 +329,7 @@ class OpenCLBackend(GPUResidencyMixin, GPUSearchMixin):
             blur = self._blur(signal, w, h, 9, 'partial')
             mask = rt.buffer('partial_mask', w*h)
             rt.run('strict_red', w*h, [hsv, signal, blur, mask, w*h])
-            mask = self._morph(mask, w, h, [True, False, False, True], 'partial_morph')
+            mask = self._morph(mask, w, h, [True, False, False, True], 'partial_morph', binary=True)
             result = rt.read(mask, (h, w), np.uint8)
             _, labels, stats, _ = cv2.connectedComponentsWithStats(result)
             keep = (stats[:, cv2.CC_STAT_AREA] >= 35) & (np.maximum(stats[:, 2], stats[:, 3]) >= 25)

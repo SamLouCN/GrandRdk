@@ -71,12 +71,18 @@ class ResidentGatePipeline:
         parents = self.buffer(tag+'_parents', n*4)
         stats = self.buffer(tag+'_stats', n*5*4)
         out = self.buffer(tag+'_filtered', n)
-        self.rt.run('rg_cc_tile', ((w+15)//16)*((h+15)//16)*64,
-                    [source, parents, stats, w, h, control, LocalMemory(256*4)], local=64)
-        self.rt.run('rg_cc_boundary', ((n+63)//64)*64, [source, parents, w, h, control], local=64)
-        self.rt.run('rg_cc_stats_hash', ((n+255)//256)*64,
-                    [source, parents, stats, w, h, control, LocalMemory(512*6*4)], local=64)
-        self.rt.run('rg_cc_filter', n, [source, parents, stats, out, n, minimum, extent, int(both), control])
+        # Exact worst-case capacity, including odd widths and checkerboards.
+        capacity = (w+1)//2
+        runs = self.buffer(tag+'_runs', capacity*h*8)
+        counts = self.buffer(tag+'_row_counts', h*4)
+        links = self.buffer(tag+'_run_links', capacity*h*4)
+        self.rt.run('rg_cc_runs', h*64, [source, runs, counts, links, parents, stats,
+                    w, h, control, LocalMemory(64*4)], local=64)
+        slots = ((capacity*h+63)//64)*64
+        self.rt.run('rg_cc_run_link', slots, [runs, counts, links, capacity, h, control], local=64)
+        self.rt.run('rg_cc_run_stats', slots, [runs, counts, links, stats, capacity, w, h, control], local=64)
+        self.rt.run('rg_cc_run_filter', n, [runs, links, parents, stats, out, w, h, capacity,
+                    minimum, extent, int(both), control])
         return out
 
     def _tube(self, bgr, tag):
@@ -94,7 +100,7 @@ class ResidentGatePipeline:
             backend._local_blur(chroma, local, self.width, self.height, sigma, i == 0, self.prefix+tag)
         mask, score = self.buffer(tag+'_mask', n), self.buffer(tag+'_score', n*4)
         rt.run('tube_threshold', n, [hsv, chroma, local, mask, score, n])
-        mask = backend._morph(mask, self.width, self.height, [True, False], self.prefix+tag+'_close')
+        mask = backend._morph(mask, self.width, self.height, [True, False], self.prefix+tag+'_close', binary=True)
         return mask, hsv, chroma
 
     def _motion(self, gray, mask, control):
@@ -170,7 +176,15 @@ class ResidentGatePipeline:
         neighbors = self.buffer('peak_masks', 2880*16)
         rt.run('rg_peak_prepare', 2880, [peaks, self.backend.fast_angles, order,
                neighbors, control, radius])
-        rt.run('rg_peak_order', 2880*64, [peaks, order, control, LocalMemory(64*4)], local=64)
+        ids = [self.buffer('peak_sort_ids_'+str(i), 4096*4) for i in range(2)]
+        rt.run('rg_peak_sort_tiles', 12*64, [peaks, ids[0], control,
+               LocalMemory(256*4), LocalMemory(256*4), LocalMemory(256*4)], local=64)
+        lists, span, current = 12, 256, 0
+        while lists > 1:
+            count, other = (lists+1)//2, 1-current
+            rt.run('rg_peak_sort_merge', count*span*2, [peaks, ids[current], ids[other], lists, span])
+            lists, span, current = count, span*2, other
+        rt.run('rg_peak_sort_order', 2880, [ids[current], order])
         rt.run('rg_peak_select', 1, [peaks, self.backend.fast_angles, order,
                neighbors, selected, control, self.peak_limit, LocalMemory(90*4)], local=1)
 
@@ -287,7 +301,7 @@ class ResidentGatePipeline:
             blur = backend._blur(signal, self.width, self.height, 9, self.prefix+'strict')
             mask, strict, white = (self.buffer(name, n) for name in ('mask', 'strict', 'white'))
             rt.run('rg_masks', n, [color, hsv, signal, blur, canvas_valid, control, mask, strict, white])
-            strict = backend._morph(strict, self.width, self.height, [True, False, False, True], self.prefix+'strict_morph')
+            strict = backend._morph(strict, self.width, self.height, [True, False, False, True], self.prefix+'strict_morph', binary=True)
         with self.stage('motion'):
             prediction, _, _ = self._motion(gray, mask, control)
         with self.stage('components'):

@@ -159,12 +159,13 @@ YOLO、CV 和输出共用干净的矫正图。日志 `enhancement_mode=none`、
 `sharpen_only`。必要的图像回读归入矫正阶段，原始输入只上传一次。
 库中独立增强/锐化对照函数不参与视频预处理；DoorSim 代码不在本轮修改范围。
 
-resident 峰值选择改为并行排名和三字掩码贪心 NMS，线段排序改为分块稳定
-Top128 与分层并行合并，保留原得分、同分顺序、抑制阈值及方向配额。
-v6 进一步融合形态学、用块内连通/跨块边合并及局部哈希统计八连通组件、
-一次判断局部极大值后分层合并每角度 Top8，保持原像素/连通/峰值规则。
-日志 `pipeline_version=6` 和各项 `total_gpu_ms` 标明完整成本；
-`check_opencl.py --resident-only` 会在板端执行与旧内核/OpenCV 的精度对照。
+resident v7 使用完整分块稳定峰值排序与三字掩码贪心 NMS，二值形态学
+将 32 像素打包为 uint 后融合逐遍 OR/AND，连通区域改为准确游程八连通
+与游程统计。保留原像素边界、最小索引标签、面积/边界框、同分顺序、
+抑制阈值和方向配额，不缩减峰值容量。线段分块 Top128 与每角度 Top8
+继续沿用前轮优化。日志 `pipeline_version=7` 与各项 `total_gpu_ms` 标明
+完整成本；`check_opencl.py --resident-only` 在板端执行精度对照。
+当前尚无 v7 Mali 实测，不将本机 CPU 算术测试作为性能证据。
 详见 [MALI_RESIDENT.md](MALI_RESIDENT.md)。
 
 OpenCV 首次 LAB 调用的查表初始化移到显式 `warmup`，连同 GPU 预处理/颜色内核

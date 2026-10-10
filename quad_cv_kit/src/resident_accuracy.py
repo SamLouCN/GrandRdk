@@ -28,7 +28,7 @@ def check_morphology(backend, exhaustive=False):
     sequences = [(True, False), (True, False, False, True)]
     if exhaustive:
         sequences = list(itertools.product((False, True), repeat=2))+list(itertools.product((False, True), repeat=4))
-    shapes = [(1, 1), (1, 19), (21, 1), (7, 11), (33, 49)]
+    shapes = [(1, 1), (1, 19), (21, 1), (7, 11), (33, 49), (17, 257), (9, 641)]
     cases = 0
     for h, w in shapes:
         for binary in (False, True):
@@ -37,7 +37,7 @@ def check_morphology(backend, exhaustive=False):
                 image = np.uint8(image > 150)*255
             source = rt.upload('accuracy_morph_source', image)
             for steps in sequences:
-                fused = backend._morph(source, w, h, steps, 'accuracy_morph_fused')
+                fused = backend._morph(source, w, h, steps, 'accuracy_morph_fused', binary=binary)
                 old = legacy_morph(backend, source, w, h, steps, 'accuracy_morph_old')
                 np.testing.assert_array_equal(rt.read(fused, image.shape, np.uint8),
                                               rt.read(old, image.shape, np.uint8),
@@ -61,6 +61,15 @@ def component_cases():
     mask[40:65:2, 1:41:2] = 255  # isolated roots, hash collisions, threshold failures
     masks.append(mask)
     masks.extend([np.full((1, 47), 255, np.uint8), np.full((47, 1), 255, np.uint8)])
+    # Exact per-row maximum capacity; diagonals must connect checkerboard runs.
+    yy, xx = np.indices((19, 65))
+    masks.append(np.uint8((xx+yy)%2 == 0)*255)
+    masks.append(np.uint8((xx%2 == 0) & (yy%2 == 0))*255)
+    # Many upper-row runs meet one lower run, including long row/chunk crossings.
+    bridge = np.zeros((7, 641), np.uint8)
+    bridge[1, ::2] = bridge[5, ::2] = 255
+    bridge[2:5, :] = 255
+    masks.append(bridge)
     return masks
 
 
@@ -126,4 +135,33 @@ def check_angle_peaks(backend, full_size=True):
 
 
 def check_resident_primitives(backend):
-    return [check_morphology(backend), check_components(backend), check_angle_peaks(backend)]
+    return [check_morphology(backend), check_components(backend), check_angle_peaks(backend), check_peak_order(backend)]
+
+
+def check_peak_order(backend):
+    """Independent integer lexicographic oracle for ALL peaks before NMS."""
+    rt = backend.runtime
+    pipeline = ResidentGatePipeline(backend)
+    rng = np.random.default_rng(7001)
+    rows = np.zeros((2880, 4), np.int32)
+    rows[:, 0] = np.arange(2880)//8
+    rows[:, 1] = rng.integers(0, 1471, 2880)
+    rows[:, 2] = rng.integers(0, 32, 2880)
+    rows[:, 3] = rng.integers(0, 128, 2880)  # key ties require original-slot ordering
+    cases = 0
+    for search, fixture in ((True, rows), (True, rows[np.arange(2880)[::-1]].copy()),
+                            (True, np.zeros_like(rows)), (False, rows)):
+        # Angle buckets remain fixed: suppression metadata assumes that layout.
+        fixture = fixture.copy();fixture[:, 0] = np.arange(2880)//8
+        source = rt.upload('accuracy_sort_peaks', fixture)
+        control = rt.upload('accuracy_sort_control', np.array([0, search], np.float32))
+        selected = rt.buffer('accuracy_sort_selected', pipeline.peak_limit*16)
+        pipeline._select_peaks(source, selected, control, 735)
+        actual = rt.read(pipeline.buffer('peak_order', 2880*4), (2880,), np.int32)
+        valid = np.flatnonzero(fixture[:, 2] > 0) if search else np.empty(0, np.int32)
+        ordered = valid[np.lexsort((valid, fixture[valid, 3], -fixture[valid, 2]))]
+        expected = np.full(2880, -1, np.int32);expected[:len(ordered)] = ordered
+        np.testing.assert_array_equal(actual, expected, err_msg=f'complete peak ordering search={search}')
+        cases += 1
+    return dict(name='resident_peak_order_exact', passed=True, cases=cases, slots=2880,
+                comparison='all valid slots match integer vote/key/original-slot ordering before NMS')

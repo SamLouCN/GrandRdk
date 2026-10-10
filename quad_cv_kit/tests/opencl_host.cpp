@@ -180,6 +180,18 @@ void rg_cc_tile(void*,void*,void*,int,int,void*,void*);
 void rg_cc_boundary(void*,void*,int,int,void*);
 void rg_cc_stats_hash(void*,void*,void*,int,int,void*,void*);
 void rg_peak_top_tiled(void*,void*,void*,void*,int,int,void*,void*);
+void morph_pack(void*,void*,int,int);
+void morph_packed1(void*,void*,int,int,int,void*,void*);
+void morph_packed2(void*,void*,int,int,int,void*,void*);
+void morph_packed3(void*,void*,int,int,int,void*,void*);
+void morph_packed4(void*,void*,int,int,int,void*,void*);
+void rg_cc_runs(void*,void*,void*,void*,void*,void*,int,int,void*,void*);
+void rg_cc_run_link(void*,void*,void*,int,int,void*);
+void rg_cc_run_stats(void*,void*,void*,void*,int,int,int,void*);
+void rg_cc_run_filter(void*,void*,void*,void*,void*,int,int,int,int,int,int,void*);
+void rg_peak_sort_tiles(void*,void*,void*,void*,void*,void*);
+void rg_peak_sort_merge(void*,void*,void*,int,int);
+void rg_peak_sort_order(void*,void*);
 void rg_clear(void*,int);
 void rg_merge(void*,void*,void*,int,void*);
 void rg_line_validate(void*,void*,void*,void*,void*,void*,int,void*,void*);
@@ -303,6 +315,18 @@ void invoke(int kernel,Arg *args) {
     case 96:rg_cc_boundary(P(0),P(1),I(2),I(3),P(4));break;
     case 97:rg_cc_stats_hash(P(0),P(1),P(2),I(3),I(4),P(5),P(6));break;
     case 98:rg_peak_top_tiled(P(0),P(1),P(2),P(3),I(4),I(5),P(6),P(7));break;
+    case 99:morph_pack(P(0),P(1),I(2),I(3));break;
+    case 100:morph_packed1(P(0),P(1),I(2),I(3),I(4),P(5),P(6));break;
+    case 101:morph_packed2(P(0),P(1),I(2),I(3),I(4),P(5),P(6));break;
+    case 102:morph_packed3(P(0),P(1),I(2),I(3),I(4),P(5),P(6));break;
+    case 103:morph_packed4(P(0),P(1),I(2),I(3),I(4),P(5),P(6));break;
+    case 104:rg_cc_runs(P(0),P(1),P(2),P(3),P(4),P(5),I(6),I(7),P(8),P(9));break;
+    case 105:rg_cc_run_link(P(0),P(1),P(2),I(3),I(4),P(5));break;
+    case 106:rg_cc_run_stats(P(0),P(1),P(2),P(3),I(4),I(5),I(6),P(7));break;
+    case 107:rg_cc_run_filter(P(0),P(1),P(2),P(3),P(4),I(5),I(6),I(7),I(8),I(9),I(10),P(11));break;
+    case 108:rg_peak_sort_tiles(P(0),P(1),P(2),P(3),P(4),P(5));break;
+    case 109:rg_peak_sort_merge(P(0),P(1),P(2),I(3),I(4));break;
+    case 110:rg_peak_sort_order(P(0),P(1));break;
     }
 }
 extern "C" int launch(const char *name,size_t size,size_t local,Arg *args) {
@@ -312,8 +336,12 @@ extern "C" int launch(const char *name,size_t size,size_t local,Arg *args) {
         "search_merge","search_probe","search_runs","search_contrast","search_quads","search_accept",
         "search_partial_joints","search_partial_color","search_side_support",
         "resident_copy","resident_roi","resident_restrict","resident_and","resident_canvas","bgr_color","track_occupancy","gaussian_small_fused","gaussian_local","linear_up4_local","sharpen_only","rg_target","rg_canvas","rg_masks","rg_cc_init","rg_cc_link","rg_cc_stats","rg_cc_filter","rg_peak_top","rg_peak_select","rg_hough_vote","rg_runs","rg_fit","rg_rank","rg_clear","rg_merge","rg_line_validate","rg_pairs","rg_complete","rg_joints","rg_partial","rg_gray_down","rg_corners","rg_feature_rank","rg_lk","rg_ransac","rg_motion","rg_track_validate","rg_select","rg_pose","rg_rotate_bgr","rg_white_open2","rg_peak_prepare","rg_peak_order","rg_rank_tiles","rg_rank_merge","rg_rank_gather","rg_test_peak_suppression","morph3_fused","rg_cc_tile","rg_cc_boundary","rg_cc_stats_hash","rg_peak_top_tiled"};
+    const char *extra[]={"morph_pack","morph_packed1","morph_packed2","morph_packed3","morph_packed4",
+        "rg_cc_runs","rg_cc_run_link","rg_cc_run_stats","rg_cc_run_filter",
+        "rg_peak_sort_tiles","rg_peak_sort_merge","rg_peak_sort_order"};
     int kernel=-1;
     for(size_t i=0;i<sizeof(names)/sizeof(names[0]);++i)if(std::strcmp(names[i],name)==0){kernel=(int)i;break;}
+    for(size_t i=0;i<sizeof(extra)/sizeof(extra[0]);++i)if(std::strcmp(extra[i],name)==0){kernel=99+(int)i;break;}
     if(kernel<0)return -1;
     if(!local) {
         for(size_t i=0;i<size;++i){global_id=i;invoke(kernel,args);}

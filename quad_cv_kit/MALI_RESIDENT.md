@@ -155,10 +155,73 @@ ROI/valid-mask 周边的图内零像素仍作为实际像素处理，不将 ROI 
 | 每角度峰值提取 | 3.512 | `gpu.angle_peak_top.total_gpu_ms` |
 | CV wall time | 48.587 | `cv_profile.total_ms` |
 
-v6 尚无 Mali 实测。若新成本分别为 M、C、T，按旧单帧替换预算：
-CV 约 `48.587 - 5.224 - 8.531 - 3.512 + M + C + T = 31.320 + M + C + T` ms。
-此前 38–42ms 为目标估算，不能作为已达到的结果。
+用户提供的 v6 第 34 帧：CV 46.081ms，整帧 71.695ms；形态学
+4.797ms、组件含白色开运算 8.920ms、每角度 Top8 1.842ms。
+Top8 改善明显，形态学收益有限，组件成本未改善。v5/v6 来自不同帧，
+不构成同帧均值/P95 对照。此前 38–42ms 估算偏乐观，未达到该目标。
 未运行 M4 OpenCL，也未使用 M4 性能数据调参。
+
+## v7：二值位打包、游程连通区域和完整峰值排序
+
+### 二值形态学
+
+`morph_pack` 将每行 32 个 0/255 像素打包成一个 uint，行尾不足 32 位
+单独处理。`morph_packed1/2/3/4` 使用固定步数，在 256×8 输出图块中
+融合逐遍运算：水平位移加跨字进位，垂直三行 OR/AND，最后直接解包
+为 0/255 图像。两遍/四遍常驻操作分别使用该组内核，不再提交字节
+`morph3_fused`。包含打包，均为两次提交；成本必须把两次相加。
+
+每遍仍重新应用膨胀 0、腐蚀 255 的图像边界，包括行尾无效位；图内
+ROI/valid-mask 的零像素仍为实际零像素。横向一整字 halo 的 32 位
+宽度超过四遍操作的传播距离；纵向保留逐遍完整 halo。
+四遍使用两个 10×16 uint 缓冲，共 1,280B，不依赖 subgroup 扩展。
+仅在调用方确认二值掩码时启用 `binary=True`，灰度形态学保持原实现。
+阈值后的颜色/严格红色掩码符合该条件，所有步骤仍在 GPU 上。
+
+### 精确游程八连通
+
+1. `rg_cc_runs`：每行一个 64 项工作组，提取全部连续前景区间；用
+   局部前缀和得到稳定的行内次序，建立像素到游程的映射。每行容量
+   为 `ceil(width/2)`，覆盖交替前景的最大数量，没有丢弃/近似截断。
+2. `rg_cc_run_link`：二分定位上一行第一个可能相交的游程，连接所有
+   区间相交或横向相距一像素的游程，准确保持八连通。根连接仍使用
+   CAS 重试，无固定传播轮次；最终标签为组件最小像素索引。
+3. `rg_cc_run_stats`：按游程长度累计面积与边界框，每个游程贡献一份
+   统计，取代每个像素的统计哈希操作。只初始化真实游程起点的统计，
+   不再逐像素初始化五个统计字段，也不再初始化 12KiB 局部哈希表。
+4. `rg_cc_run_filter`：把准确组件标签和原筛选结果映射回全部像素。
+
+白色 2×2 开运算 `rg_white_open2` 规则保持。棋盘格有大量短游程，
+收益可能低于稀疏长线段；必须按真实视频分布测量，不能声称通用加速。
+
+### 完整稳定峰值排序
+
+`rg_peak_sort_tiles` 对 12 个 256 槽位块做稳定整数元组排序，排序规则
+为票数降序、key 升序、原槽位升序；每组局部存储 3KiB。
+`rg_peak_sort_merge` 通过并行 merge-path 做完整合并，块数
+12→6→3→2→1、块长度 256→512→1024→2048→4096。
+`rg_peak_sort_order` 输出全部 2,880 槽位的顺序，无效槽位写 -1。
+不再执行平方复杂度的 `rg_peak_order`；整数票数不转换为 float。
+
+NMS 保留原贪心抑制链、三字抑制记录、余弦/距离阈值和方向配额。
+排序不能预先只留 Top256：高分峰被抑制后，较弱峰仍可能需要入选。
+所有排序/计数状态均留在设备，没有新增中间回读。
+
+`pipeline_version=7`；当前没有 v7 Mali 性能实测，也不保证已达到 30ms。
+以下成本汇总包含整个新算法，不能仅比较同名旧内核与某个新内核：
+
+| 日志字段 | 包含的成本 | v6 单帧基线 |
+|---|---|---:|
+| `gpu.morphology.total_gpu_ms` | 打包与全部融合/解包调用 | 4.797ms |
+| `gpu.components.total_gpu_ms` | 两次游程 CCL 与白色开运算 | 8.920ms |
+| `gpu.peak_selector.total_gpu_ms` | prepare、分块排序、全部合并、顺序输出、NMS | 3.536ms |
+| `cv_profile.total_ms` | 完整 CV wall time | 46.081ms |
+
+精度检查覆盖二值逐位/灰度逐字节对照、跨 32 位字/256 像素块、奇数
+宽度、逐遍图像边界、ROI 边缘；组件最小索引标签/面积/边界框/筛选
+像素与 OpenCV 八连通对照，包括棋盘格容量上限和多游程连接一条长
+游程。峰值的全部排序槽位用独立整数排序校验，NMS 回归包含抑制链、
+角度环绕和方向配额。验证专用回读不会进入实时视频路径。
 
 ## 算法差异与质量限制
 
@@ -190,11 +253,12 @@ python3 quad_cv_kit/demo/demo_video.py quad_cv_kit/res/test.mp4 \
   --weights models/door_4_nashe_1280x1280_nv12.hbm --class-names door \
   --cv-backend opencl --gpu-device Mali --cv-execution resident \
   --cv-blur pyramid --cv-budget-ms 30 \
-  --out quad_cv_kit/runs/mali_v6 --perf-log quad_cv_kit/logs/mali_v6.log
+  --out quad_cv_kit/runs/mali_v7 --perf-log quad_cv_kit/logs/mali_v7.log
 ```
 
-自检先执行 v6 精度检查：形态学与旧 GPU 逐遍内核像素对照、组件标签/
-面积/包围盒与 OpenCV 八连通对照、全部峰值记录与旧 GPU 八次扫描对照。
+自检先执行 v7 精度检查：形态学与旧 GPU 逐遍内核像素对照、组件标签/
+面积/包围盒与 OpenCV 八连通对照、全部峰值记录与旧 GPU 八次扫描对照，
+以及 NMS 前全部峰值的稳定排序对照。
 这些验证专用的中间回读不参与视频或随后 benchmark 的统计。检查失败
 时自检退出非零；应先通过再测视频。
 
@@ -210,7 +274,7 @@ python3 quad_cv_kit/demo/demo_video.py quad_cv_kit/res/test.mp4 \
 - `cv_profile.stages_ms`：按工作阶段分组的 GPU 事件时长，非 CPU wall checkpoints；
 - `cv_profile.final_join_ms`：等待尚未完成的 GPU 工作和最终读回，不能再加到事件总时长上；
 - `gpu.kernel_ms`：更细的内核事件耗时；
-- `gpu.pipeline_version=6` 与本轮三个 `total_gpu_ms`：确认融合形态学、块 CCL 和每角度 Top8 的完整成本；
+- `gpu.pipeline_version=7` 与本轮 `total_gpu_ms`：确认位打包形态学、游程 CCL 和完整峰值排序的成本；
 - `gpu.peak_selector.total_gpu_ms`、`gpu.line_ranker.total_gpu_ms`：继续监控 v5 优化的两个成本；
 - `gpu.transfer_bytes`：应无 mask、score、peaks、partial-mask 等中间回读；
 - `run_summary.cv_modes`：搜索/跟踪的 mean、P95、max、30ms 达标率。
@@ -237,4 +301,10 @@ v6 验证：全套 209 项，207 项通过、2 项因 FFmpeg 不可用跳过；�
 组件检查重复 12 轮；修复竞争根连接后，针对性随机场景另连续 100 轮
 通过。完整/残缺、弱红色、白接头、嵌套门框与跨帧跟踪的全状态输出
 通过 v5 参考路径对照。视频与板端自检入口回归确认验证回读不污染
-实时统计，CV 核心仍仅最终 800B 输出。尚未获得 v6 Mali 实测结果。
+实时统计，CV 核心仍仅最终 800B 输出。
+
+v7 验证：全套 211 项，209 项通过、2 项因 FFmpeg 不可用跳过；
+游程端点提取的最后一次并行调整后，重新执行的 9 项基元/完整流程
+精度检查全部通过。最终生产内核通过 OpenCL C 1.2 语法检查。
+这些运行仅为 CPU 主机执行实际 OpenCL C 的正确性验证，未运行
+M4 GPU/OpenCL 性能测试，也没有据此报告 Mali 耗时。

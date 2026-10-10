@@ -1,4 +1,4 @@
-"""v6 integer stages: exact borders, connectivity, statistics and peak ties."""
+"""Resident integer stages: exact borders, connectivity, statistics and peak ties."""
 from pathlib import Path
 import shutil
 import sys
@@ -12,7 +12,7 @@ from opencl_host import HostRuntime
 from src.gpu_pipeline import ResidentGatePipeline
 from src.opencl_backend import OpenCLBackend
 from src.opencl_runtime import LocalMemory
-from src.resident_accuracy import check_morphology, check_components, check_angle_peaks, legacy_morph
+from src.resident_accuracy import check_morphology, check_components, check_angle_peaks, check_peak_order, legacy_morph
 
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('clang++'), 'Production kernel harness requires clang')
@@ -43,7 +43,7 @@ class ResidentPrimitiveTests(unittest.TestCase):
         result = check_resident(self.backend)
         self.assertTrue(result['passed'])
         self.assertEqual(result['final_output_bytes'], 800)
-        self.assertEqual(len(result['primitive_checks']), 3)
+        self.assertEqual(len(result['primitive_checks']), 4)
         self.assertTrue(all(check['passed'] for check in result['primitive_checks']))
         self.assertEqual(self.backend.runtime.download_bytes, 800)
 
@@ -56,11 +56,30 @@ class ResidentPrimitiveTests(unittest.TestCase):
         mask[0, :] = mask[-1, :] = mask[:, 0] = mask[:, -1] = 255
         source = rt.upload('morph_large_source', mask)
         for steps in ((True, False), (True, False, False, True)):
-            actual = self.backend._morph(source, 640, 360, steps, 'morph_large_fused')
+            actual = self.backend._morph(source, 640, 360, steps, 'morph_large_fused', binary=True)
             expected = legacy_morph(self.backend, source, 640, 360, steps, 'morph_large_old')
             self.assertEqual(rt.download_bytes, 0)
             np.testing.assert_array_equal(rt.read(actual, mask.shape, np.uint8), rt.read(expected, mask.shape, np.uint8))
             rt.reset_stats()
+
+    def test_complete_peak_order_including_keys_slots_padding_and_skipped_search(self):
+        self.assertTrue(check_peak_order(self.backend)['passed'])
+
+    def test_packed_word_tile_boundaries_and_every_pass_combination(self):
+        import itertools
+        rt = self.backend.runtime
+        rng = np.random.default_rng(7010)
+        for w in (31, 32, 33, 255, 256, 257, 511, 513, 641):
+            mask = np.uint8(rng.random((17, w)) > .58)*255
+            mask[0, :] = mask[-1, :] = mask[:, 0] = mask[:, -1] = 255
+            source = rt.upload('packed_boundary_source', mask)
+            for length in (1, 2, 3, 4):
+                for steps in itertools.product((False, True), repeat=length):
+                    actual = self.backend._morph(source, w, 17, steps, 'packed_boundary', binary=True)
+                    expected = legacy_morph(self.backend, source, w, 17, steps, 'packed_boundary_old')
+                    np.testing.assert_array_equal(rt.read(actual, mask.shape, np.uint8),
+                                                  rt.read(expected, mask.shape, np.uint8),
+                                                  err_msg=f'packed width={w} steps={steps}')
 
     def test_hash_reduction_never_drops_collisions_or_threshold_boundary_components(self):
         rt = self.backend.runtime
@@ -132,7 +151,7 @@ class ResidentPrimitiveTests(unittest.TestCase):
                     self.assertEqual(rt.download_bytes, 800)
                     expected_state = rt.read(modern.state, (128,), np.float32)
                     rt.reset_stats()
-                    with patch.object(backend, '_morph', side_effect=lambda *args: legacy_morph(backend, *args)):
+                    with patch.object(backend, '_morph', side_effect=lambda *args, **kwargs: legacy_morph(backend, *args)):
                         with backend.frame_batch():
                             legacy.update(image, image, boxes, {0})
                     self.assertEqual(rt.download_bytes, 800)

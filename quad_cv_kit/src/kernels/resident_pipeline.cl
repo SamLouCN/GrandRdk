@@ -7,6 +7,61 @@
 #define RG_FEATURES 64
 #define RG_STATE 128
 
+// Binary masks only: 32 adjacent pixels per word, no subgroup extensions.
+__kernel void morph_pack(__global const uchar *src,__global uint *packed,int w,int h) {
+    int i=get_global_id(0),words=(w+31)/32;if(i>=words*h)return;
+    int x=(i%words)*32,y=i/words;uint bits=0;
+    #pragma unroll
+    for(int b=0;b<32;++b)if(x+b<w&&src[y*w+x+b])bits|=1u<<b;
+    packed[i]=bits;
+}
+static inline uint morph_word(__local const uint *tile,int x,int y,int ox,int oy,
+    int words,int w,int h,int rows,uint neutral) {
+    int gx=ox+x,gy=oy+y;
+    if(x<0||x>=10||y<0||y>=rows||gx<0||gx>=words||gy<0||gy>=h)return neutral;
+    uint bits=tile[y*10+x];
+    if(gx==words-1&&(w&31)){uint valid=(1u<<(w&31))-1u;bits=(bits&valid)|(neutral&~valid);}
+    return bits;
+}
+static inline uint morph_horizontal(__local const uint *tile,int x,int y,int ox,int oy,
+    int words,int w,int h,int rows,int dilate) {
+    uint neutral=dilate?0u:~0u;
+    uint a=morph_word(tile,x-1,y,ox,oy,words,w,h,rows,neutral);
+    uint b=morph_word(tile,x,y,ox,oy,words,w,h,rows,neutral);
+    uint c=morph_word(tile,x+1,y,ox,oy,words,w,h,rows,neutral);
+    uint left=(b<<1)|(a>>31),right=(b>>1)|(c<<31);
+    return dilate?(left|b|right):(left&b&right);
+}
+// One word of horizontal halo suffices for <=4 passes: errors at the outer
+// word edge cannot travel 32 bits to the output. Vertical halo is exact.
+// Every pass reapplies image-border neutrality, including unused tail bits.
+#define MORPH_PACKED(NAME,STEPS) \
+__kernel void NAME(__global const uint *src,__global uchar *dst,int w,int h,int operations, \
+    __local uint *a,__local uint *b) { \
+    int lid=get_local_id(0),words=(w+31)/32,cols=(words+7)/8; \
+    int ox=(get_group_id(0)%cols)*8-1,oy=(get_group_id(0)/cols)*8-STEPS,rows=8+2*STEPS; \
+    for(int j=lid;j<10*rows;j+=64){int x=ox+j%10,y=oy+j/10; \
+        a[j]=x>=0&&x<words&&y>=0&&y<h?src[y*words+x]:0u;} \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+    for(int pass=0;pass<STEPS;++pass){ \
+        __local uint *in=(pass&1)?b:a,*out=(pass&1)?a:b;int dilate=(operations>>pass)&1; \
+        int margin=pass+1,active=rows-2*margin; \
+        for(int j=lid;j<10*active;j+=64){int x=j%10,y=j/10+margin,gx=ox+x,gy=oy+y; \
+            uint p=morph_horizontal(in,x,y-1,ox,oy,words,w,h,rows,dilate); \
+            uint q=morph_horizontal(in,x,y,ox,oy,words,w,h,rows,dilate); \
+            uint r=morph_horizontal(in,x,y+1,ox,oy,words,w,h,rows,dilate); \
+            out[y*10+x]=gx>=0&&gx<words&&gy>=0&&gy<h?(dilate?(p|q|r):(p&q&r)):0u;} \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    __local uint *result=(STEPS&1)?b:a;int xword=ox+1+lid%8,y=oy+STEPS+lid/8; \
+    if(xword<words&&y<h){uint bits=result[(STEPS+lid/8)*10+1+lid%8];int x=xword*32; \
+        for(int k=0;k<32;++k)if(x+k<w)dst[y*w+x+k]=(uchar)(((bits>>k)&1u)*255u);} \
+}
+MORPH_PACKED(morph_packed1,1)
+MORPH_PACKED(morph_packed2,2)
+MORPH_PACKED(morph_packed3,3)
+MORPH_PACKED(morph_packed4,4)
+
 // Exact fusion of up to four 3x3 min/max passes. Each pass uses its own
 // neutral image border (0 for dilation, 255 for erosion), including intermediate
 // images: extending only the initial image would change mixed-pass corners.
@@ -272,6 +327,69 @@ __kernel void rg_cc_stats_hash(__global const uchar *mask,__global int *parent,
     }
 }
 
+// Exact row runs. Capacity ceil(w/2) covers the alternating-pixel worst case;
+// row-major run IDs have the same order as their first pixel indices.
+__kernel void rg_cc_runs(__global const uchar *mask,__global int2 *runs,
+    __global int *counts,__global int *links,__global int *labels,__global int *stats,
+    int w,int h,__global const float *control,__local int *prefix) {
+    int y=get_group_id(0),lid=get_local_id(0),capacity=(w+1)/2;
+    if(y>=h)return;if(!control[1]){if(lid==0)counts[y]=0;return;}
+    int chunk=(w+63)/64,begin=min(w,lid*chunk),end=min(w,begin+chunk),count=0;
+    for(int x=begin;x<end;++x)count+=mask[y*w+x]&&(x==0||!mask[y*w+x-1]);
+    prefix[lid]=count;barrier(CLK_LOCAL_MEM_FENCE);
+    for(int step=1;step<64;step*=2){int value=lid>=step?prefix[lid-step]:0;
+        barrier(CLK_LOCAL_MEM_FENCE);prefix[lid]+=value;barrier(CLK_LOCAL_MEM_FENCE);}
+    int offset=(lid?prefix[lid-1]:0)-1,total=prefix[63];if(lid==0)counts[y]=total;
+    // Start/end events use matching ordinal IDs even across lane spans. Each
+    // coordinate has a single writer; no lane serially scans a long run.
+    __global int *coordinates=(__global int *)runs;
+    for(int x=begin;x<end;++x)if(mask[y*w+x]) {
+        if(x==0||!mask[y*w+x-1]) {
+            int id=y*capacity+(++offset);coordinates[id*2]=x;links[id]=id;
+            int pixel=y*w+x;stats[pixel*5]=0;stats[pixel*5+1]=w;stats[pixel*5+2]=h;
+            stats[pixel*5+3]=-1;stats[pixel*5+4]=-1;
+        }
+        if(x==w-1||!mask[y*w+x+1])coordinates[(y*capacity+offset)*2+1]=x;
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    // Each lane maps a contiguous small span, binary-searching only its first
+    // run, then advancing through sorted intervals. No per-pixel atomics.
+    int lo=0,hi=total;
+    while(lo<hi){int mid=(lo+hi)/2;if(runs[y*capacity+mid].y<begin)lo=mid+1;else hi=mid;}
+    int at=lo;
+    for(int x=begin;x<end;++x){while(at<total&&runs[y*capacity+at].y<x)++at;
+        labels[y*w+x]=mask[y*w+x]?y*capacity+at:-1;}
+}
+__kernel void rg_cc_run_link(__global const int2 *runs,__global const int *counts,
+    __global int *links,int capacity,int h,__global const float *control) {
+    int i=get_global_id(0),y=i/capacity,k=i%capacity;
+    if(y>=h||!control[1]||y==0||k>=counts[y])return;
+    int2 run=runs[i];int base=(y-1)*capacity,lo=0,hi=counts[y-1];
+    while(lo<hi){int mid=(lo+hi)/2;if(runs[base+mid].y<run.x-1)lo=mid+1;else hi=mid;}
+    for(int j=lo;j<counts[y-1]&&runs[base+j].x<=run.y+1;++j) {
+        for(;;){int a=rg_root(links,i),b=rg_root(links,base+j);if(a==b)break;
+            int high=max(a,b),low=min(a,b);
+            if(atomic_cmpxchg(links+high,high,low)==high)break;}
+    }
+}
+__kernel void rg_cc_run_stats(__global const int2 *runs,__global const int *counts,
+    __global int *links,__global int *stats,int capacity,int w,int h,__global const float *control) {
+    int i=get_global_id(0),y=i/capacity,k=i%capacity;
+    if(y>=h||!control[1]||k>=counts[y])return;
+    int root=rg_root(links,i);atomic_min(links+i,root);
+    int pixel=(root/capacity)*w+runs[root].x;int2 run=runs[i];__global int *s=stats+pixel*5;
+    atomic_add(s,run.y-run.x+1);atomic_min(s+1,run.x);atomic_min(s+2,y);
+    atomic_max(s+3,run.y);atomic_max(s+4,y);
+}
+__kernel void rg_cc_run_filter(__global const int2 *runs,__global const int *links,
+    __global int *labels,__global const int *stats,__global uchar *out,int w,int h,int capacity,
+    int minimum,int extent,int both,__global const float *control) {
+    int i=get_global_id(0);if(i>=w*h||!control[1])return;int run=labels[i];out[i]=0;if(run<0)return;
+    int root=links[run],pixel=(root/capacity)*w+runs[root].x;labels[i]=pixel;
+    __global const int *s=stats+pixel*5;int cw=s[3]-s[1]+1,ch=s[4]-s[2]+1;
+    out[i]=s[0]>=minimum&&(both?min(cw,ch):max(cw,ch))>=extent?255:0;
+}
+
 static inline int rg_peak_before(int v,int r,int other,int rho) {
     return r>=0&&(v>other||(v==other&&(rho<0||r<rho)));
 }
@@ -379,6 +497,48 @@ __kernel void rg_peak_order(__global const int *peaks,__global int *order,
     ranks[lid]=rank;barrier(CLK_LOCAL_MEM_FENCE);
     for(int k=lanes/2;k;k/=2){if(lid<k)ranks[lid]+=ranks[lid+k];barrier(CLK_LOCAL_MEM_FENCE);}
     if(lid==0)order[ranks[0]]=i;
+}
+// Full stable peak ordering: invalid slots sort last; no TopK truncation before
+// greedy suppression. Integer vote/key/slot tuple matches rg_peak_order.
+#define RG_PEAK_INVALID 2147483647
+static inline int rg_peak_id_before(__global const int *peaks,int a,int b) {
+    if(a==RG_PEAK_INVALID)return 0;if(b==RG_PEAK_INVALID)return 1;
+    int av=peaks[a*4+2],bv=peaks[b*4+2],ak=peaks[a*4+3],bk=peaks[b*4+3];
+    return av>bv||(av==bv&&(ak<bk||(ak==bk&&a<b)));
+}
+__kernel void rg_peak_sort_tiles(__global const int *peaks,__global int *ids,
+    __global const float *control,__local int *votes,__local int *keys,__local int *indices) {
+    int tile=get_group_id(0),lid=get_local_id(0);
+    for(int j=lid;j<256;j+=64){int i=tile*256+j,valid=i<RG_PEAKS&&control[1]&&peaks[i*4+2]>0;
+        votes[j]=valid?peaks[i*4+2]:0;keys[j]=valid?peaks[i*4+3]:RG_PEAK_INVALID;
+        indices[j]=valid?i:RG_PEAK_INVALID;}
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int width=2;width<=256;width*=2)for(int step=width/2;step;step/=2) {
+        for(int j=lid;j<256;j+=64){int other=j^step;if(j>=other)continue;
+            int av=votes[j],bv=votes[other],ak=keys[j],bk=keys[other],ai=indices[j],bi=indices[other];
+            int before=av>bv||(av==bv&&(ak<bk||(ak==bk&&ai<bi)));
+            int after=bv>av||(bv==av&&(bk<ak||(bk==ak&&bi<ai)));
+            if((j&width)?before:after){votes[j]=bv;votes[other]=av;keys[j]=bk;keys[other]=ak;
+                indices[j]=bi;indices[other]=ai;}}
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for(int j=lid;j<256;j+=64)ids[tile*256+j]=indices[j];
+}
+__kernel void rg_peak_sort_merge(__global const int *peaks,__global const int *ids,
+    __global int *out,int lists,int span) {
+    int i=get_global_id(0),pair=i/(2*span),k=i%(2*span),left=pair*2*span,right=left+span;
+    if(pair>=(lists+1)/2)return;
+    if(pair*2+1>=lists){out[i]=k<span?ids[left+k]:RG_PEAK_INVALID;return;}
+    int lo=max(0,k-span),hi=min(k,span),a=0,b=0;
+    while(lo<=hi){a=(lo+hi)/2;b=k-a;
+        if(a>0&&b<span&&rg_peak_id_before(peaks,ids[right+b],ids[left+a-1]))hi=a-1;
+        else if(b>0&&a<span&&rg_peak_id_before(peaks,ids[left+a],ids[right+b-1]))lo=a+1;
+        else break;}
+    int take_left=b==span||(a<span&&!rg_peak_id_before(peaks,ids[right+b],ids[left+a]));
+    out[i]=ids[take_left?left+a:right+b];
+}
+__kernel void rg_peak_sort_order(__global const int *ids,__global int *order) {
+    int i=get_global_id(0);if(i>=RG_PEAKS)return;order[i]=ids[i]==RG_PEAK_INVALID?-1:ids[i];
 }
 // Retain exact greedy acceptance (a suppressed peak must not suppress others).
 // One pass over the sorted array, exactly three local bitset updates per
