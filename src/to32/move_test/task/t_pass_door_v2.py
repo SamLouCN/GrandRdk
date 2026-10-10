@@ -2,9 +2,6 @@
 """t_pass_door_v2.py —— 穿门任务 v2（2026-10-11 四门过门：门循环 + 高度计突变判完成）
 
 流程（内部状态机）：
-    Step0. 视觉就绪（仅一次）：前视相机由 front.py 常驻采集；进入本阶段 Mission
-           即发布 momo_stage.json（Stage.NAME → stage_model.STAGE_MODELS 热切换 YOLO
-           模型）。本步等「前视检测文件新鲜连续 3 拍」→ 确认链路与模型切换完成。
     门循环（AUV_PASS_DOOR_V2_GATES，每门独立 st dict，互不残留）：
         每门 sub=0 转向定深：相对当前航向转 turn（右正左负，lock_turn_target 每次
             重新锁存，门间误差不累积）+ 下发定深目标；转到位后定深（dive_step 判融合
@@ -21,10 +18,10 @@
     门4 完成（含其 15s 兜底）→ 全任务完成，阶段结束。
 
 ★ 兜底矩阵（2026-10-11 用户确认）：
-    Step0/每门 Step1（转向定深）/每门 Step2（对中）无兜底 —— 判据失效即持续执行；
+    每门 Step1（转向定深）/每门 Step2（对中）无兜底 —— 判据失效即持续执行；
     每门 Step3（前冲）有 15s 兜底；整体无总超时，门4 Step3 的 15s 兜底即全任务兜底。
 
-任务侧不直接碰共享内存：视觉走 ctx.vision（obs.VisionIF，fresh/poll），
+任务侧不直接碰共享内存：视觉走 ctx.vision（obs.VisionIF，poll），
 高度计走自建 AltIF（obs.AltIF，读原始 B/C），定深走 ctx.depth（obs.DepthIF）。
 """
 import os
@@ -44,7 +41,7 @@ from obs import AltIF                                  # 高度计原始通道�
 
 
 class PassDoorV2(Stage):
-    """穿门 v2 四门：Step0 视觉就绪（一次）→ 门循环（每门 转向定深 → 对中 → 前冲+B/C突变判完成）。"""
+    """穿门 v2 四门：门循环（每门 转向定深 → 对中 → 前冲+B/C突变判完成）。"""
 
     NAME = getattr(TC, 'AUV_PASS_DOOR_V2_STAGE', 'PassDoorV2')  # 阶段名：日志 + 0x09 stage 字段 + stage_model 模型映射键
 
@@ -53,7 +50,6 @@ class PassDoorV2(Stage):
         self.alt = alt or AltIF(shm_dir=getattr(ctx.cfg, 'AUV_SHM_DIR', '/dev/shm'))
         self.gates = []                       # 门参数表（enter 时从 TC 读取）
         self.n_gates = 0
-        self.idx = 0                          # 0 = Step0 视觉就绪；1 = 门循环
         self.gate = 0                         # 当前门（0-based）
         self.sub = 0                          # 门内子步骤：0 转向定深 / 1 对中 / 2 前冲
         self.sts = []                         # 每门独立 st dict（下标 = gate）
@@ -71,21 +67,12 @@ class PassDoorV2(Stage):
         """当前门显示名（1-based）。"""
         return '门%d' % (self.gate + 1)
 
-    def _hold_cmd(self, note):
-        """零推力保持帧：锁当前航向 + 保持门1 定深目标（Step0 等视觉用）。"""
-        height = float(self.gates[0]['height'])
-        return t_function._cmd(self.NAME, note,
-                               t_function._yaw_hold(self.sts[0], self.ctx),
-                               t_function._depth_out(self.sts[0], height),
-                               surge=0.0, sway=0.0)
-
     # ---------------- Stage 契约（enter / step） ----------------
     def enter(self, now):
         self.gates = list(getattr(TC, 'AUV_PASS_DOOR_V2_GATES', []))
         if not self.gates:
             raise ValueError('AUV_PASS_DOOR_V2_GATES 为空：四门参数未配置')
         self.n_gates = len(self.gates)
-        self.idx = 0
         self.gate = 0
         self.sub = 0
         self.sts = [{} for _ in range(self.n_gates)]
@@ -98,11 +85,6 @@ class PassDoorV2(Stage):
     def step(self, now, dt):
         self._now = now                       # 刷新时间戳缓存
         self._dt = dt                         # 刷新拍间隔缓存
-        if self.idx == 0:                     # Step0（仅一次）：等视觉链路 + 模型切换就绪
-            cmd = self.step0_wait_vision()
-            if cmd is not None:
-                return cmd
-            self.idx = 1                      # 视觉就绪 → 进入门循环
         while self.gate < self.n_gates:       # 门循环（有界：每门 ≤3 子步骤，最多 n_gates 门）
             gst = self.sts[self.gate]
             cfg = self.gates[self.gate]
@@ -125,27 +107,6 @@ class PassDoorV2(Stage):
                 return None
             continue                          # 下一门同拍起步
         return None
-
-    #=====Step0. 视觉就绪 + 模型切换（仅一次） ==============
-    def step0_wait_vision(self):
-        """确认前视检测链路就绪（front.py 常驻采集；模型由 stage_model 按 NAME 热切换）。
-
-        完成判据：momo_det_front.json 文件新鲜（mtime ≤ AUV_DET_STALE_S）连续 3 拍。
-        模型切换/加载期间 front 不更新 JSON → fresh=False；恢复写帧 → fresh=True，
-        因此本判据同时覆盖"模型切换完成"。无 fresh → 持续保持等待（无兜底，符合口径）。
-        """
-        st = self.sts[0]
-        now = self._now
-        cam = str(getattr(TC, 'AUV_PASS_DOOR_V2_CAM', 'front'))
-        if self.ctx.vision.fresh(cam, now):
-            st['ok'] = st.get('ok', 0) + 1
-            if st['ok'] >= 3:
-                self.log('Step0 完成：前视检测链路就绪（阶段 %s 已发布，front 按 stage_model 热切换模型）' % self.NAME)
-                return None
-            return self._hold_cmd('等视觉链路稳定 ok=%d/3' % st['ok'])
-        st['ok'] = 0
-        self._say(st, '前视检测未就绪（模型切换/相机启动中，或 front 未起）')
-        return self._hold_cmd('前视检测未就绪')
 
     #=====门循环 sub=0：转向定深 ==============
     def _turn_dive(self, gst, cfg):
