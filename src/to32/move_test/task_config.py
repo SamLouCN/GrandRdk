@@ -22,6 +22,8 @@ AUV_CLIP_MARGIN_PX = 4.0                       # 贴边判定余量（px），�
 AUV_DEPTH_FILE = 'momo_depth.json'             # 融合深度（depth_kalman 写，20Hz）
 AUV_DEPTH_STALE_S = 1.0                        # 深度 JSON 超期秒数
 AUV_SIGMA_D_MAX = 0.05                         # 深度标准差上限（m），超限判 ok=False
+AUV_ALT_FILE = 'momo_alt.json'                 # 高度计原始通道（read_altimeter.py 5Hz 落盘；AltIF 读）
+AUV_ALT_STALE_S = 1.5                          # 高度计数据超期秒数（与 depth_config 一致）
 
 # ---------------- 运动控制（占位值，TODO 上车标定） ----------------
 AUV_SPEED_MPS = 0.25                           # TODO: 巡航速度对应 surge 档位需实测
@@ -125,6 +127,32 @@ AUV_TOUCH_ACC_BASE_N = 10        # 触壁基线窗口：进入检测后前 N 拍
 AUV_TOUCH_ACC_DROP_RATIO = 0.5   # 触壁判据：当前幅值 < 基线×(1-ratio) 计一次命中
 AUV_TOUCH_ACC_HIT_N = 3          # 连续命中拍数 → 判触壁（20Hz 下 ≈0.15s）
 
+# PassDoor_v2（task/t_pass_door_v2.py，2026-10-11 四门过门：门循环 + 高度计突变判完成）
+#   流程：Step0 视觉就绪（仅一次）→ 四门循环，每门 = 转向定深 → 横移对中 → 前冲+B/C突变判完成
+#   过门判定四门统一：B/C 均突变（读数 < 基线−ALT_DROP_MM，连续 ALT_HIT_N 拍）后 DONE_DELAY_S；
+#   每门 Step3 均有 RUSH_DUR_S（15s）兜底；整体无兜底（门4 Step3 的 15s 兜底即全任务兜底）。
+#   ★ 无 Step2 超时：60s→HOLD_FAULT 已按 2026-10-11 要求移除，无门帧持续横移找门、永不超时。
+#   模型由 stage_model 按 Stage.NAME 热切换（PassDoorV2 已注册 → gate）。
+AUV_PASS_DOOR_V2_STAGE = 'PassDoorV2'      # 本任务阶段名（决定 YOLO 模型映射，勿与正式序列 PassGate 混淆）
+AUV_PASS_DOOR_V2_GATES = [                 # 四门参数：turn=相对当前航向（右正左负），height=定深距池底(cm)
+    {'turn': +60.0, 'height': 45.0},       # 门1：右转60°，定深45cm（低门）
+    {'turn': -90.0, 'height': 65.0},       # 门2：左转90°，定深65cm（高门）
+    {'turn': +60.0, 'height': 45.0},       # 门3：右转60°，定深45cm（低门）
+    {'turn': -30.0, 'height': 65.0},       # 门4：左转30°，定深65cm（高门）
+]
+AUV_PASS_DOOR_V2_CAM = 'front'             # 前视相机（YOLO 检测 door → canonical gate）
+AUV_PASS_DOOR_V2_WANT = 'gate'             # 检测目标 canonical 名
+AUV_PASS_DOOR_V2_SWAY_DIR = 1.0            # 无门帧横移方向：+1 右移 / -1 左移（找门）
+AUV_PASS_DOOR_V2_SWAY_THRUST = 0.3         # 无门帧横移推力幅度（找门速度档，-1~1）
+AUV_PASS_DOOR_V2_PX_TOL = 20.0             # 对准容差(px)：门中心 x 距画面中心 ≤ 此值
+AUV_PASS_DOOR_V2_HOLD_N = 10               # 对准稳定帧数（带内连续 N 个新检测帧）
+AUV_PASS_DOOR_V2_SURGE = 0.5               # 前冲推力幅度（-1~1）
+AUV_PASS_DOOR_V2_RUSH_DUR_S = 15.0         # 每门前冲兜底时长(s)：B/C 突变未检出 → 到时自动过门
+AUV_PASS_DOOR_V2_DONE_DELAY_S = 1.0        # B、C 均突变后延迟(s) → 判过门完成
+AUV_PASS_DOOR_V2_ALT_DROP_MM = 80.0        # 突变判据：读数 < 基线−此值(mm) 算一次命中（需现场标定）
+AUV_PASS_DOOR_V2_ALT_BASE_N = 10           # 突变基线窗口（拍，@5Hz≈2s；基线锁存后才开始判）
+AUV_PASS_DOOR_V2_ALT_HIT_N = 3             # 连续命中拍数 → 该通道判"突变发生"（@5Hz≈0.6s）
+
 
 
 try:                                             # Task1 脚本在 task/ 子目录；move_test 在 sys.path 时引用
@@ -184,6 +212,12 @@ except ImportError:
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
 # 穿门参数单独集中于 task/task_door/config.py，不在此复制。
 from task.task_door.t_door import DOOR_TABLE
+
+try:
+    from task import t_pass_door_v2                 # 新过门 v2（对中→前冲+高度计突变判完成）
+    PASS_DOOR_V2_TABLE = t_pass_door_v2.PASS_DOOR_V2_TABLE
+except ImportError:
+    PASS_DOOR_V2_TABLE = []
 
 # Task1 → SearchBall → HitBall → Task2 → Door → PickBall → Return。
 STAGE_TABLE = (TASK1_TABLE + HIT_BALL_TABLE + TASK2_TABLE + DOOR_TABLE

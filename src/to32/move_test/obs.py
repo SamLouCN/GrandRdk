@@ -145,6 +145,23 @@ class VisionIF(object):
             'age_s': age, 'frame': frame,
         }
 
+    def fresh(self, cam, now):
+        """检测链路就绪判据：写端文件存在且未超期（不要求本帧有目标）。
+
+        用途：过门 step0 等"视觉就绪 + 模型切换完成"。front.py 在模型
+        切换/加载期间直接 continue（不更新 JSON）→ mtime 停更 → fresh=False；
+        恢复写帧 → fresh=True。连续 N 拍 fresh 可确认链路与模型已就绪。
+        """
+        fname = self.file.get(cam)
+        if fname is None:
+            return False
+        path = os.path.join(self.shm_dir, fname)
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return False
+        return (now - mtime) <= float(TC.AUV_DET_STALE_S)
+
 
 class DepthIF(object):
     """深度接口：read(now) -> dict（永远返回 dict，绝不抛）
@@ -209,3 +226,44 @@ class DepthIF(object):
             'degraded': bool((d.get('flags') or {}).get('degraded', cl is None)),
             'H': d.get('H'),
         }
+
+
+class AltIF(object):
+    """高度计接口：read(now) -> dict —— 读 momo_alt.json（read_altimeter.py 5Hz 落盘）
+
+    返回 {'ok','age_s','ch':{ch:{'mm','status'}}}：
+      ok=False = 文件缺失/解析失败/超期（本拍不做任何高度计判据）；
+      mm = 该通道原始读数(mm，探头面到波束内最近物体的净空)；None = 无有效读数。
+    ★ 与 DepthIF 的 clearance 不同：这里给**原始通道值**，过门判据要用原始突变
+      （融合 clearance 会把门底梁的瞬态回波当野值平滑/拒掉，看不到突变）。
+    """
+
+    def __init__(self, shm_dir=None, log=None):
+        self.shm_dir = shm_dir or TC.AUV_SHM_DIR
+        self.fname = getattr(TC, 'AUV_ALT_FILE', 'momo_alt.json')
+        self.stale_s = float(getattr(TC, 'AUV_ALT_STALE_S', 1.5))
+        self._warn = _WarnOnce(log)
+
+    def read(self, now):
+        path = os.path.join(self.shm_dir, self.fname)
+        if not os.path.isfile(path):
+            self._warn('alt_nofile', '%s 不存在 —— read_altimeter 没起？（突变判据将不可用）' % path)
+            return {'ok': False, 'age_s': None, 'ch': {}}
+        d, mtime = _read_json(path)
+        if d is None:
+            return {'ok': False, 'age_s': None, 'ch': {}}
+        age = (now - mtime) if mtime else 9.9
+        if age > self.stale_s:
+            self._warn('alt_stale', '%s 超期 %.2fs' % (self.fname, age))
+            return {'ok': False, 'age_s': age, 'ch': {}}
+        ch = {}
+        for name, v in (d.get('ch') or {}).items():
+            if not isinstance(v, dict):
+                continue
+            mm = v.get('mm')
+            try:
+                mm = float(mm) if mm is not None else None
+            except (TypeError, ValueError):
+                mm = None
+            ch[str(name).upper()] = {'mm': mm, 'status': str(v.get('status', ''))}
+        return {'ok': True, 'age_s': age, 'ch': ch}
