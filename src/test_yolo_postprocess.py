@@ -102,10 +102,24 @@ class YoloPostprocessTests(unittest.TestCase):
         q.put(None)
         published = []
         writer = SimpleNamespace(write=published.append)
-        front.worker(0, q, queue.Queue(), False, threading.Event(), front.StageStats(),
-                     False, None, None, writer, processor, cfg['model_path'])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            front.worker(0, q, queue.Queue(), False, threading.Event(), front.StageStats(),
+                         False, None, None, writer, processor, cfg['model_path'])
         self.assertEqual(published[0]['status'], 'done')
         self.assertTrue(published[0]['door_sim']['valid'])
+        import json
+        timing_logs = [json.loads(line.split('[Timing] ', 1)[1])
+                       for line in output.getvalue().splitlines() if '[Timing] ' in line]
+        self.assertEqual(len(timing_logs), 1)  # --no-timing 仍逐帧打印完整耗时。
+        self.assertEqual(timing_logs[0]['frame'], 8)
+        self.assertEqual(timing_logs[0]['cv_profile'], published[0]['door_sim']['yolo']['cv_profile'])
+        self.assertEqual(timing_logs[0]['yolo_timing_ms'], detector.last_timing_ms)
+        for key in ('yolo_input', 'bpu_inference', 'yolo_decode_nms', 'format_detections'):
+            self.assertGreaterEqual(detector.last_timing_ms[key], 0)
+        self.assertLessEqual(sum(detector.last_timing_ms[key] for key in
+                            ('yolo_input', 'bpu_inference', 'yolo_decode_nms', 'format_detections')),
+                            detector.last_timing_ms['total_ms'])
         np.testing.assert_allclose(published[0]['dets'][0]['bbox'], [210, 120, 400, 285])
         self.assertAlmostEqual(published[0]['dets'][0]['score'], 1/(1+np.exp(-4)), places=6)
         self.assertEqual(submitted[0]['door']['y'].shape, (1, 640, 640, 1))

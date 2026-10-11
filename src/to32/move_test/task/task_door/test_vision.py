@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 import json
+import contextlib
+import io
 import queue
 import shutil
 import subprocess
@@ -28,6 +30,29 @@ from shm_reader import ShmFrameReader, ShmJsonReader
 
 
 class VisionTests(unittest.TestCase):
+    def test_model_switch_failure_and_retry_never_reuse_inference_timings(self):
+        def factory(cfg):
+            if cfg['model_path'] == 'missing.hbm':
+                raise FileNotFoundError('missing model')
+            return SimpleNamespace(detect=lambda frame, nv12=None: [],
+                                   last_timing_ms={'bpu_inference': 5., 'total_ms': 8.})
+        detector = front.StageDetector({'model_path': 'first.hbm'}, factory, log=lambda _: None)
+        with patch.object(detector, '_stage', return_value='IDLE'):
+            detector.detect(None)
+            self.assertEqual(detector.last_timing_ms['bpu_inference'], 5.)
+            self.assertEqual(detector.last_timing_ms['detect_ms'], 8.)
+            detector.detect(None)
+            self.assertEqual(detector.last_timing_ms['model_load_ms'], 0.)
+            detector.base_cfg['model_path'] = 'missing.hbm'
+            with patch('stage_model.time.monotonic', return_value=10.):
+                detector.detect(None)
+                self.assertFalse(detector.ready)
+                self.assertNotIn('bpu_inference', detector.last_timing_ms)
+                self.assertGreaterEqual(detector.last_timing_ms['model_load_ms'], 0.)
+                detector.detect(None)  # 重试间隔内没有再次加载，也没有推理。
+            self.assertEqual(detector.last_timing_ms['model_load_ms'], 0.)
+            self.assertNotIn('detect_ms', detector.last_timing_ms)
+
     def test_fixed_door_model_ignores_motion_stage_and_does_not_write_it(self):
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory)/'momo_stage.json'
@@ -63,8 +88,13 @@ class VisionTests(unittest.TestCase):
     def test_shared_publication_keeps_frame_contract_and_drops_backlog(self):
         image = np.zeros((480, 640, 3), np.uint8)
         pipeline = DoorFrontPipeline()
+        profile = dict(total_ms=17.5, stages_ms={'color_evidence': 4.2, 'models': .3},
+                       final_join_ms=12.8, event_collection_ms=.4)
+        gpu = dict(kernel_ms={'rg_fit': 1.1}, synchronization={'finish_calls': 0})
         pipeline.processor = SimpleNamespace(process=lambda frame, detector, now:
-            (frame, [], dict(valid=True, has_target=False, geometry=None, guidance=None)))
+            (frame, [], dict(valid=True, has_target=False, geometry=None, guidance=None,
+                            timing_ms={'yolo': 9.5, 'opencv': 17.6},
+                            yolo_timing_ms={'bpu_inference': 5.5}, cv_profile=profile, gpu=gpu)))
         detector = SimpleNamespace(stage='PassGate', ready=True, is_current=lambda: True,
                                    cfg={'model_path': 'door.hbm'})
         with tempfile.TemporaryDirectory() as directory:
@@ -72,7 +102,9 @@ class VisionTests(unittest.TestCase):
             dw = ShmJsonWriter(str(Path(directory)/'momo_det_front.json'))
             reader = ShmFrameReader(fw.path)
             try:
-                with patch('to32.move_test.task.task_door.front_pipeline.time.time', return_value=100.):
+                output = io.StringIO()
+                with patch('to32.move_test.task.task_door.front_pipeline.time.time', return_value=100.), \
+                     contextlib.redirect_stdout(output):
                     self.assertIsNotNone(pipeline.process(10, image, detector, 99.9, fw, dw, 85))
                     record = ShmJsonReader(dw.path).read()
                     self.assertEqual((record['frame'], record['capture_ts']), (10, 99.9))
@@ -83,6 +115,15 @@ class VisionTests(unittest.TestCase):
                     self.assertIsNone(pipeline.process(9, image, detector, 99.9, fw, dw, 85))
                     self.assertIsNone(pipeline.process(11, image, detector, 98., fw, dw, 85))
                     self.assertEqual(ShmJsonReader(dw.path).read()['frame'], 10)
+                logs = output.getvalue().splitlines()
+                self.assertEqual(len(logs), 1)  # 丢弃积压帧不伪造推理耗时。
+                timing = json.loads(logs[0].split('[Timing] ', 1)[1])
+                self.assertEqual(timing['frame'], record['frame'])
+                self.assertEqual(timing['cv_profile'], profile)
+                self.assertEqual(timing['gpu'], gpu)
+                self.assertEqual(timing['yolo_timing_ms']['bpu_inference'], 5.5)
+                for name in ('overlay', 'jpeg_encode', 'frame_write', 'results_write', 'pipeline_total'):
+                    self.assertGreaterEqual(timing['timing_ms'][name], 0)
             finally:
                 fw.close()
                 dw.close()
@@ -122,6 +163,14 @@ class VisionTests(unittest.TestCase):
             self.assertNotIn('pose', obs)
             self.assertNotIn('control_pose_ms', obs)
             self.assertNotIn('reset_token', obs)
+            # 检测消失后不能沿用上一帧的 CV profile 或调用 CV update。
+            detector.detect = lambda image, nv12=None: []
+            processor.cv.last_status = {'cv_profile': {'total_ms': 99., 'mode': 'search'}}
+            with patch.object(processor.cv, 'update', side_effect=AssertionError('no-target CV')):
+                _, _, missing = processor.process(np.zeros((480, 640, 3), np.uint8), detector, 101.)
+            self.assertIsNone(missing['cv_profile'])
+            self.assertEqual(missing['cv_mode'], 'skipped-no-target')
+            self.assertEqual(missing['timing_ms']['opencv'], 0)
         finally:
             processor.close()
 
@@ -148,6 +197,7 @@ class VisionTests(unittest.TestCase):
                                    cfg={'model_path': 'door_6_nashe_640x640_nv12.hbm'}, detect=detect)
         try:
             with tempfile.TemporaryDirectory() as directory, \
+                 contextlib.redirect_stdout(io.StringIO()), \
                  patch('opencl_host.LocalMemory', LocalMemory), \
                  patch('to32.move_test.task.task_door.front_pipeline.time.time', return_value=100.), \
                  patch('to32.move_test.task.task_door.perception.create_backend', return_value=(gpu, gpu.runtime.info)), \
@@ -177,11 +227,12 @@ class VisionTests(unittest.TestCase):
         finally:
             processor.close()
 
-    def test_mission_import_has_no_removed_door_controller(self):
+    def test_mission_import_registers_cx_test_without_restoring_old_door_controller(self):
         code = ('import sys; sys.path.insert(0, sys.argv[1]); '
                 'import mission, task_config; from test_mode import test_config; '
-                'assert task_config.DOOR_TABLE == []; '
-                'assert test_config.DOOR_TABLE == []; '
+                'assert task_config.DOOR_TABLE[0].__name__ == "GateYawCxTask"; '
+                'assert test_config.DOOR_TABLE == task_config.DOOR_TABLE; '
+                'assert task_config.DOOR_TABLE[0] not in task_config.STAGE_TABLE; '
                 'assert task_config.PASS_DOOR_V2_TABLE; '
                 'assert all(cls.__name__ != "DoorTask" for cls in task_config.STAGE_TABLE)')
         result = subprocess.run([sys.executable, '-c', code, str(ROOT/'config')], cwd=ROOT/'src/to32/move_test',

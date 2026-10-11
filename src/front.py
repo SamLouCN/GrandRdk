@@ -363,6 +363,7 @@ def producer(cap, q, max_frames, stop, n_workers, stats, enable_timing,  # 采�
 def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检测 worker：推理并把帧与结果写进共享内存
            frame_w, det_w, door_sim_processor=None, door_sim_model_path=None, door_vision=False):
     """检测 worker：检测 -> 写帧/检测结果到共享内存。"""
+    from vision_timing import log_vision_timing
     detector_class = StageDetector
     if door_vision:
         from to32.move_test.task.task_door.front_pipeline import DoorDetector
@@ -384,6 +385,7 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
         if item is None:  # 收到生产者放的结束哨兵
             break  # 退出 worker 循环
         fid, frame, nv12, captured_at = item  # 同帧图像及采集时间
+        processing_started = time.perf_counter()
         status = 'no_yolo' if detector is None else 'done'  # 未启用 YOLO 时日志状态标记为 no_yolo
         door_published = False
         door_sim_observation = None
@@ -517,6 +519,22 @@ def worker(wid, q, disp_q, show, stop, stats, enable_timing, log_writer,  # 检�
                 t3 = time.perf_counter()  # 投递结束时刻
                 if enable_timing:  # 只在开启统计时记录
                     stats.add('display', t3 - t2)  # 计入显示阶段耗时
+
+        if not door_published:
+            observation = door_sim_observation or {}
+            timings = dict(observation.get('timing_ms', {}))
+            yolo_timings = (observation.get('yolo_timing_ms', {}) if door_sim_processor is not None
+                            else dict(getattr(detector, 'last_timing_ms', {}) or {}))
+            if door_sim_processor is None:
+                timings.update(yolo=yolo_timings.get('total_ms', 0.0), opencv=0.0)
+            timings['worker_total'] = (time.perf_counter()-processing_started)*1000
+            log_vision_timing(fid, 'DoorSim' if door_sim_processor is not None else
+                              getattr(detector, 'stage', 'IDLE'), status,
+                              timing_ms=timings, yolo_timing_ms=yolo_timings,
+                              cv_profile=observation.get('yolo', {}).get('cv_profile'),
+                              gpu=observation.get('gpu'), stream=observation.get('stream'),
+                              yolo_count=len(dets), worker=wid,
+                              capture_to_publish_ms=(time.time()-captured_at)*1000)
 
         for d in dets:  # 逐个目标打印到终端
             print(f'[{TASK}] ' + format_detection(d, MARK_POINT, idx), flush=True)  # 带标定点换算后输出目标的距离与方位

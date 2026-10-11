@@ -20,6 +20,7 @@ function.py — 板端核心库（YOLO 检测 + 水下预处理）
 
 import os  # 路径解析与文件存在性判断
 import sys  # 模块搜索路径注入
+import time
 
 # ---- 路径注入: config/ + src/ ----
 _HERE = os.path.dirname(os.path.abspath(__file__))     # src/
@@ -268,20 +269,27 @@ class YoloDetect:  # 基于 HB_HBMRuntime 的 YOLO 检测封装
                 score_thres: Optional[float] = None,  # 置信度阈值
                 nms_thres: Optional[float] = None,  # NMS 阈值
                 ):
+        self.last_timing_ms = {}
         if image_format in ("NV12", "nv12"):  # NV12 输入时从数组尺寸反推原图大小
             ori_img_h, ori_img_w = nv12.shape[0] * 2 // 3, nv12.shape[1]  # NV12 高度乘三分之二还原
         else:  # BGR 输入
             ori_img_h, ori_img_w = img.shape[:2]  # 直接取图像高宽
 
+        started = time.perf_counter()
         with self.timer.measure('YOLO预处理'):  # 计时：预处理阶段
             input_tensor = self.pre_process(img, image_format=image_format, nv12=nv12)  # 生成模型输入
+        prepared = time.perf_counter()
+        self.last_timing_ms['yolo_input'] = (prepared-started)*1000
 
         with self.timer.measure('推理'):  # 计时：BPU 推理阶段
             outputs = self.forward(input_tensor)  # 执行推理
+        inferred = time.perf_counter()
+        self.last_timing_ms['bpu_inference'] = (inferred-prepared)*1000
 
         with self.timer.measure('后处理'):  # 计时：后处理阶段
             boxes, scores, cls_ids = self.post_process(  # 解码并还原坐标
                 outputs, ori_img_w, ori_img_h, score_thres, nms_thres)  # 传入原图尺寸与阈值
+        self.last_timing_ms['yolo_decode_nms'] = (time.perf_counter()-inferred)*1000
 
         return boxes, scores, cls_ids  # 返回最终检测结果
 
@@ -374,11 +382,16 @@ class YoloDetector:  # 统一 hbm 与 ultralytics 两种后端的高层检测入
                 self.labels = list(names)  # 直接拷贝成列表
 
     def detect(self, frame, nv12=None):  # 统一检测入口，按后端分派
-        if frame is None and nv12 is None:  # 没有任何输入数据
-            return []  # 返回空结果，避免底层报错
-        if self.backend == 'ultralytics':  # 开发机后端
-            return self._detect_ultralytics(frame)  # 走 ultralytics 分支
-        return self._detect_hbm(frame, nv12)  # 走板端分支
+        self.last_timing_ms = {}
+        started = time.perf_counter()
+        try:
+            if frame is None and nv12 is None:  # 没有任何输入数据
+                return []
+            if self.backend == 'ultralytics':
+                return self._detect_ultralytics(frame)
+            return self._detect_hbm(frame, nv12)
+        finally:
+            self.last_timing_ms['total_ms'] = (time.perf_counter()-started)*1000
 
     def _detect_hbm(self, frame, nv12=None):  # 板端推理，能直接用 NV12 就省一次转换
         use_nv12 = (nv12 is not None and self.preprocess_mode in ('auto', 'nv12'))  # 有 NV12 且模式允许
@@ -389,12 +402,23 @@ class YoloDetector:  # 统一 hbm 与 ultralytics 两种后端的高层检测入
             if frame is None and nv12 is not None:  # 只有 NV12 时先转成 BGR
                 frame = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)  # NV12 转 BGR
             boxes, scores, cls_ids = self.model.predict(frame)  # 用 BGR 帧推理
-        return self._format_detections(boxes, scores, cls_ids)  # 转成统一字典列表
+        self.last_timing_ms.update(self.model.last_timing_ms)
+        started = time.perf_counter()
+        detections = self._format_detections(boxes, scores, cls_ids)
+        self.last_timing_ms['format_detections'] = (time.perf_counter()-started)*1000
+        return detections
 
     def _detect_ultralytics(self, frame):  # ultralytics 后端推理
+        started = time.perf_counter()
         with self.timer.measure('推理'):  # 计时：整段推理
             preds = self.model.predict(frame, conf=self.cfg['score_thres'],  # 传入置信度阈值
                                        iou=self.cfg['nms_thres'], verbose=False)  # 传入 IoU 阈值并关闭冗长日志
+        inferred = time.perf_counter()
+        self.last_timing_ms['predict'] = (inferred-started)*1000
+        if preds:
+            self.last_timing_ms.update({'ultralytics_'+name: float(value)
+                                       for name, value in (getattr(preds[0], 'speed', None) or {}).items()
+                                       if value is not None})
         dets = []  # 结果列表
         if preds and preds[0].boxes is not None:  # 有预测结果且含检测框
             names = preds[0].names  # 类别名表
@@ -406,6 +430,7 @@ class YoloDetector:  # 统一 hbm 与 ultralytics 两种后端的高层检测入
                 x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]  # 取出左上右下坐标
                 dets.append(self._make_detection(label, float(box.conf.item()),  # 组装统一格式的结果
                                                  x1, y1, x2, y2))  # 传入框坐标
+        self.last_timing_ms['format_detections'] = (time.perf_counter()-inferred)*1000
         return dets  # 返回检测结果列表
 
     def _format_detections(self, boxes, scores, cls_ids):  # 把底层数组转成统一的字典列表

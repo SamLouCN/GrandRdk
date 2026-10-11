@@ -10,6 +10,7 @@
   4. ★ 2026-10-11 整理：**所有任务的参数一律收敛到本文件** —— 任务脚本里
      不许再留"只有 getattr 兜底、配置里没有"的数值（改参只改这里）。
      task/task_door/config.py 只包含独立视觉参数，不包含任务控制参数。
+     下载版 cx/cy 测试按用户要求保留两个控制器的原公式和类内增益。
 
 分区索引（按 Ctrl+F 搜"===== 区"跳转；编号即文件中的阅读顺序）：
   区1  观测源（共享内存 JSON / 画面尺寸 / 检测门槛）
@@ -343,8 +344,8 @@ except ImportError:
 #   GATE×N=（穿门段待重写, 2026-10-08 旧 task_pass_door 已整体清理）
 #   GRAB(坐底抓球)=PickBall   DROP=缺（0x09 无合爪位，未来挂点）
 #   TURN(θ3)+FWD(x5,触壁)=Return；Task4 为旧测试段，不入正式序列。
-# task_door 仅保留视觉后端；空表兼容已有配置引用，不注册运动阶段。
-DOOR_TABLE = []
+# 下载版 cx 航向 + cy 深度控制共用的测试表，不加入正式 STAGE_TABLE。
+from task.task_door.gate_yaw_cx_ctrl import DOOR_TABLE
 
 try:
     from task import t_pass_door_v2                 # 新过门 v2（对中→前冲+高度计突变判完成）
@@ -364,7 +365,7 @@ try:
 except ImportError:
     HIT_BALL_V2_TABLE = []
 
-# task_door 的控制阶段已删除，其视觉链路由 front.py 独立启用。
+# 正式任务序列不包含 cx/cy 测试；测试模式可显式选择 DOOR_TABLE。
 STAGE_TABLE = (TASK1_TABLE + HIT_BALL_TABLE + TASK2_TABLE
                + SEARCH_BALL_TABLE + PICK_BALL_TABLE + TASK4_TABLE + RETURN_TABLE)
 

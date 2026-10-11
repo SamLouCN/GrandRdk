@@ -130,12 +130,21 @@ class StageDetector:
         return self._stage()
 
     def detect(self, frame, nv12=None):
+        started = time.perf_counter()
+        self.last_timing_ms = {'model_load_ms': 0.0}
+        try:
+            return self._detect(frame, nv12)
+        finally:
+            self.last_timing_ms['total_ms'] = (time.perf_counter()-started)*1000
+
+    def _detect(self, frame, nv12=None):
         self.stage = self._stage()
         self.cfg = model_config(self.stage, self.base_cfg)
         self.ready = self.cfg == self._loaded_cfg
         if not self.ready:
             if self.cfg == self._failed_cfg and time.monotonic() < self._retry_at:
                 return []
+            loading = time.perf_counter()
             try:
                 detector = self.factory(self.cfg)
             except Exception as exc:
@@ -143,12 +152,19 @@ class StageDetector:
                 self._failed_cfg = dict(self.cfg)
                 self._retry_at = time.monotonic() + 1.0
                 return []  # 继续回传相机画面，不用旧模型冒充当前模型。
+            finally:
+                self.last_timing_ms['model_load_ms'] = (time.perf_counter()-loading)*1000
             self._detector = detector
             self._loaded_cfg = dict(self.cfg)
             self._failed_cfg = None
             self.ready = True
             self.log('[stage_model] %s -> %s' % (self.stage, self.cfg['model_path']))
-        return self._detector.detect(frame, nv12=nv12)
+        detections = self._detector.detect(frame, nv12=nv12)
+        timings = dict(getattr(self._detector, 'last_timing_ms', {}) or {})
+        if 'total_ms' in timings:
+            timings['detect_ms'] = timings.pop('total_ms')
+        self.last_timing_ms.update(timings)
+        return detections
 
     def is_current(self):
         """加载/推理期间若已经切到另一模型，丢弃这次过时结果。"""

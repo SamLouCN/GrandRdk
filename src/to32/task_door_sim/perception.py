@@ -147,6 +147,7 @@ class DoorSimFrameProcessor:
                            input='clean', enhancement_mode='none', cv_execution=self.cv_execution,
                            camera_adaptation=self.camera_adaptation,
                            cv_backend=dict(self.cv_backend_info),
+                           yolo_timing_ms=dict(getattr(self.detector.detector, 'last_timing_ms', {}) or {}),
                            timing_ms=dict(correction=round((corrected_at-started)*1000, 2),
                                           enhancement=0.,
                                           yolo=round(self.detector.last_detect_ms, 2),
